@@ -18,7 +18,7 @@ dependencies = [
 
 [project.optional-dependencies]
 media = [
-    "rapidocr-onnxruntime==1.2.3",  # local OCR gate (offline, free)
+    "rapidocr-onnxruntime==1.4.4",  # local OCR gate (offline, free)
     "rlottie-python==1.3.8",        # TGS (Lottie) animated sticker rendering
 ]
 dev = [
