@@ -28,7 +28,7 @@ dev = [
     "mypy==2.4.1",
     "bandit==1.9.4",
     "pip-audit==2.10.1",
-    "fonttools==4.60.2",  # test fixtures only (vector-text TGS)
+    "fonttools==4.68.0",  # test fixtures only (vector-text TGS)
 ]
 
 [project.scripts]
