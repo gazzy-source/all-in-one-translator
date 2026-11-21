@@ -229,3 +229,75 @@ def test_reply_message_id_invalid_means_resend_without_reply() -> None:
     exc = TelegramBadRequest(method=SendMessage(chat_id=1, text="x"),
                              message="Bad Request: REPLY_MESSAGE_ID_INVALID")
     assert TelegramTransport._map(exc).reason == "reply_not_found"
+
+
+def test_gemini_daily_quota_rolls_over_at_pacific_midnight() -> None:
+    from datetime import UTC, datetime
+
+    from translator_bot.resilience import pacific_today
+
+    assert pacific_today(datetime(2026, 11, 22, 7, 59, tzinfo=UTC)) == "2026-11-21"  # PST: UTC-8
+    assert pacific_today(datetime(2026, 11, 22, 8, 0, tzinfo=UTC)) == "2026-11-22"
+    assert pacific_today(datetime(2026, 7, 1, 6, 59, tzinfo=UTC)) == "2026-06-30"  # PDT: UTC-7
+    assert pacific_today(datetime(2026, 7, 1, 7, 0, tzinfo=UTC)) == "2026-07-01"
+
+
+def test_cache_key_keeps_line_breaks() -> None:
+    from translator_bot.textutil import normalize_for_key
+
+    assert normalize_for_key("a\nb") != normalize_for_key("a b")
+    assert normalize_for_key(" a \r\n  b ") == normalize_for_key("a\nb")
+    assert normalize_for_key("a  \t b") == "a b"
+
+
+def test_romanized_text_never_falls_back_to_deepl_last_resort() -> None:
+    d = FakeProvider("deepl", supported={"hi", "en"})
+    o = Orchestrator({"deepl": d}, Metrics())  # Gemini unavailable
+    routes = o.route(TranslationJob("bhai kya scene hai", "en", "hi"),
+                     Detection("hi", 0.9, Verdict.OTHER, romanized=True), "group")
+    assert routes == []
+
+
+def test_audio_and_video_containers_are_sniffed() -> None:
+    from translator_bot.media.frames import sniff_container
+
+    assert sniff_container(b"RIFF\x00\x00\x00\x00WAVEfmt ", ".ogg") == ".wav"
+    assert sniff_container(b"RIFF\x00\x00\x00\x00AVI LIST", ".mp4") == ".avi"
+    assert sniff_container(b"fLaC\x00\x00\x00\x22", ".ogg") == ".flac"
+    assert sniff_container(bytes.fromhex("fff15080") + b"\x00" * 8, ".ogg") == ".aac"
+
+
+def test_serbian_latin_output_is_not_romanized() -> None:
+    from translator_bot.textutil import romanized_output
+
+    out = "Doći ću sutra sa prijateljima"
+    assert not romanized_output("I will come tomorrow with my friends", out, "Cyrillic", "sr")
+    assert romanized_output("I will come tomorrow with my friends", out, "Cyrillic", "ru")
+
+
+async def test_message_locks_released_when_cancelled_mid_acquire(tmp_path: Path) -> None:
+    from translator_bot.pipeline import Pipeline
+
+    p = Pipeline.__new__(Pipeline)
+    from collections import defaultdict
+    p._locks = defaultdict(asyncio.Lock)
+    await p._locks[(1, 2)].acquire()  # message 2 busy (held by another job)
+
+    async def job() -> None:
+        async with p._message_locks(1, [1, 2]):
+            pass
+
+    t = asyncio.create_task(job())
+    await asyncio.sleep(0.05)  # holds lock (1,1), waiting for (1,2)
+    t.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await t
+    assert (1, 1) not in p._locks or not p._locks[(1, 1)].locked()  # not leaked
+
+
+def test_chinese_script_conversion_routes_to_llm_only() -> None:
+    g, d = FakeProvider("gemini"), FakeProvider("deepl")
+    o = Orchestrator({"gemini": g, "deepl": d}, Metrics())
+    routes = o.route(TranslationJob("我們明天下午在老地方見面吧，記得帶傘", "zh", "zh-Hant"),
+                     Detection("zh-Hant", 0.9, Verdict.OTHER), "group")
+    assert [r.provider for r in routes] == ["gemini"]  # DeepL returns Chinese unchanged

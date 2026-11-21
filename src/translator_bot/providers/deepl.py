@@ -156,7 +156,10 @@ class DeepLProvider:
             raise ProviderError(ErrorKind.INVALID_OUTPUT, self.name, "schema mismatch") from None
         self.local_chars += billed
         translation = out_html if job.html else html_to_plain(out_html)
-        same_lang = same_language(detected, job.target)  # "zh" vs "zh-Hant" are different targets
+        # DeepL reports both Chinese scripts as "zh": trust the detector's variant hint when it gave one
+        src_lang = job.source_hint if (job.source_hint or "").lower().startswith("zh") and (detected or "").startswith(
+            "zh") else detected
+        same_lang = same_language(src_lang, job.target)  # "zh" vs "zh-Hant" are different targets
         needs = not same_lang and translation.strip() != html_to_plain(job.text).strip()
         return TranslationResult(
             needs_translation=needs, translation=translation.strip() if needs else "", source_lang=detected,

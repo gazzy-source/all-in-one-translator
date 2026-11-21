@@ -7,12 +7,29 @@ import random
 import time
 from collections import deque
 from collections.abc import Callable
-from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 
 
 def _today() -> str:
     return datetime.now(UTC).strftime("%Y-%m-%d")
+
+
+def _nth_sunday(year: int, month: int, n: int) -> int:
+    first = datetime(year, month, 1, tzinfo=UTC).weekday()  # Monday=0
+    return 1 + (6 - first) % 7 + 7 * (n - 1)
+
+
+def pacific_today(now: datetime | None = None) -> str:
+    """Calendar day in US Pacific time (Gemini's free-tier daily quota resets at midnight Pacific).
+    UTC-7 from the 2nd Sunday of March 10:00 UTC to the 1st Sunday of November 09:00 UTC, else UTC-8;
+    computed directly so no tz database is needed (Windows ships none)."""
+    now = now or datetime.now(UTC)
+    y = now.year
+    dst_start = datetime(y, 3, _nth_sunday(y, 3, 2), 10, tzinfo=UTC)
+    dst_end = datetime(y, 11, _nth_sunday(y, 11, 1), 9, tzinfo=UTC)
+    offset = timedelta(hours=-7 if dst_start <= now < dst_end else -8)
+    return (now + offset).strftime("%Y-%m-%d")
 
 
 class SlidingWindowLimiter:
@@ -80,14 +97,18 @@ class KeyedLimiter:
 
 @dataclass
 class DailyQuota:
-    """Counts requests (or chars) per UTC day; resets automatically."""
+    """Counts requests (or chars) per day (UTC by default); resets automatically."""
 
     limit: int
     used: int = 0
-    day: str = field(default_factory=_today)
+    day_fn: Callable[[], str] = _today
+    day: str = ""
+
+    def __post_init__(self) -> None:
+        self.day = self.day or self.day_fn()
 
     def _roll(self) -> None:
-        d = _today()
+        d = self.day_fn()
         if d != self.day:
             self.day, self.used = d, 0
 

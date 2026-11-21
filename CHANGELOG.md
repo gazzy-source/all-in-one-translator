@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.2.5 — 2026-11-22 (review of recent fixes)
+
+A fresh review of the 0.2.1–0.2.4 changes found regressions introduced by them; all fixed with tests.
+
+* Audio files sent as WAV, FLAC or AAC (and AVI videos) were silently ignored after the forced-demuxer hardening;
+  they are recognized by magic bytes again (verified with real files) — still one whitelisted demuxer each.
+* Traditional → Simplified Chinese cost a call and was then discarded (providers report both as "zh"); the
+  detector's script verdict now decides, and Chinese script conversion always goes to Gemini (DeepL returns
+  Chinese unchanged — verified live). Both directions now convert correctly.
+* Serbian (and Kazakh) written in Latin is no longer rejected as "romanized".
+* Caption edits on photos/videos/voice reuse the media reading kept in memory instead of re-downloading and
+  re-running vision/audio each time.
+* An edit waiting for its original job no longer burns its own queue timeout; a cancelled job can't leak a lock.
+* Gemini's daily quota rolls over at Pacific midnight (Google's reset), not UTC.
+* Cache keys keep line breaks (two layouts of the same words no longer share a translation).
+* Romanized text never falls back to DeepL as a last resort when Gemini is down (DeepL returns nonsense).
+
 ## 0.2.4 — 2026-11-22 (live group test)
 
 * Song lyrics in voice/audio messages (within the 60 s limit) are transcribed and translated, marked ♪; speech

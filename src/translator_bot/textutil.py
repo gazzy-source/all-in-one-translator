@@ -367,12 +367,17 @@ def wrong_script(text: str, target_script: str) -> bool:
 _LATIN_WORD_RE = re.compile(r"[\p{Latin}][\p{Latin}\p{M}']+")
 
 
-def romanized_output(source: str, translation: str, target_script: str) -> bool:
+# Languages routinely and correctly written in Latin as well as their table script (Serbian: both official;
+# Kazakh: moving to Latin). Latin output for them is not "romanized".
+_DIGRAPHIC = frozenset({"sr", "kk"})
+
+
+def romanized_output(source: str, translation: str, target_script: str, target: str | None = None) -> bool:
     """True when a translation into a non-Latin-script language came back transliterated into Latin letters
     (observed live: "LOL TERA MAZAK CHAL RAHA HAI?" and "apni poori koshish karo!" for Hindi readers).
     `wrong_script` tolerates Latin on purpose (names, URLs, brand words), so this checks separately: several
     Latin words that were not in the source, and Latin letters outnumbering the target script's letters."""
-    if target_script == "Latin":
+    if target_script == "Latin" or (target is not None and target.split("-")[0].lower() in _DIGRAPHIC):
         return False
     src_words = {w.lower() for w in _LATIN_WORD_RE.findall(source)}
     plain = strip_non_linguistic(translation)
@@ -421,8 +426,12 @@ def looks_garbled(source: str, translation: str, target: str) -> bool:
 
 
 def normalize_for_key(text: str) -> str:
-    """Cache-key normalization: NFC, collapse whitespace. Case and punctuation are kept (they carry tone)."""
-    return str(re.sub(r"\s+", " ", unicodedata.normalize("NFC", text))).strip()
+    """Cache-key normalization: NFC, collapse runs of spaces/tabs, keep line breaks (translations preserve
+    them, so text split over two lines must not share a cached result with the one-line version). Case and
+    punctuation are kept (they carry tone)."""
+    s = unicodedata.normalize("NFC", text).replace("\r\n", "\n")
+    s = re.sub(r"[^\S\n]+", " ", s)
+    return str(re.sub(r" *\n *", "\n", s)).strip()
 
 
 def truncate(text: str, limit: int) -> str:

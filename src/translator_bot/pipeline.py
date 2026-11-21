@@ -11,7 +11,7 @@ import html as _html
 import logging
 import time
 from collections import OrderedDict, defaultdict
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -80,6 +80,10 @@ class Pipeline:
         self.edit_memory_s = edit_memory_s
         self._units: OrderedDict[tuple[int, int], UnitRecord] = OrderedDict()  # (chat, msg) -> unit
         self._locks: dict[tuple[int, int], asyncio.Lock] = defaultdict(asyncio.Lock)
+        # last media reading per message (memory only, edit_memory_s): a caption edit reuses it instead of
+        # re-downloading and re-running vision/audio for photos, videos and voice (which aren't cached on disk)
+        self._media_memo: OrderedDict[tuple[int, int], tuple[float, str, MediaText | None]] = OrderedDict()
+        self._bg: set[asyncio.Task[None]] = set()
         self._chat_cache: dict[int, tuple[float, Chat]] = {}
 
     def start(self) -> None:
@@ -87,6 +91,8 @@ class Pipeline:
         self.media_lane.start()
 
     async def stop(self) -> None:
+        for t in list(self._bg):
+            t.cancel()
         await self.bursts.flush_all()
         await self.text_lane.stop()
         await self.media_lane.stop()
@@ -196,8 +202,9 @@ class Pipeline:
             meta_m = UnitMeta(msg.chat.id, msg.chat.title, thread, sid, sender_name(msg), self._reply_ctx(msg, sid),
                               chat.settings)
             self.metrics.inc("edit.retranslate_media")
-            await self.media_lane.submit(msg.chat.id, lambda: self._process_media(msg, res, meta_m, edited=True),
-                                         key=f"em:{msg.chat.id}:{msg.message_id}:{new_hash}")
+            await self._submit_when_unlocked(self.media_lane, msg.chat.id, [msg.message_id],
+                                             lambda: self._process_media(msg, res, meta_m, edited=True),
+                                             key=f"em:{msg.chat.id}:{msg.message_id}:{new_hash}")
             return
         unit = self._units.get((msg.chat.id, msg.message_id))
         if unit is not None and time.monotonic() - unit.created <= self.edit_memory_s:
@@ -210,8 +217,9 @@ class Pipeline:
             meta = UnitMeta(msg.chat.id, msg.chat.title, thread, sid, sender_name(msg), self._reply_ctx(msg, sid),
                             chat.settings)
         self.metrics.inc("edit.retranslate")
-        await self.text_lane.submit(msg.chat.id, lambda: self._process_text(meta, items, edited=True),
-                                    key=f"e:{msg.chat.id}:{msg.message_id}:{new_hash}")
+        await self._submit_when_unlocked(self.text_lane, msg.chat.id, [i.message_id for i in items],
+                                         lambda: self._process_text(meta, items, edited=True),
+                                         key=f"e:{msg.chat.id}:{msg.message_id}:{new_hash}")
 
     # -- internals -------------------------------------------------------------------------------
     @contextlib.asynccontextmanager
@@ -219,16 +227,38 @@ class Pipeline:
         """Serialize the original translation and edits of the same message(s): an edit racing the original
         job sent a duplicate (and possibly stale) ephemeral. Sorted order avoids lock-order deadlocks."""
         keys = sorted({(chat_id, m) for m in message_ids})
-        locks = [self._locks[k] for k in keys]
-        for lk in locks:
-            await lk.acquire()
+        held: list[tuple[tuple[int, int], asyncio.Lock]] = []
         try:
+            for k in keys:
+                lk = self._locks[k]
+                await lk.acquire()
+                held.append((k, lk))
             yield
-        finally:
-            for k, lk in zip(keys, locks, strict=True):
+        finally:  # also runs when cancelled half-way through acquiring: never leak a held lock
+            for k, lk in held:
                 lk.release()
                 if not lk.locked() and not getattr(lk, "_waiters", None):
                     self._locks.pop(k, None)
+
+    async def _submit_when_unlocked(self, lane: Lane, chat_id: int, message_ids: list[int],
+                                    fn: Callable[[], Awaitable[None]], *, key: str) -> None:
+        """Queue an edit job; if the original job for these messages still holds their lock, wait for it in the
+        background first, so the wait doesn't eat the edit job's own lane timeout."""
+        busy = [self._locks[k] for k in ((chat_id, m) for m in message_ids)
+                if k in self._locks and self._locks[k].locked()]
+        if not busy:
+            await lane.submit(chat_id, fn, key=key)
+            return
+
+        async def later() -> None:
+            for lk in busy:
+                async with lk:
+                    pass
+            await lane.submit(chat_id, fn, key=key)
+
+        task = asyncio.create_task(later())
+        self._bg.add(task)
+        task.add_done_callback(self._bg.discard)
 
     async def _already_delivered(self, chat_id: int, message_ids: list[int]) -> bool:
         for m in message_ids:
@@ -307,6 +337,10 @@ class Pipeline:
         if res is None:
             return None
         src = res.source_lang or det.lang
+        # Providers report Chinese as plain "zh" for both scripts; the detector's Han-variant verdict is the
+        # authority there (a Traditional message for a Simplified reader is a real conversion, not a no-op).
+        if det.lang and det.lang.lower().startswith("zh") and src and src.lower().startswith("zh"):
+            src = det.lang
         if src and same_language(src, target):
             return None
         # Output is Telegram HTML. Plain sources: escape, so the model can't add markup (link spoofing).
@@ -379,7 +413,13 @@ class Pipeline:
         glossary = tuple(await self.storage.glossary(meta.chat_id))
         # media extraction (one provider call for all languages) runs concurrently with caption translation
         extract_task: asyncio.Task[MediaText | None] | None = None
-        if el.has_media and self.media is not None and file_id and unique_id and mkind:
+        memo_key = (meta.chat_id, msg.message_id)
+        memo = self._media_memo.get(memo_key)
+        reuse = (edited and memo is not None and memo[1] == unique_id
+                 and time.monotonic() - memo[0] <= self.edit_memory_s)
+        if reuse:
+            self.metrics.inc("edit.media_reused")
+        elif el.has_media and self.media is not None and file_id and unique_id and mkind:
             extract_task = asyncio.create_task(self.media.extract(
                 file_id=file_id, file_unique_id=unique_id, size=size, kind=mkind,  # type: ignore[arg-type]
                 targets=langs, caption_hint=el.plain or None, duration=duration))
@@ -390,7 +430,17 @@ class Pipeline:
             return await self._translate_for(meta, el.text_html, el.plain, lang, glossary=glossary)
 
         captions = dict(zip(langs, await asyncio.gather(*(caption_for(lg) for lg in langs)), strict=True))
-        media_text = await extract_task if extract_task is not None else None
+        if reuse:
+            assert memo is not None
+            media_text = memo[2]
+        else:
+            media_text = await extract_task if extract_task is not None else None
+        if unique_id:
+            self._media_memo[memo_key] = (time.monotonic(), unique_id, media_text)
+            self._media_memo.move_to_end(memo_key)
+            while self._media_memo and (len(self._media_memo) > 2000 or time.monotonic()
+                                        - next(iter(self._media_memo.values()))[0] > self.edit_memory_s):
+                self._media_memo.popitem(last=False)
         icon = {Kind.VIDEO: "🎬 ", Kind.VOICE: "🎙 "}.get(el.kind, "🖼 ")
 
         async def one(lang: str, rs: list[Recipient]) -> None:

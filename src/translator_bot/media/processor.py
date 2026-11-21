@@ -196,7 +196,7 @@ class MediaProcessor:
             else:
                 seconds = self.max_media_seconds if kind == "video" else self.max_video_seconds
                 suffix = F.sniff_container(data, ".webm" if kind == "video_sticker" else ".mp4")
-                if suffix not in (".webm", ".mp4", ".gif"):
+                if suffix not in (".webm", ".mp4", ".gif", ".avi"):
                     raise F.MediaRejected("not a video container")
                 fps = 1.0 if kind == "video" else 4.0
                 fs = await self._run(F.extract_video_frames, data, ffmpeg=self.ffmpeg_path, suffix=suffix,
@@ -266,7 +266,7 @@ class MediaProcessor:
                     tr = vr.translations.get(tg, "")
                     lang = LANGUAGES.get(tg)
                     if tr and lang is not None and (wrong_script(tr, lang.script)
-                                                    or romanized_output(vr.text, tr, lang.script)):
+                                                    or romanized_output(vr.text, tr, lang.script, tg)):
                         self.metrics.inc("media.wrong_script")
                         continue
                     if tr and looks_garbled(vr.text, tr, tg):  # word salad: the text translator redoes it

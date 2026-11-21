@@ -119,7 +119,7 @@ def validate(job: TranslationJob, res: TranslationResult) -> list[str]:
     target = LANGUAGES.get(job.target)
     if target is not None and wrong_script(out_plain, target.script):
         problems.append("wrong_script")
-    elif target is not None and romanized_output(src_plain, out_plain, target.script):
+    elif target is not None and romanized_output(src_plain, out_plain, target.script, job.target):
         problems.append("romanized")
     elif looks_garbled(src_plain, out_plain, job.target):
         problems.append("garbled")
@@ -144,7 +144,10 @@ class Orchestrator:
     def route(self, job: TranslationJob, det: Detection | None, purpose: Purpose) -> list[Route]:
         has_g = "gemini" in self.providers
         deepl = self.providers.get("deepl")
-        deepl_ok = deepl is not None and deepl.supports(job.source_hint, job.target)
+        # Simplified <-> Traditional Chinese is a script conversion DeepL doesn't do (it returns the text
+        # unchanged, verified live), so those go to the LLM only
+        zh_conversion = bool(det and (det.lang or "").lower().startswith("zh") and job.target.lower().startswith("zh"))
+        deepl_ok = deepl is not None and deepl.supports(job.source_hint, job.target) and not zh_conversion
         words = len(html_to_plain(job.text).split()) if job.html else len(job.text.split())
         hard = bool(det and (det.informal or det.romanized or det.mixed or det.verdict is Verdict.UNSURE))
         clean = not hard and words >= 4 and job.style != "ocr"
@@ -167,7 +170,8 @@ class Orchestrator:
             routes.append(Route("gemini", False, "fallback"))
         elif routes and routes[0].provider == "gemini" and deepl_ok and not (det and det.romanized):
             routes.append(Route("deepl", False, "fallback"))
-        elif not routes and deepl_ok:
+        elif not routes and deepl_ok and not (det and det.romanized):
+            # never romanized text: DeepL can't read Hinglish/Arabizi and returns confident nonsense
             routes.append(Route("deepl", False, "last-resort"))
         return routes
 

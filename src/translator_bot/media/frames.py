@@ -163,7 +163,7 @@ def render_tgs(data: bytes, max_json_bytes: int, max_frames: int, size: int = 38
 # an HLS playlist or concat list could read local files (file:// is allowed for our temp input). Forcing the
 # demuxer and whitelisting only it means nothing else is ever parsed.
 _DEMUXER = {".mp4": "mov", ".mov": "mov", ".m4a": "mov", ".webm": "matroska", ".gif": "gif", ".ogg": "ogg",
-            ".oga": "ogg", ".mp3": "mp3"}
+            ".oga": "ogg", ".mp3": "mp3", ".wav": "wav", ".flac": "flac", ".aac": "aac", ".avi": "avi"}
 
 
 def sniff_container(data: bytes, default: str) -> str:
@@ -178,6 +178,14 @@ def sniff_container(data: bytes, default: str) -> str:
         return ".mp4"
     if head[:4] == b"OggS":
         return ".ogg"
+    if head[:4] == b"RIFF" and head[8:12] == b"WAVE":
+        return ".wav"
+    if head[:4] == b"RIFF" and head[8:12] == b"AVI ":
+        return ".avi"
+    if head[:4] == b"fLaC":
+        return ".flac"
+    if head[:2] in (bytes.fromhex("fff1"), bytes.fromhex("fff9")):
+        return ".aac"  # ADTS
     if head[:3] == b"ID3" or head[:2] in (bytes.fromhex("fffb"), bytes.fromhex("fff3"), bytes.fromhex("fff2")):
         return ".mp3"
     return default
@@ -193,7 +201,7 @@ def _input_args(suffix: str) -> list[str]:
 
 def extract_video_frames(data: bytes, *, ffmpeg: str, suffix: str, max_seconds: float, max_frames: int,
                          timeout: float, fps: float = 4.0, width: int = 384) -> FrameSet:
-    if suffix not in (".webm", ".mp4", ".gif"):
+    if suffix not in (".webm", ".mp4", ".gif", ".avi"):
         raise MediaRejected("suffix")
     with tempfile.TemporaryDirectory(prefix="bb_media_") as tmp:
         src = Path(tmp) / f"in{suffix}"  # fixed safe names: no user-controlled paths
@@ -377,7 +385,7 @@ def warmup() -> bool:
 
 def extract_audio(data: bytes, *, ffmpeg: str, suffix: str, max_seconds: float, timeout: float) -> bytes | None:
     """Mono 16 kHz Opus (~24 kbit/s) of the first `max_seconds`; None if the file has no audio track."""
-    if suffix not in (".mp4", ".webm", ".mov", ".ogg", ".oga", ".mp3", ".m4a"):
+    if suffix not in (".mp4", ".webm", ".mov", ".ogg", ".oga", ".mp3", ".m4a", ".wav", ".flac", ".aac", ".avi"):
         raise MediaRejected("suffix")
     with tempfile.TemporaryDirectory(prefix="bb_audio_") as tmp:
         src = Path(tmp) / f"in{suffix}"

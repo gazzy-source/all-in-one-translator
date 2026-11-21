@@ -29,7 +29,7 @@ from translator_bot.providers.base import (
     TranslationResult,
     VisionResult,
 )
-from translator_bot.resilience import DailyQuota, SlidingWindowLimiter
+from translator_bot.resilience import DailyQuota, SlidingWindowLimiter, pacific_today
 
 log = logging.getLogger(__name__)
 
@@ -82,7 +82,7 @@ class GeminiProvider:
         self._store = store
         models = {fast_model, quality_model, vision_model} | ({self.fallback_model} if self.fallback_model else set())
         self._rpm = {m: SlidingWindowLimiter(rpm, 60.0) for m in models}
-        self._rpd = {m: DailyQuota(rpd) for m in models}
+        self._rpd = {m: DailyQuota(rpd, day_fn=pacific_today) for m in models}  # Google resets at Pacific midnight
         # Feature support learned at runtime (some models reject thinkingConfig levels / store).
         self._no_thinking: set[str] = set()
         self._send_store = True
