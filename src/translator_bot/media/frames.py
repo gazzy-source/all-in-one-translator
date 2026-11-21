@@ -110,7 +110,32 @@ def _read_tgs_json(data: bytes, max_json_bytes: int) -> str:
     frames = float(doc["op"]) - float(doc["ip"])
     if not (0 < w <= 1024 and 0 < h <= 1024 and 0 < fr <= 120 and 0 < frames <= 1800):
         raise MediaRejected("lottie bounds")
+    if _has_external_refs(doc):
+        raise MediaRejected("lottie external asset")
     return raw.decode("utf-8")
+
+
+def _has_external_refs(doc: dict[str, Any]) -> bool:
+    """Image layers/assets (and font files) make rlottie open paths on *this* machine: a crafted sticker could
+    pull local files into the frames we send to the vision model. Telegram's TGS format forbids them anyway."""
+    fonts = doc.get("fonts")
+    if isinstance(fonts, dict) and any(isinstance(f, dict) and f.get("fPath") for f in fonts.get("list") or []):
+        return True
+    layer_lists = [doc.get("layers")]
+    for asset in doc.get("assets") or []:
+        if not isinstance(asset, dict):
+            return True
+        if "p" in asset or "u" in asset:  # image asset (file name / directory)
+            return True
+        layer_lists.append(asset.get("layers"))
+    for layers in layer_lists:
+        if layers is None:
+            continue
+        if not isinstance(layers, list):
+            return True
+        if any(not isinstance(layer, dict) or layer.get("ty") == 2 for layer in layers):  # ty 2 = image layer
+            return True
+    return False
 
 
 def render_tgs(data: bytes, max_json_bytes: int, max_frames: int, size: int = 384) -> FrameSet:
@@ -134,6 +159,21 @@ def render_tgs(data: bytes, max_json_bytes: int, max_frames: int, size: int = 38
 # --- video (WEBM sticker, GIF/MP4 animation) -----------------------------------------------------
 
 
+# Demuxer per expected container. ffmpeg picks a demuxer by probing the *content*, so a "video" that is really
+# an HLS playlist or concat list could read local files (file:// is allowed for our temp input). Forcing the
+# demuxer and whitelisting only it means nothing else is ever parsed.
+_DEMUXER = {".mp4": "mov", ".mov": "mov", ".m4a": "mov", ".webm": "matroska", ".gif": "gif", ".ogg": "ogg",
+            ".oga": "ogg", ".mp3": "mp3"}
+
+
+def _input_args(suffix: str) -> list[str]:
+    fmt = _DEMUXER[suffix]
+    args = ["-protocol_whitelist", "file", "-format_whitelist", fmt, "-f", fmt]
+    if fmt == "mov":
+        args += ["-enable_drefs", "0"]  # never follow MP4 external data references (off by default; be explicit)
+    return args
+
+
 def extract_video_frames(data: bytes, *, ffmpeg: str, suffix: str, max_seconds: float, max_frames: int,
                          timeout: float, fps: float = 4.0, width: int = 384) -> FrameSet:
     if suffix not in (".webm", ".mp4", ".gif"):
@@ -143,7 +183,7 @@ def extract_video_frames(data: bytes, *, ffmpeg: str, suffix: str, max_seconds: 
         src.write_bytes(data)
         out_pattern = str(Path(tmp) / "f_%03d.png")
         cmd = [ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error", "-threads", "1",
-               "-protocol_whitelist", "file", "-t", f"{max_seconds:.2f}"]
+               *_input_args(suffix), "-t", f"{max_seconds:.2f}"]
         if suffix == ".webm":
             cmd += ["-c:v", "libvpx-vp9"]  # decoder with alpha support for video stickers
         cmd += ["-i", str(src), "-an", "-sn",
@@ -178,8 +218,8 @@ def _native_webm(data: bytes, ffmpeg: str, max_seconds: float, max_frames: int, 
     with tempfile.TemporaryDirectory(prefix="bb_media_") as tmp:
         src = Path(tmp) / "in.webm"
         src.write_bytes(data)
-        cmd = [ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error", "-threads", "1", "-protocol_whitelist",
-               "file", "-t", f"{max_seconds:.2f}", "-i", str(src), "-an", "-vf",
+        cmd = [ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error", "-threads", "1", *_input_args(".webm"),
+               "-t", f"{max_seconds:.2f}", "-i", str(src), "-an", "-vf",
                f"fps={fps},scale='min({width},iw)':-2", "-frames:v", str(max_frames), str(Path(tmp) / "f_%03d.png")]
         try:
             subprocess.run(cmd, capture_output=True, timeout=timeout, check=False,  # noqa: S603  # nosec B603
@@ -322,8 +362,8 @@ def extract_audio(data: bytes, *, ffmpeg: str, suffix: str, max_seconds: float, 
         src = Path(tmp) / f"in{suffix}"
         src.write_bytes(data)
         out = Path(tmp) / "a.ogg"
-        cmd = [ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error", "-threads", "1", "-protocol_whitelist",
-               "file", "-t", f"{max_seconds:.2f}", "-i", str(src), "-vn", "-sn", "-ac", "1", "-ar", "16000",
+        cmd = [ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error", "-threads", "1", *_input_args(suffix),
+               "-t", f"{max_seconds:.2f}", "-i", str(src), "-vn", "-sn", "-ac", "1", "-ar", "16000",
                "-c:a", "libopus", "-b:a", "24k", str(out)]
         try:
             proc = subprocess.run(cmd, capture_output=True, timeout=timeout, check=False,  # noqa: S603  # nosec B603

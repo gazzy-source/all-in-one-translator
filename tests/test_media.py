@@ -284,3 +284,32 @@ async def test_processor_drops_wrong_script_translation(storage: Storage) -> Non
         assert r is not None and "hi" not in r.translations and r.translations["es"] == "¡BUM!"
     finally:
         await p.close()
+
+
+@needs_ffmpeg
+def test_ffmpeg_never_parses_a_playlist_disguised_as_video(tmp_path: Path) -> None:
+    # HLS playlist pointing at a local file: with content probing, ffmpeg would read it (local file disclosure)
+    secret = tmp_path / "secret.txt"
+    secret.write_text("TOP SECRET\n" * 100)
+    playlist = (f"#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:10.0,\nfile://{secret.as_posix()}\n"
+                "#EXT-X-ENDLIST\n").encode()
+    for suffix in (".mp4", ".webm", ".gif"):
+        with pytest.raises(F.MediaRejected):
+            F.extract_video_frames(playlist, ffmpeg="ffmpeg", suffix=suffix, max_seconds=5, max_frames=4, timeout=20)
+    assert F.extract_audio(playlist, ffmpeg="ffmpeg", suffix=".ogg", max_seconds=5, timeout=20) is None
+    assert F._input_args(".mp4")[:6] == ["-protocol_whitelist", "file", "-format_whitelist", "mov", "-f", "mov"]
+
+
+def test_tgs_with_image_assets_or_layers_is_rejected() -> None:
+    import gzip
+    import json
+
+    base = json.loads(gzip.decompress(lottie_tgs()))
+    image_asset = dict(base, assets=[{"id": "img", "w": 10, "h": 10, "u": "/etc/", "p": "passwd", "e": 0}])
+    image_layer = dict(base, layers=[*base["layers"], {"ty": 2, "refId": "img", "ind": 9}])
+    nested = dict(base, assets=[{"id": "pre", "layers": [{"ty": 2, "refId": "img"}]}])
+    font_file = dict(base, fonts={"list": [{"fName": "x", "fPath": "/etc/passwd"}]})
+    for doc in (image_asset, image_layer, nested, font_file):
+        with pytest.raises(F.MediaRejected, match="external"):
+            F.render_tgs(gzip.compress(json.dumps(doc).encode()), 4_000_000, 4)
+    F.render_tgs(lottie_tgs(), 4_000_000, 4)  # ordinary vector sticker still renders

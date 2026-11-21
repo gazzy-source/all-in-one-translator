@@ -294,3 +294,15 @@ async def test_model_cannot_inject_links_into_plain_translation(h: Harness) -> N
     text = en[0].params["text"]
     assert '<a href="https://evil.example">' not in text  # rendered as literal text, never a live link
     assert "&lt;a href=" in text and "&lt;b&gt;now" in text
+
+
+async def test_edits_respect_disabled_topics_and_send_date(h: Harness) -> None:
+    await h.app.storage.set_topic_enabled(GROUP_ID, 42, False)
+    topic = {"message_thread_id": 42, "is_topic_message": True}
+    msg = group_message("Hola amigos, ¿qué tal todo?", sender=SPANISH_SPEAKER, message_id=901, extra=topic)
+    await h.send(dict(msg, edit_date=int(time.time())), edited=True)  # edit in a disabled topic
+    old = group_message("Hola amigos, ¿qué tal todo?", sender=SPANISH_SPEAKER, message_id=902)
+    old["date"] = int(time.time()) - 3 * 24 * 3600  # sent 3 days ago (> 48 h window), edited now
+    await h.send(dict(old, edit_date=int(time.time())), edited=True)
+    await h.idle()
+    assert h.tg.ephemeral_to(OWNER) == [] and h.gemini.jobs == [] and h.deepl.jobs == []

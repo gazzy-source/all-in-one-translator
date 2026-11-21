@@ -17,6 +17,13 @@
   `<a href="https://evil">your bank</a>` became a live link in a private translation. Plain sources are now
   HTML-escaped; HTML sources keep only links that were already in the original message.
 
+* Media: ffmpeg's demuxer is forced and whitelisted per expected container, so a file disguised as a video
+  (e.g. an HLS playlist or concat list) is never parsed — defence in depth, since recent ffmpeg already refuses
+  HLS with non-standard extensions. MP4 external data references explicitly disabled.
+* Animated (TGS) stickers with image layers/assets or font files are rejected: rlottie would open local paths.
+* Edits now pass the same gates as new messages (disabled topics, length cap), and the edit window is measured
+  from when the message was sent (it was compared with the edit time, so it never applied).
+
 ### Project
 * Repository renamed to `all-in-one-translator`; package renamed to `translator_bot` (default database
   `data/translator.sqlite3`); NOTICE, CI (ruff, mypy, bandit, pytest on

@@ -156,12 +156,22 @@ class Pipeline:
         chat = await self.chat(msg)
         if not chat.enabled or not chat.active or not chat.bot_is_admin:
             return
+        thread = topic_of(msg)
+        # same gates as new messages: disabled topics stay silent
+        if not await self.storage.topic_enabled(msg.chat.id, thread):
+            self.metrics.inc("skip.topic_disabled")
+            return
+        # only messages *sent* recently are retranslated (edit_date is always ~now, so compare the send date)
+        sent = msg.date.timestamp() if msg.date else 0.0
+        if time.time() - sent > self.s.edit_window_s:
+            self.metrics.inc("edit.too_old")
+            return
         res = classify(msg, bot_id=self.bot_id, settings=chat.settings, media_enabled=self.s.media_enabled)
         if isinstance(res, Skip) or res.kind not in (Kind.TEXT, Kind.CAPTION, Kind.GIF, Kind.IMAGE):
             return
-        if msg.edit_date and time.time() - msg.edit_date > self.s.edit_window_s:
-            return
-        thread = topic_of(msg)
+        if len(res.plain) > self.s.max_text_chars:
+            res = Eligible(res.kind, html_escape_truncate(res.plain, self.s.max_text_chars),
+                           truncate(res.plain, self.s.max_text_chars), res.has_media)
         sid = sender_id(msg)
         new_hash = content_hash(res.plain + str(res.kind.value))
         row = await self.storage.get_message(msg.chat.id, msg.message_id)
