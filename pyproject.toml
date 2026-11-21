@@ -66,7 +66,7 @@ ignore = ["S101", "RUF001", "RUF002", "RUF003", "S311", "ASYNC109", "E501", "SIM
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["S", "RUF012"]
 "tests/fixtures.py" = ["S", "B023", "E702"]
-"benchmarks/**" = ["S"]
+"benchmarks/**" = ["S", "ASYNC"]  # one-off scripts: blocking calls in async code are fine
 
 [tool.mypy]
 python_version = "3.13"
