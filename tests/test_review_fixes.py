@@ -217,3 +217,15 @@ def test_cjk_clock_formats_and_thai_laughter_are_not_missing_numbers() -> None:
     assert missing_entities("at 8:30", "9時30分") == ["8:30"]  # a changed time is still caught
     assert missing_entities("555 ขำมากเลยอะ", "lol so funny") == []  # Thai laughter is translated
     assert missing_entities("room 555 please", "habitación por favor") == ["555"]  # a real number stays protected
+
+
+def test_reply_message_id_invalid_means_resend_without_reply() -> None:
+    # observed live 2026-11-22: the ephemeral to one recipient failed with this wording instead of being resent
+    from aiogram.exceptions import TelegramBadRequest
+    from aiogram.methods import SendMessage
+
+    from translator_bot.delivery import TelegramTransport
+
+    exc = TelegramBadRequest(method=SendMessage(chat_id=1, text="x"),
+                             message="Bad Request: REPLY_MESSAGE_ID_INVALID")
+    assert TelegramTransport._map(exc).reason == "reply_not_found"

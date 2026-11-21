@@ -75,7 +75,9 @@ class TelegramTransport:
         if isinstance(exc, TelegramBadRequest):
             if "can't parse entities" in msg or "unsupported start tag" in msg:
                 return DeliveryError("parse_error")
-            if "message to be replied not found" in msg or "replied message not found" in msg:
+            # wording varies by API version: live 2026-11-22 Telegram returned "REPLY_MESSAGE_ID_INVALID"
+            if ("message to be replied not found" in msg or "replied message not found" in msg
+                    or "reply_message_id_invalid" in msg or "message to reply not found" in msg):
                 return DeliveryError("reply_not_found")
             if "not enough rights" in msg or "administrator" in msg or "ephemeral" in msg:
                 return DeliveryError("ephemeral_not_allowed", permanent=True)
