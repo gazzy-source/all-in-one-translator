@@ -1,4 +1,4 @@
-"""Entrypoint: `python -m translator_bot` (or the `translator_bot` console script)."""
+"""Entrypoint: `python -m translator_bot` (or the `translator-bot` console script)."""
 
 from __future__ import annotations
 

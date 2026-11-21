@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.2.2 — 2026-11-21 (media matrix testing)
+
+Found by a new live media benchmark (`benchmarks/bench_media_matrix.py`: 40 items, 22 scripts rendered with real
+text shaping by headless Chrome, video stickers, GIF89a/MP4 GIFs, vector TGS, clean and noisy voice notes).
+First run: recall 94.7%, 0 false positives, 0 garbled, read accuracy 96%; problems below.
+
+### Fixed
+* Fade-in / slide-in video stickers with a small caption were treated as one blank frame (64×64 thumbnails
+  averaged the caption away), so their text was never read (Japanese and Arabic stickers missed). Frames are
+  compared at 128×128 with finer thresholds, and the last frame is always considered.
+* Real GIF89a animations were rejected by the forced ffmpeg demuxer: the container is now chosen from magic
+  bytes (GIF / WebM / MP4 / Ogg / MP3), still with a single whitelisted demuxer.
+* Romanized output for non-Latin-script readers (e.g. `LOL TERA MAZAK CHAL RAHA HAI?` for Hindi) slipped past
+  the script check, which tolerates Latin for names/URLs: new `romanized_output` check on text and media paths.
+* Media translations now pass the garbled-output check too; rejected ones are redone by the text translator.
+* Video on-screen text showed a raw `[screen]` tag to readers; it is now a 📺 icon.
+* Prompts: Thai `555`, Indonesian `wkwk`, Japanese `草`, Arabic `ههه` and similar laughter, and slang terms of
+  address (`machan`, `wey`, `kanka`), are rendered as the reader's equivalent instead of left as-is or
+  transliterated (`सुपर मचान` meant "super scaffolding").
+
 ## 0.2.1 — 2026-11-21
 
 ### Fixed

@@ -166,6 +166,23 @@ _DEMUXER = {".mp4": "mov", ".mov": "mov", ".m4a": "mov", ".webm": "matroska", ".
             ".oga": "ogg", ".mp3": "mp3"}
 
 
+def sniff_container(data: bytes, default: str) -> str:
+    """Container from magic bytes (Telegram "animations" may be real GIFs, not MP4); `default` when unknown.
+    The result picks the one demuxer ffmpeg may use, so a wrong guess fails closed instead of probing."""
+    head = data[:12]
+    if head[:4] in (b"GIF8",):
+        return ".gif"
+    if head[:4] == bytes.fromhex("1a45dfa3"):
+        return ".webm"  # Matroska/WebM (EBML)
+    if head[4:8] == b"ftyp":
+        return ".mp4"
+    if head[:4] == b"OggS":
+        return ".ogg"
+    if head[:3] == b"ID3" or head[:2] in (bytes.fromhex("fffb"), bytes.fromhex("fff3"), bytes.fromhex("fff2")):
+        return ".mp3"
+    return default
+
+
 def _input_args(suffix: str) -> list[str]:
     fmt = _DEMUXER[suffix]
     args = ["-protocol_whitelist", "file", "-format_whitelist", fmt, "-f", fmt]
@@ -252,21 +269,23 @@ def dhash(png: bytes, size: int = 8) -> int:
     return bits
 
 
-def _thumb(png: bytes, size: int = 64):  # type: ignore[no-untyped-def]
+def _thumb(png: bytes, size: int = 128):  # type: ignore[no-untyped-def]
     import numpy as np
 
     with Image.open(io.BytesIO(png)) as im:
         return np.asarray(im.convert("L").resize((size, size), Image.Resampling.BILINEAR), dtype=np.int16)
 
 
-def select_distinct(frames: list[bytes], *, changed_frac: float = 0.012, pixel_delta: int = 40,
+def select_distinct(frames: list[bytes], *, changed_frac: float = 0.004, pixel_delta: int = 28,
                     limit: int = 12) -> list[int]:
     """Indices of visually distinct frames, always keeping the first.
 
-    A frame is kept when >= `changed_frac` of 64x64 grayscale pixels differ by > `pixel_delta` from the
-    last KEPT frame (so slow progressive text reveals still accumulate into a change).
-    Adaptive: static scenes collapse to 1 frame; frames where content (e.g. text) changes survive.
-    (A global dHash misses text changes on a static background.)
+    A frame is kept when >= `changed_frac` of 128x128 grayscale pixels differ by > `pixel_delta` from the
+    last KEPT frame (so slow progressive text reveals still accumulate into a change). The last frame is also
+    kept whenever it differs at all from the last kept one: fade-in / typewriter stickers show the full text at
+    the end. Static scenes collapse to 1 frame; frames where content (e.g. text) changes survive.
+    (64x64 thumbnails averaged a thin caption away: a fade-in sticker looked like one blank frame. A global
+    dHash misses text changes on a static background.)
     """
     if not frames:
         return []
@@ -274,12 +293,14 @@ def select_distinct(frames: list[bytes], *, changed_frac: float = 0.012, pixel_d
     last = _thumb(frames[0])
     for i in range(1, len(frames)):
         cur = _thumb(frames[i])
-        if float((abs(cur - last) > pixel_delta).mean()) >= changed_frac:
+        diff = abs(cur - last) > pixel_delta
+        is_last = i == len(frames) - 1
+        if float(diff.mean()) >= (changed_frac / 4 if is_last else changed_frac):
             keep.append(i)
             last = cur
-    if len(keep) > limit:  # evenly subsample, keep order
-        step = len(keep) / limit
-        keep = [keep[int(i * step)] for i in range(limit)]
+    if len(keep) > limit:  # evenly subsample, keep order (first and last included)
+        step = (len(keep) - 1) / (limit - 1)
+        keep = [keep[round(i * step)] for i in range(limit)]
     return keep
 
 

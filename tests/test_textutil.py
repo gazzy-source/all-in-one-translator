@@ -153,3 +153,19 @@ def test_restrict_links_resists_attribute_tricks() -> None:
         '<a href="https://a.example">x</a>')
     # an evil href in the source's text (not a tag) doesn't whitelist it
     assert restrict_links('<a href="https://evil.example">x</a>', 'href="https://evil.example"') == "x"
+
+
+def test_romanized_output_detection() -> None:
+    from translator_bot.textutil import romanized_output
+
+    # observed live from the vision model for Hindi readers
+    assert romanized_output("MDR T'ES SÉRIEUX ?", "LOL TERA MAZAK CHAL RAHA HAI?", "Devanagari")
+    assert romanized_output("がんばって", "apni poori koshish karo!", "Devanagari")
+    assert romanized_output("hola amigos", "privet druzya kak dela", "Cyrillic")
+    # native script with a few Latin names/brands/URLs is fine
+    assert not romanized_output("check https://x.io and ping @dave before 5",
+                                "https://x.io चेक करें और 5 बजे से पहले @dave को ping करें", "Devanagari")
+    assert not romanized_output("Send it on WhatsApp", "WhatsApp पर भेज दो", "Devanagari")
+    assert not romanized_output("Maria and Dave Smith", "Maria और Dave Smith", "Devanagari")  # copied names
+    assert not romanized_output("x", "anything goes here in latin", "Latin")
+    assert not romanized_output("x", "lol ok", "Devanagari")  # too short to judge

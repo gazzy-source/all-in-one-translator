@@ -30,7 +30,14 @@ from translator_bot.providers.base import (
     TranslationResult,
 )
 from translator_bot.resilience import CircuitBreaker, backoff_delay
-from translator_bot.textutil import html_to_plain, looks_garbled, missing_entities, normalize_for_key, wrong_script
+from translator_bot.textutil import (
+    html_to_plain,
+    looks_garbled,
+    missing_entities,
+    normalize_for_key,
+    romanized_output,
+    wrong_script,
+)
 
 log = logging.getLogger(__name__)
 
@@ -112,6 +119,8 @@ def validate(job: TranslationJob, res: TranslationResult) -> list[str]:
     target = LANGUAGES.get(job.target)
     if target is not None and wrong_script(out_plain, target.script):
         problems.append("wrong_script")
+    elif target is not None and romanized_output(src_plain, out_plain, target.script):
+        problems.append("romanized")
     elif looks_garbled(src_plain, out_plain, job.target):
         problems.append("garbled")
     low = out_plain.lower()

@@ -37,7 +37,10 @@ meaning — never a word-for-word rendering.
 dates and times (values must not change), code, commands, emoji (same emoji, same positions), and \
 the original line breaks.
 - Render laughter and reaction tokens the way target-language chatters write them ("jajaja", "ㅋㅋㅋ", \
-"kkkk", "mdr", "www" -> "hahaha"/"lol" in English); don't leave them untranslated.
+"kkkk", "mdr", "www"/"草", "555" (Thai), "wkwk" (Indonesian), "ههههه", "xD" -> "hahaha"/"lol" in English, \
+"ахаха"/"ору" in Russian, "हाहाहा" in Hindi, "ههههه" in Arabic); don't leave them untranslated.
+- Slang terms of address and in-group words ("machan", "wey", "kanka", "habibi", "bhai") become the target \
+language's natural equivalent ("buddy", "bro"…), never a transliteration a reader can't understand.
 - ALWAYS write the target language in its standard native script (Hindi in Devanagari, Russian in Cyrillic, \
 Arabic in Arabic script, Japanese in kana/kanji), even when the message is casual or romanized. Never \
 transliterate the output into Latin letters unless the target language is written in Latin script.
@@ -114,7 +117,10 @@ set has_text=false.
 5. text = the content exactly as written/spoken (original language). source_language = ISO 639-1 code.
 6. For EACH requested target language, give a natural, idiomatic translation like a native speaker would \
 write (meme/slang tone preserved at the same strength, never cruder; same emphasis/caps style where natural), \
-in that language's standard native script, with no explanations. If the content is already in that target \
+in that language's standard native script — never transliterated into Latin letters (Hindi in Devanagari, not \
+"kya baat hai") — with no explanations. Laughter becomes the target language's laughter ("555" Thai, "wkwk" \
+Indonesian, "草"/"www" Japanese, "kkkk" Portuguese -> "lol"/"hahaha", "ору", "हाहाहा", "ههههه"); slang terms of \
+address become natural equivalents, never transliterations. If the content is already in that target \
 language, return an empty string for it.
 7. confidence (0-1): how sure you are that you read/heard the content correctly."""
 

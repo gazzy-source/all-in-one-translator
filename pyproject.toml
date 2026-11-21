@@ -1,6 +1,6 @@
 [project]
 name = "all-in-one-translator"
-version = "0.2.1"
+version = "0.2.2"
 description = "Private, per-person Telegram group & inline translator (ephemeral messages) with sticker/GIF/image/voice text"
 readme = "README.md"
 requires-python = ">=3.12"

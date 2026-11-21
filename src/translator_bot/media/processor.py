@@ -18,6 +18,7 @@ import asyncio
 import contextlib
 import io
 import logging
+import re
 import time
 from collections.abc import Callable
 from concurrent.futures import ProcessPoolExecutor
@@ -31,9 +32,10 @@ from translator_bot.media import frames as F
 from translator_bot.metrics import Metrics
 from translator_bot.providers.base import ProviderError, VisionProvider
 from translator_bot.storage import Storage
-from translator_bot.textutil import wrong_script
+from translator_bot.textutil import looks_garbled, romanized_output, wrong_script
 
 log = logging.getLogger(__name__)
+_SCREEN_TAG = re.compile(r"(?m)^\s*\[\s*screen\s*\]\s*", re.IGNORECASE)
 
 MediaKind = Literal["image", "sticker", "animated_sticker", "video_sticker", "gif", "video", "voice"]
 PERSISTED: frozenset[str] = frozenset({"sticker", "animated_sticker", "video_sticker", "gif"})
@@ -168,18 +170,21 @@ class MediaProcessor:
                 if len(data) <= 2 * 1024 * 1024 and data[:4] == b"OggS":
                     audio, audio_mime = data, "audio/ogg"  # Telegram voice is already small Opus: send as-is
                 else:
-                    audio = await self._run(F.extract_audio, data, ffmpeg=self.ffmpeg_path, suffix=".ogg",
+                    audio = await self._run(F.extract_audio, data, ffmpeg=self.ffmpeg_path,
+                                            suffix=F.sniff_container(data, ".ogg"),
                                             max_seconds=self.max_media_seconds, timeout=self.timeout_s - 2)
                     audio_mime = "audio/ogg"
             else:
                 seconds = self.max_media_seconds if kind == "video" else self.max_video_seconds
-                suffix = ".webm" if kind == "video_sticker" else ".mp4"
+                suffix = F.sniff_container(data, ".webm" if kind == "video_sticker" else ".mp4")
+                if suffix not in (".webm", ".mp4", ".gif"):
+                    raise F.MediaRejected("not a video container")
                 fps = 1.0 if kind == "video" else 4.0
                 fs = await self._run(F.extract_video_frames, data, ffmpeg=self.ffmpeg_path, suffix=suffix,
                                      max_seconds=seconds, max_frames=self.max_frames, timeout=self.timeout_s - 2,
                                      fps=fps)
-                if kind == "video":
-                    audio = await self._run(F.extract_audio, data, ffmpeg=self.ffmpeg_path, suffix=".mp4",
+                if kind == "video" and suffix != ".gif":  # GIFs carry no audio
+                    audio = await self._run(F.extract_audio, data, ffmpeg=self.ffmpeg_path, suffix=suffix,
                                             max_seconds=self.max_media_seconds, timeout=self.timeout_s - 2)
                     audio_mime = "audio/ogg"
             del data
@@ -225,14 +230,21 @@ class MediaProcessor:
                         await self.storage.put_media(file_unique_id, has_text=False, text=None, source_lang=None,
                                                      confidence=vr.confidence, translations={})
                     return None
+                # the prompt marks on-screen text in videos with "[screen]"; show readers an icon, not a tag
+                vr.text = _SCREEN_TAG.sub("📺 ", vr.text)
+                vr.translations = {k: _SCREEN_TAG.sub("📺 ", v) for k, v in vr.translations.items()}
                 # "" = already in that language, so the text path doesn't redo it. A translation in the wrong
                 # script (e.g. Hebrew letters for a Hindi reader) is dropped: the text translator redoes it.
                 translations: dict[str, str] = {}
                 for tg in targets:
                     tr = vr.translations.get(tg, "")
                     lang = LANGUAGES.get(tg)
-                    if tr and lang is not None and wrong_script(tr, lang.script):
+                    if tr and lang is not None and (wrong_script(tr, lang.script)
+                                                    or romanized_output(vr.text, tr, lang.script)):
                         self.metrics.inc("media.wrong_script")
+                        continue
+                    if tr and looks_garbled(vr.text, tr, tg):  # word salad: the text translator redoes it
+                        self.metrics.inc("media.garbled")
                         continue
                     translations[tg] = tr
                 if persist:

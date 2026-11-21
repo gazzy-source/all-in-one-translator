@@ -351,6 +351,28 @@ def wrong_script(text: str, target_script: str) -> bool:
     return counts.get(target_script, 0) / total < 0.5
 
 
+_LATIN_WORD_RE = re.compile(r"[\p{Latin}][\p{Latin}\p{M}']+")
+
+
+def romanized_output(source: str, translation: str, target_script: str) -> bool:
+    """True when a translation into a non-Latin-script language came back transliterated into Latin letters
+    (observed live: "LOL TERA MAZAK CHAL RAHA HAI?" and "apni poori koshish karo!" for Hindi readers).
+    `wrong_script` tolerates Latin on purpose (names, URLs, brand words), so this checks separately: several
+    Latin words that were not in the source, and Latin letters outnumbering the target script's letters."""
+    if target_script == "Latin":
+        return False
+    src_words = {w.lower() for w in _LATIN_WORD_RE.findall(source)}
+    plain = strip_non_linguistic(translation)
+    new_latin = [w for w in _LATIN_WORD_RE.findall(plain) if w.lower() not in src_words]
+    if len(new_latin) < 3:
+        return False
+    counts = script_counts(plain)
+    if target_script == "Kana":
+        counts["Kana"] = counts.get("Kana", 0) + counts.pop("Han", 0)
+    native = counts.get(target_script, 0)
+    return sum(len(w) for w in new_latin) > 2 * native
+
+
 # Non-Latin-script targets wordfreq can score with plain word splitting (no MeCab/jieba needed).
 _GARBLE_LANGS = frozenset({"ar", "bg", "bn", "el", "fa", "he", "hi", "mk", "ru", "ta", "uk", "ur"})
 _LATIN_TOKEN_RE = re.compile(r"^[\p{Latin}\p{M}']+$")

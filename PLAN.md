@@ -53,7 +53,7 @@ Legend: ✅ done & mock-tested · 🟢 live-verified · ⏳ pending live verific
 
 * Language gate, 103-case corpus authored for this project (not held-out): false-translate 0%, missed 0%,
   source-language accuracy 98% (ms↔id confusion), deferred-to-LLM 6.8%, ~21–34 ms/message on this laptop.
-* Test suite: 344 passed (CI: ubuntu, Python 3.12 + 3.13) (all mocked; media tests use real ffmpeg/rlottie/RapidOCR on synthetic images).
+* Test suite: 353 passed (CI: ubuntu, Python 3.12 + 3.13) (all mocked; media tests use real ffmpeg/rlottie/RapidOCR on synthetic images).
 * ruff, mypy --strict, bandit: clean. pip-audit: no known vulnerabilities.
 
 ## Known gaps / next steps

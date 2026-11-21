@@ -116,7 +116,7 @@ def lottie_text_tgs(text: str, *, font_path: str = "C:/Windows/Fonts/arialbd.ttf
                     size: int = 512) -> bytes:
     """Realistic animated text sticker: glyph outlines converted to Lottie vector shapes (Telegram TGS forbids
     image layers, so real text stickers draw text as shapes). The text slides in and fades in."""
-    from fontTools.pens.recordingPen import RecordingPen
+    from fontTools.pens.recordingPen import DecomposingRecordingPen
     from fontTools.ttLib import TTFont
 
     ft = TTFont(font_path, fontNumber=0)
@@ -132,7 +132,7 @@ def lottie_text_tgs(text: str, *, font_path: str = "C:/Windows/Fonts/arialbd.ttf
     baseline = size * 0.62
     for ch in text:
         gname = cmap.get(ord(ch), ".notdef")
-        pen = RecordingPen()
+        pen = DecomposingRecordingPen(gs)  # composite glyphs (e.g. Cyrillic Р/Е reuse Latin outlines)
         gs[gname].draw(pen)
         contour: list[tuple[float, float, tuple[float, float], tuple[float, float]]] = []
 

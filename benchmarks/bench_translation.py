@@ -66,6 +66,7 @@ async def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--route", default="auto", choices=["auto", "gemini-fast", "gemini-quality", "deepl"])
     ap.add_argument("--limit", type=int, default=0)
+    ap.add_argument("--corpus", default="translation_corpus.json", help="file in benchmarks/")
     ap.add_argument("--pause", type=float, default=0.0, help="seconds between cases (free-tier RPM)")
     args = ap.parse_args()
     s = load_settings()
@@ -83,7 +84,7 @@ async def main() -> None:
         providers["deepl"] = d
     det = LanguageDetector()
     orch = Orchestrator(providers, Metrics())
-    cases = json.loads((HERE / "translation_corpus.json").read_text("utf-8"))
+    cases = json.loads((HERE / args.corpus).read_text("utf-8"))
     if args.limit:
         cases = cases[: args.limit]
     rows: list[dict[str, Any]] = []
@@ -150,7 +151,7 @@ async def main() -> None:
                         for t in sorted({t for r in tr for t in r["tags"]})},
     }
     print(json.dumps(summary, indent=2, ensure_ascii=False))
-    out_path = HERE / "results" / f"translation-{args.route}-{time.strftime('%Y%m%d-%H%M%S')}.json"
+    out_path = HERE / "results" / f"translation-{Path(args.corpus).stem}-{args.route}-{time.strftime('%Y%m%d-%H%M%S')}.json"
     out_path.parent.mkdir(exist_ok=True)
     out_path.write_text(json.dumps({"summary": summary, "rows": rows}, indent=2, ensure_ascii=False), "utf-8")
     print(f"wrote {out_path}")

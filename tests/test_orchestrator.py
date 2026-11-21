@@ -156,3 +156,13 @@ async def test_garbled_output_escalates_then_falls_back_to_deepl() -> None:
                             det(lang="fr", informal=True))
     assert [q for _, q in g.jobs] == [False, True]  # escalated once, still garbled
     assert res is not None and res.provider == "deepl"  # then the other provider family
+
+
+async def test_romanized_output_escalates_then_falls_back_to_deepl() -> None:
+    g, d = FakeProvider("gemini"), FakeProvider("deepl", supported={"fr", "hi"})
+    g.overrides["Grave, c'était ouf, on remet ça samedi ?"] = "sach mein bahut maza aaya, shanivaar ko phir se?"
+    o = orch(gemini=g, deepl=d)
+    res = await o.translate(TranslationJob("Grave, c'était ouf, on remet ça samedi ?", "hi", "fr"),
+                            det(lang="fr", informal=True))
+    assert [q for _, q in g.jobs] == [False, True]
+    assert res is not None and res.provider == "deepl"

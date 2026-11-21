@@ -313,3 +313,79 @@ def test_tgs_with_image_assets_or_layers_is_rejected() -> None:
         with pytest.raises(F.MediaRejected, match="external"):
             F.render_tgs(gzip.compress(json.dumps(doc).encode()), 4_000_000, 4)
     F.render_tgs(lottie_tgs(), 4_000_000, 4)  # ordinary vector sticker still renders
+
+
+@needs_ffmpeg
+async def test_real_gif89a_animation_is_decoded(storage: Storage) -> None:
+    # Telegram "animations" are usually MP4 but can be real GIFs; the forced demuxer must follow the bytes
+    from PIL import Image
+
+    frames = [Image.open(io.BytesIO(text_image(t))).convert("RGB") for t in ("WAIT", "WHAT")]
+    buf = io.BytesIO()
+    frames[0].save(buf, format="GIF", save_all=True, append_images=frames[1:], duration=600, loop=0)
+    assert buf.getvalue()[:6] == b"GIF89a"
+    assert F.sniff_container(buf.getvalue(), ".mp4") == ".gif"
+    fs = F.extract_video_frames(buf.getvalue(), ffmpeg="ffmpeg", suffix=".gif", max_seconds=5, max_frames=8,
+                                timeout=20)
+    assert fs.animated and len(fs.frames) >= 2
+    p = processor(FakeBot(buf.getvalue()), storage, FakeVision())
+    try:
+        r = await p.extract(file_id="f", file_unique_id="gif89", size=None, kind="gif", targets=["es"])
+        assert r is not None and r.has_text
+    finally:
+        await p.close()
+
+
+async def test_media_translation_word_salad_is_dropped_for_text_retry(storage: Storage) -> None:
+    class SaladVision(FakeVision):
+        async def read_images(self, *a: Any, **kw: Any) -> VisionResult:
+            r = await super().read_images(*a, **kw)
+            r.translations["ru"] = "Жестче азец гага Чтев деет завтра?"  # observed live from 3.5-flash-lite
+            return r
+
+    p = processor(FakeBot(text_image("NO WAY BRO")), storage, SaladVision())
+    try:
+        r = await p.extract(file_id="f", file_unique_id="salad", size=None, kind="image", targets=["es", "ru"])
+        assert r is not None and r.translations.get("es") == "¡NI DE BROMA!"
+        assert "ru" not in r.translations  # missing -> the pipeline's text translator (validated) redoes it
+    finally:
+        await p.close()
+
+
+def test_fade_in_caption_frames_are_kept() -> None:
+    # small caption fading in over a static character: 64x64 thumbnails averaged it away (live miss)
+    from PIL import Image, ImageDraw
+
+    frames = []
+    for alpha in (0, 0, 90, 180, 255, 255):
+        im = Image.new("RGB", (512, 512), (128, 128, 128))
+        d = ImageDraw.Draw(im)
+        d.ellipse((150, 200, 360, 410), fill=(250, 200, 60))
+        d.text((190, 30), "YALLA", fill=(alpha, alpha, alpha), font=_fixture_font(40))
+        buf = io.BytesIO()
+        im.save(buf, "PNG")
+        frames.append(buf.getvalue())
+    idx = F.select_distinct(frames)
+    assert idx[0] == 0 and any(i >= 3 for i in idx)  # a frame with the full caption survives
+
+
+def _fixture_font(size: int) -> Any:
+    from tests.fixtures import _font
+
+    return _font(size)
+
+
+async def test_screen_tag_becomes_icon(storage: Storage) -> None:
+    class ScreenVision(FakeVision):
+        async def read_images(self, *a: Any, **kw: Any) -> VisionResult:
+            return VisionResult(True, "Check this out\n[screen] OFERTA HOY", "en",
+                                {"es": "Mira esto\n[screen] OFERTA HOY", "hi": "यह देखो\n[Screen] आज का ऑफर"},
+                                0.9, "gemini", "m")
+
+    p = processor(FakeBot(text_image("OFERTA HOY")), storage, ScreenVision())
+    try:
+        r = await p.extract(file_id="f", file_unique_id="scr", size=None, kind="image", targets=["es", "hi"])
+        assert r is not None and "[screen]" not in r.text.lower() and "📺 OFERTA HOY" in r.text
+        assert all("[screen]" not in t.lower() and "📺" in t for t in r.translations.values())
+    finally:
+        await p.close()
