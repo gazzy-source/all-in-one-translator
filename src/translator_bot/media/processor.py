@@ -124,6 +124,8 @@ class MediaProcessor:
         """Text/speech found in the media with translations into `targets` (when available), or None."""
         if kind in AUDIO_KINDS and duration is not None and duration > self.max_media_seconds:
             self.metrics.inc(f"media.too_long.{kind}")
+            log.info("media skipped: too long", extra={"kind": kind, "seconds": duration,
+                                                       "limit": self.max_media_seconds})
             return None
         cached = await self.storage.get_media(file_unique_id, self.cache_ttl_s) if kind in PERSISTED else None
         if cached is not None:
@@ -245,6 +247,11 @@ class MediaProcessor:
                 self.metrics.inc("media.vision")
                 self.metrics.observe(f"media_ms.{kind}", (time.perf_counter() - t_start) * 1000)
                 if not vr.has_text or vr.confidence < self.ocr_min_confidence or not vr.text:
+                    self.metrics.inc(f"media.no_text.{kind}")
+                    # reason only, never the content
+                    log.info("media: nothing to translate", extra={
+                        "kind": kind, "has_text": vr.has_text, "confidence": round(vr.confidence, 2),
+                        "chars": len(vr.text or ""), "min_confidence": self.ocr_min_confidence})
                     if persist:
                         await self.storage.put_media(file_unique_id, has_text=False, text=None, source_lang=None,
                                                      confidence=vr.confidence, translations={})

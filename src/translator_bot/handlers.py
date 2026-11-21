@@ -378,6 +378,11 @@ def _status_text(app: App) -> str:
             "fallback", "validation_fail", "skip.already_target", "media.vision", "media.no_text")
     lines = ["<b>Status</b>", f"uptime {snap['uptime_s']}s · public output blocked: {app.guard.blocked}"]
     lines += [f"{k}: {c.get(k, 0)}" for k in keys]
+    media = {k: v for k, v in c.items() if k.startswith(("media.too_long", "media.no_text.", "media.rejected",
+                                                          "media.vision_error", "media.error"))}
+    if media:
+        lines.append("<b>Media skipped</b>")
+        lines += [f"{html.escape(k)}: {v}" for k, v in sorted(media.items())]
     fails = {k: v for k, v in c.items() if k.startswith(("delivery_fail", "provider_error"))}
     if fails:
         lines.append("<b>Failures</b>")
