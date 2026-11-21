@@ -1,0 +1,111 @@
+"""Who receives translations of a given group message, and in which language.
+
+Recipients = (owners ∪ owner-approved users) who are
+  * current members of the group (verified with getChatMember, short-lived cache),
+  * not paused globally and not muted for this group,
+  * not the author of the message (you never get your own message translated back to you),
+  * onboarded, unless onboarding is optional (then English is used and the user is told once).
+A failure or setting for one recipient never affects another: each recipient is resolved independently.
+"""
+
+from __future__ import annotations
+
+import logging
+import time
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
+
+from translator_bot.storage import Storage, User
+
+log = logging.getLogger(__name__)
+
+MemberCheck = Callable[[int, int], Awaitable[bool]]  # (chat_id, user_id) -> is current member
+
+
+@dataclass(frozen=True, slots=True)
+class Recipient:
+    user_id: int
+    lang: str
+    using_default: bool  # never chose a language -> English default (user informed once)
+    dm_fallback: bool  # consented to private-chat fallback if ephemeral delivery fails
+    notice_pending: bool
+
+
+class MembershipCache:
+    def __init__(self, check: MemberCheck, ttl_s: float = 600, negative_ttl_s: float = 120,
+                 max_items: int = 100_000) -> None:
+        self._check = check
+        self.ttl_s, self.negative_ttl_s, self.max_items = ttl_s, negative_ttl_s, max_items
+        self._cache: dict[tuple[int, int], tuple[float, bool]] = {}
+
+    async def is_member(self, chat_id: int, user_id: int) -> bool:
+        key = (chat_id, user_id)
+        now = time.monotonic()
+        hit = self._cache.get(key)
+        if hit is not None:
+            ts, val = hit
+            if now - ts < (self.ttl_s if val else self.negative_ttl_s):
+                return val
+        try:
+            val = await self._check(chat_id, user_id)
+        except Exception:  # API hiccup: fail closed (no delivery) but don't cache long
+            log.warning("membership check failed", extra={"chat_id": chat_id})
+            self._cache[key] = (now - self.negative_ttl_s + 15, False)
+            return False
+        if len(self._cache) >= self.max_items:
+            self._cache.clear()
+        self._cache[key] = (now, val)
+        return val
+
+    def invalidate(self, chat_id: int, user_id: int | None = None) -> None:
+        if user_id is None:
+            for k in [k for k in self._cache if k[0] == chat_id]:
+                del self._cache[k]
+        else:
+            self._cache.pop((chat_id, user_id), None)
+
+    def set(self, chat_id: int, user_id: int, is_member: bool) -> None:
+        self._cache[(chat_id, user_id)] = (time.monotonic(), is_member)
+
+
+class RecipientResolver:
+    def __init__(self, storage: Storage, membership: MembershipCache, owner_ids: list[int], *,
+                 default_lang: str = "en", onboarding_required: bool = False) -> None:
+        self.storage = storage
+        self.membership = membership
+        self.owner_ids = list(owner_ids)
+        self.default_lang = default_lang
+        self.onboarding_required = onboarding_required
+
+    def is_owner(self, user_id: int) -> bool:
+        return user_id in self.owner_ids
+
+    async def is_approved(self, user_id: int) -> bool:
+        if self.is_owner(user_id):
+            return True
+        u = await self.storage.get_user(user_id)
+        return bool(u and u.approved)
+
+    async def candidates(self) -> list[User]:
+        users = {u.user_id: u for u in await self.storage.approved_users()}
+        for oid in self.owner_ids:
+            if oid not in users:
+                users[oid] = await self.storage.get_user(oid) or User(user_id=oid, approved=True)
+        return list(users.values())
+
+    async def resolve(self, chat_id: int, sender_id: int | None) -> list[Recipient]:
+        muted = await self.storage.muted_users(chat_id)
+        out: list[Recipient] = []
+        for u in await self.candidates():
+            if u.user_id == sender_id or u.paused or u.user_id in muted:
+                continue
+            if self.onboarding_required and not u.onboarded:
+                continue
+            if not await self.membership.is_member(chat_id, u.user_id):
+                continue
+            using_default = not u.lang
+            out.append(Recipient(
+                user_id=u.user_id, lang=u.lang or self.default_lang, using_default=using_default,
+                dm_fallback=u.dm_fallback and u.started, notice_pending=using_default and not u.default_notice_sent,
+            ))
+        return out

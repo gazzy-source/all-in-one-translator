@@ -1,0 +1,17 @@
+All-in-One Translator Bot
+Copyright (c) 2026 Gazzy Labs
+
+This project uses third-party open source components. See LICENSE (MIT) for
+the terms of this project.
+
+Third-party components (selected):
+  - aiogram — MIT; see upstream LICENSE
+  - lingua-language-detector — Apache-2.0
+  - wordfreq — Apache-2.0 (word lists: CC BY-SA 4.0; see upstream)
+  - RapidOCR (rapidocr-onnxruntime) — Apache-2.0
+  - rlottie-python — LGPL-2.1 (dynamically used, unmodified); see upstream
+  - FFmpeg — LGPL/GPL depending on build; installed separately or via the Docker image
+
+External services: Google Gemini API and DeepL API are used under their own
+terms. Operators are responsible for their API keys, quotas and data-use terms,
+and must comply with the Telegram Bot API Terms of Service.

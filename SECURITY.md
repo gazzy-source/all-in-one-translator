@@ -1,0 +1,41 @@
+# Security
+
+## Reporting a vulnerability
+
+**Please don't open a public issue for security problems.** Report privately through a
+[GitHub Security Advisory](https://github.com/gazzy-source/all-in-one-translator/security/advisories/new) on this
+repository. Include the affected version/commit, steps to reproduce and the impact; redact tokens, API keys and
+other people's messages. Supported version: `main` (latest); older tags best-effort.
+
+# Security review
+
+Scope: `src/translator_bot` at v0.2.1. Tools: bandit 1.9.4 (clean after reviewed suppressions), pip-audit 2.10.1
+(no known vulnerabilities in dependencies), ruff security rules (S), mypy --strict, and a manual review.
+
+| Area | Risk | Mitigation | Verified by |
+|---|---|---|---|
+| Public output / group interference | Bug or future change posts in a group | `PublicOutputGuard` request middleware rejects every group-visible method (send/forward/copy/react/pin/edit/delete/chat action) unless it is an ephemeral send/edit to a specific receiver; no group-scope command menu | `tests/test_guard.py` (incl. live request chain), e2e `public_group_output() == []` |
+| Unauthorized recipients | Non-approved user receives translations | Recipients = owners ∪ approved IDs, re-checked per message; membership verified via `getChatMember` (cached ≤10 min, fail-closed) and invalidated by `chat_member` updates; DM fallback re-checks membership uncached and never fires on `not_member` | `test_e2e_group`, `test_regressions` |
+| Unauthorized configuration | Members change settings | Owner-only commands check `OWNER_IDS`; group owner commands silently ignored for others; callbacks re-verify approval/ownership; settings keyboards only work in private chat | e2e tests |
+| Cross-user / cross-group leakage | One user's prefs/translations visible to another | Ephemeral messages are receiver-scoped; per-user rows keyed by Telegram ID; translation cache shares only context-free, content-addressed entries (same input → same output); context/glossary-dependent entries are chat-scoped | `test_orchestrator::test_cache_and_context_scoping` |
+| Token / key exposure | Secrets in logs, URLs, errors | `SecretStr` settings; config errors list field names only; Gemini key sent in header (`x-goog-api-key`), never URL; provider errors keep only status/reason; httpx/httpcore loggers at WARNING; `.env` git-ignored | `test_providers` (key not in URL / error) |
+| Logging private content | Message text in logs | No log call includes message text; metrics are counters/latencies only | code review |
+| Prompt / OCR injection | Message tells the LLM to do something else | Message is JSON *data* in the user turn; system prompt says it is untrusted and must be translated, never followed; structured JSON output; output sanitized to a Telegram-HTML whitelist; translations can't trigger bot actions | `test_gemini_prompt_injection_stays_data`; live benchmark case `es-inject-1` |
+| HTML injection / link spoofing | Provider output breaks Telegram HTML or adds a disguised link (`<a href=evil>your bank</a>`) via prompt injection or OCR'd text | Plain-text sources and all image/sticker/voice text: model output is HTML-escaped (no markup possible). HTML sources: `restrict_links` keeps only hrefs present in the original, then the whitelist sanitizer (`b,i,u,s,code,pre,a[http/https/tg/mailto],tg-spoiler,blockquote`) drops unknown tags; parse failure → plain-text resend | `test_textutil::test_sanitize`, `test_restrict_links_drops_links_not_in_source`, `test_e2e_group::test_model_cannot_inject_links_into_plain_translation` |
+| SQL injection | Dynamic SQL | Values always bound; dynamic column names only from fixed allow-lists (unknown fields raise) | `test_upsert_rejects_unknown_fields` |
+| Malicious media | Decompression bombs, gzip bombs, huge videos, parser exploits | Size cap before download (8 MB; Telegram cap 20 MB); Pillow `MAX_IMAGE_PIXELS` + dimension checks + `verify()`; TGS read with byte cap and Lottie bounds (≤1024 px, ≤1800 frames); ffmpeg: argv list (no shell), fixed temp names, `-protocol_whitelist file`, `-t`/frame caps, 1 thread, timeout; native decoders run in a separate process pool, recycled on timeout | `test_media` (bombs, garbage, limits) |
+| Path traversal / SSRF | Attacker-controlled paths/URLs | Files only fetched via Telegram `getFile` paths; temp files have fixed names inside `TemporaryDirectory`; no user-supplied URL is ever fetched | code review |
+| Temp files | Media left on disk | `TemporaryDirectory` context managers; images processed in memory | code review |
+| Resource exhaustion / DoS | Floods, huge texts, inline spam | Bounded lanes (global + per chat), dedupe, job timeouts, burst coalescing, `MAX_TEXT_CHARS`, per-user inline limiter + debounce, provider RPM/RPD guards, circuit breakers | `test_storage_queue` |
+| Webhook spoofing | Fake updates | Secret token required (≥16 chars) and verified by aiogram | config validation |
+| Deserialization | Unsafe loads | Only `json`; no pickle of external data (process-pool arguments are our own bytes) | code review |
+| Permissions | Over-privileged bot | Works as admin with **all rights off**; never needs delete/pin/edit rights | setup report |
+
+## Remaining concerns
+
+* Free-tier providers may use submitted text to improve their services (stated in `/privacy`). For sensitive
+  groups use paid tiers with no-training terms.
+* Ephemeral messages are processed by Telegram servers like any message; this is not end-to-end encryption.
+* Process-pool hard-kill uses a private CPython attribute (best effort); on hang the pool is replaced regardless.
+* The live Telegram behaviour of ephemeral messages (offline delivery, persistence) is documented by Telegram as
+  best-effort and must be observed in the three-account test.

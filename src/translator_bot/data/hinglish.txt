@@ -1,0 +1,240 @@
+# Romanized Hindi/Urdu (Hinglish) tokens. Format: token[ weight]. weight 1.0 = unambiguous, 0.4 = also a common word elsewhere.
+hai
+hain
+kya
+kyaa
+nahi
+nahin
+nhi
+yaar
+yar 0.6
+bhai
+bhaiya
+behen
+kal 0.7
+aaj
+abhi
+milte
+milenge
+kaise
+kaisa
+kaisi
+kahan
+kaha
+kidhar
+idhar
+udhar
+mujhe
+mujhko
+tujhe
+tujhko
+tumhe
+tumko
+tum 0.7
+aap 0.8
+apna
+apni
+mera
+meri
+mere
+tera
+teri
+tere
+uska
+uski
+haan
+han 0.3
+accha
+acha
+achha
+theek
+thik
+chal 0.6
+chalo
+chalega
+bas 0.4
+matlab
+kuch
+kuchh
+sab 0.4
+sabko
+bahut
+bohot
+bahot
+bhi 0.9
+aur 0.9
+lekin
+magar
+kyun
+kyu
+kyon
+kab
+kaun
+kon 0.5
+hoga
+hogi
+raha
+rahi
+rahe
+karna
+karo
+karte
+karta
+karti
+kiya
+kiye
+gaya
+gayi
+gaye
+dekh
+dekho
+dekha
+bol
+bolo
+bola
+sun 0.3
+suno
+suna
+pata
+phir
+fir 0.4
+wala
+wali
+wale
+jaldi
+khana
+paani
+pani 0.6
+ghar
+dost
+pyaar
+pyar
+dil 0.5
+yaha
+yahan
+waha
+wahan
+mat 0.3
+kar 0.4
+ho 0.3
+hu 0.5
+hoon
+hun 0.4
+tha
+thi
+the 0.05
+toh
+tho
+na 0.2
+nai 0.5
+koi
+kisi
+jab
+tab 0.2
+agar
+bilkul
+zaroor
+zarur
+shukriya
+dhanyavad
+namaste
+arre
+arey
+are 0.05
+oye
+chup
+pagal
+bakwas
+sahi
+galat
+bindaas
+jugaad
+paisa
+paise
+log 0.2
+logo
+kaam
+naya
+purana
+chhota
+bada
+thoda
+zyada
+jyada
+samajh
+samjha
+samjhe
+bata
+batao
+bataya
+lagta
+lagti
+laga
+chahiye
+sakta
+sakti
+sakte
+jaana
+jana 0.5
+aana
+aaja
+aao
+jao
+rehne
+dena
+lena
+diya
+liya
+mil 0.3
+milna
+kitna
+kitne
+kitni
+sach
+jhooth
+bhagwan
+khuda
+inshallah 0.3
+mashallah 0.3
+scene 0.05
+yeh
+ye 0.6
+woh
+wo 0.5
+vasool
+wasool
+bhot
+bahut
+kaafi
+kafi
+mast
+ekdum
+pakka
+bekaar
+faltu
+achchha
+abey
+abe 0.6
+yahi
+wahi
+apun
+humko
+humein
+hume
+tumhara
+tumhari
+mujhse
+tujhse
+uske
+unka
+unki
+kyunki
+isliye
+phirse
+lagega
+karega
+karegi
+jayega
+jaayega
+dekhenge
+chalenge
