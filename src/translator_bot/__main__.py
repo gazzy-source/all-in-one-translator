@@ -50,11 +50,8 @@ def setup_logging(level: str, as_json: bool) -> None:
 
 def health_app(app: App) -> web.Application:
     async def healthz(_: web.Request) -> web.Response:
-        ok = app.pipeline is not None
-        body = {"ok": ok, "providers": sorted(app.providers), "guard_blocked": app.guard.blocked,
-                "queues": {"text": app.pipeline.text_lane.size, "media": app.pipeline.media_lane.size}
-                if app.pipeline else {}}
-        return web.json_response(body, status=200 if ok else 503)
+        body = await app.health()
+        return web.json_response(body, status=200 if body["ok"] else 503)
 
     wapp = web.Application()
     wapp.router.add_get("/healthz", healthz)
@@ -90,7 +87,10 @@ async def run(settings: Settings) -> None:
             await app.bot.set_webhook(settings.webhook_url, secret_token=settings.webhook_secret.get_secret_value(),
                                       allowed_updates=ALLOWED_UPDATES, drop_pending_updates=False)
             log.info("webhook mode", extra={"listen": f"{settings.listen_host}:{settings.listen_port}"})
-            await stop.wait()
+            stopper, fatal = asyncio.create_task(stop.wait()), asyncio.create_task(app.fatal.wait())
+            await asyncio.wait({stopper, fatal}, return_when=asyncio.FIRST_COMPLETED)
+            for t in (stopper, fatal):
+                t.cancel()
         else:
             if settings.health_port:
                 runner = web.AppRunner(health_app(app))
@@ -101,15 +101,19 @@ async def run(settings: Settings) -> None:
             polling = asyncio.create_task(dp.start_polling(app.bot, allowed_updates=ALLOWED_UPDATES,
                                                            handle_signals=False, close_bot_session=False))
             stopper = asyncio.create_task(stop.wait())
-            await asyncio.wait({polling, stopper}, return_when=asyncio.FIRST_COMPLETED)
+            fatal = asyncio.create_task(app.fatal.wait())
+            await asyncio.wait({polling, stopper, fatal}, return_when=asyncio.FIRST_COMPLETED)
             await dp.stop_polling()
             await asyncio.gather(polling, return_exceptions=True)
             stopper.cancel()
+            fatal.cancel()
     finally:
         log.info("shutting down: draining queues")
         if runner is not None:
             await runner.cleanup()
         await app.stop()
+    if app.fatal.is_set():
+        raise SystemExit(f"exiting for restart: {app.fatal_reason}")  # non-zero -> Docker/systemd restart
 
 
 def main() -> None:

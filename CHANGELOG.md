@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.0.0 — 2026-11-22 (production release)
+
+### Production
+* **Self-healing:** `/healthz` reports dead queue workers and an unresponsive database (it used to say OK as long
+  as the process existed); a watchdog exits non-zero after two failed checks so Docker/systemd restart the bot.
+* **Docker:** `HEALTHCHECK`, `init` (reaps ffmpeg children), log rotation, JSON logs, `cap_drop: ALL`, graceful
+  30 s drain, health port on by default; image published to `ghcr.io/gazzy-source/all-in-one-translator` on
+  version tags.
+* **CI:** builds the production image and runs a native-media smoke test inside it on a read-only root FS
+  (ffmpeg with forced demuxers, rlottie, RapidOCR, language gate) plus an invalid-config exit check;
+  `pip-audit` dependency scan.
+* **Backups:** `python -m translator_bot.backup` — online SQLite backup (safe while running), integrity-checked,
+  rotated.
+* **Docs:** [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) — Docker and systemd setups, group setup, backups, updates,
+  webhook mode, free-tier limits, troubleshooting by log line.
+* Every setting is documented in `.env.example` (a test enforces it); unused `FFPROBE_PATH` removed.
+
 ## 0.2.5 — 2026-11-22 (review of recent fixes)
 
 A fresh review of the 0.2.1–0.2.4 changes found regressions introduced by them; all fixed with tests.

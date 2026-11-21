@@ -355,6 +355,10 @@ class Storage:
             (chat_id, message_id, recipient_id, channel, ephemeral_id, dm_message_id, lang, status, error, _now()))
         await self.db.commit()
 
+    async def ping(self) -> None:
+        cur = await self.db.execute("SELECT 1")
+        await cur.fetchone()
+
     async def messages_for_ephemeral(self, chat_id: int, ephemeral_id: int) -> list[int]:
         """Original message ids whose translation lives in this ephemeral (a burst covers several)."""
         cur = await self.db.execute("SELECT DISTINCT message_id FROM deliveries WHERE chat_id=? AND ephemeral_id=?",

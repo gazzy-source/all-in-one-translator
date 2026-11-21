@@ -173,3 +173,23 @@ async def test_burst_disabled() -> None:
     b = BurstCoalescer(cb, window=0)
     await b.add((1, None, 1), BurstItem(9, "x", "x"), None)
     assert flushed == [9]
+
+
+async def test_online_backup_while_open(tmp_path: Path) -> None:
+    from translator_bot.backup import backup
+
+    st = Storage(tmp_path / "live.sqlite3")
+    await st.open()
+    try:
+        await st.upsert_chat(-100, title="Group", enabled=True)  # bot running: WAL has uncheckpointed data
+        out = backup(tmp_path / "live.sqlite3", tmp_path / "backups", keep=2)
+        import sqlite3
+
+        con = sqlite3.connect(out)
+        assert con.execute("SELECT title FROM chats WHERE chat_id=-100").fetchone()[0] == "Group"
+        con.close()
+        for _ in range(3):
+            backup(tmp_path / "live.sqlite3", tmp_path / "backups", keep=2)
+        assert len(list((tmp_path / "backups").glob("translator-*.sqlite3"))) <= 2
+    finally:
+        await st.close()

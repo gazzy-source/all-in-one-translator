@@ -1,18 +1,33 @@
+# Production: `docker compose up -d` (builds locally), or set TRANSLATOR_IMAGE to use the published image:
+#   TRANSLATOR_IMAGE=ghcr.io/gazzy-source/all-in-one-translator:latest docker compose up -d
 services:
   translator:
+    image: ${TRANSLATOR_IMAGE:-all-in-one-translator:local}
     build: .
     env_file: .env
     environment:
       DATABASE_PATH: /app/data/translator.sqlite3
       HEALTH_PORT: "8081"
       LISTEN_HOST: 0.0.0.0
+      LOG_JSON: "true"
     volumes:
       - ./data:/app/data
     restart: unless-stopped
+    init: true                 # reaps ffmpeg/worker child processes (PID 1 doesn't)
+    stop_grace_period: 30s     # lets queued translations drain on shutdown
     read_only: true
     tmpfs:
       - /tmp
     security_opt:
       - no-new-privileges:true
+    cap_drop: [ALL]
     mem_limit: 1g
     cpus: 2
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+    # Webhook mode only (RUN_MODE=webhook): expose LISTEN_PORT behind your HTTPS reverse proxy.
+    # ports:
+    #   - "127.0.0.1:8080:8080"

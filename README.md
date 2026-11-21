@@ -10,7 +10,7 @@ Nobody else sees anything.**
 [![CI](https://github.com/gazzy-source/all-in-one-translator/actions/workflows/ci.yml/badge.svg)](https://github.com/gazzy-source/all-in-one-translator/actions/workflows/ci.yml)
 ![Python](https://img.shields.io/badge/python-3.12%2B-3B5BDB)
 ![aiogram](https://img.shields.io/badge/aiogram-3.33%20%C2%B7%20Bot%20API%2010.4-2BC4B5)
-![Tests](https://img.shields.io/badge/tests-340%2B%20passing-2BC4B5)
+![Tests](https://img.shields.io/badge/tests-380%2B%20passing-2BC4B5)
 ![mypy](https://img.shields.io/badge/mypy-strict-3B5BDB)
 ![License](https://img.shields.io/badge/license-MIT-F5A524)
 
@@ -150,6 +150,10 @@ Requirements: Python 3.12+, `ffmpeg` on PATH (GIFs/video/voice), a bot token fro
 ID, and at least one free API key: [Gemini](https://aistudio.google.com/apikey) and/or
 [DeepL API Free](https://www.deepl.com/pro-api). Docker: `docker compose up -d --build`.
 
+**Production:** see [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) — Docker or systemd on any always-on Linux machine,
+published image on GHCR, health checks with self-healing restarts, online backups
+(`python -m translator_bot.backup`), updating, webhook mode, free-tier limits and troubleshooting.
+
 ### BotFather
 1. `/newbot` → token. 2. `/setinline` → enable inline mode. 3. Privacy mode can stay on (admin bots receive all messages).
 
@@ -188,7 +192,7 @@ Unknown users get a polite access-denied message showing their ID to send to the
 
 ## 🧪 Testing
 
-- **340+ automated tests** including end-to-end runs through the real aiogram dispatcher against a recording fake
+- **380+ automated tests** including end-to-end runs through the real aiogram dispatcher against a recording fake
   Telegram (asserting zero public group output), provider adapters against recorded API shapes, and media tests with
   real ffmpeg/rlottie/OCR on generated fixtures.
 - **Live benchmarks**: `benchmarks/bench_translation.py`, `bench_language_matrix.py`, `bench_media.py`,
@@ -223,6 +227,7 @@ optional paid-tier providers with no-training terms.
 | `benchmarks/` | Corpora, benchmark runners and live results |
 | `scripts/` | Live Telegram and provider probes |
 | [ARCHITECTURE.md](ARCHITECTURE.md) | Design, data flow, decisions, cost model |
+| [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) | Production deployment, backups, updates, troubleshooting |
 | [COMPETITIVE_ANALYSIS.md](COMPETITIVE_ANALYSIS.md) | Comparison with existing translator bots |
 | [SECURITY.md](SECURITY.md) | Security review |
 | [PLAN.md](PLAN.md) | Status and live-verification log |

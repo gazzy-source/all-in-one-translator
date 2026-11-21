@@ -1,6 +1,6 @@
 [project]
 name = "all-in-one-translator"
-version = "0.2.5"
+version = "1.0.0"
 description = "Private, per-person Telegram group & inline translator (ephemeral messages) with sticker/GIF/image/voice text"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -67,6 +67,7 @@ ignore = ["S101", "RUF001", "RUF002", "RUF003", "S311", "ASYNC109", "E501", "SIM
 "tests/**" = ["S", "RUF012"]
 "tests/fixtures.py" = ["S", "B023", "E702"]
 "benchmarks/**" = ["S", "ASYNC"]  # one-off scripts: blocking calls in async code are fine
+"scripts/container_smoke.py" = ["S603", "S607"]  # fixed ffmpeg commands in a test
 
 [tool.mypy]
 python_version = "3.13"

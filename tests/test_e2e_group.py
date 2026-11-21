@@ -306,3 +306,22 @@ async def test_edits_respect_disabled_topics_and_send_date(h: Harness) -> None:
     await h.send(dict(old, edit_date=int(time.time())), edited=True)
     await h.idle()
     assert h.tg.ephemeral_to(OWNER) == [] and h.gemini.jobs == [] and h.deepl.jobs == []
+
+
+async def test_health_reports_dead_worker(h: Harness) -> None:
+    ok = await h.app.health()
+    assert ok["ok"] is True and ok["problems"] == []
+    assert h.app.pipeline is not None
+    h.app.pipeline.text_lane._tasks[0].cancel()  # simulate a worker that died
+    await asyncio.sleep(0.05)
+    bad = await h.app.health()
+    assert bad["ok"] is False and any("text lane" in p for p in bad["problems"])  # type: ignore[union-attr]
+
+
+async def test_watchdog_requests_restart_when_unhealthy(h: Harness) -> None:
+    assert h.app.pipeline is not None
+    for t in h.app.pipeline.text_lane._tasks:
+        t.cancel()  # all text workers dead
+    await asyncio.sleep(0.05)
+    await asyncio.wait_for(h.app._watchdog(interval=0.01), 2)  # two failed checks -> fatal
+    assert h.app.fatal.is_set() and "text lane" in (h.app.fatal_reason or "")

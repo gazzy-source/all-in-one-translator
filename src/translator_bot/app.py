@@ -88,6 +88,8 @@ class App:
                                            chat_per_min=settings.ephemeral_per_chat_per_min)
         self.deliverer = Deliverer(self.transport, self.storage, self.metrics, member_check=self._is_member)
         self.orchestrator: Orchestrator | None = None
+        self.fatal = asyncio.Event()  # set by the watchdog: __main__ stops and exits non-zero
+        self.fatal_reason: str | None = None
         self.media: MediaProcessor | None = None
         self.pipeline: Pipeline | None = None
         self.inline_limiter = KeyedLimiter(settings.inline_per_min, 60.0)
@@ -144,6 +146,7 @@ class App:
         if not me.supports_inline_queries:
             log.warning("inline mode is disabled in BotFather (/setinline)")
         self._tasks.append(asyncio.create_task(self._maintenance(), name="maintenance"))
+        self._tasks.append(asyncio.create_task(self._watchdog(), name="watchdog"))
 
     async def _check_gemini_models(self) -> None:
         assert self.gemini is not None
@@ -159,6 +162,29 @@ class App:
             if m not in available:
                 log.error("configured Gemini model not available for this key", extra={"model": m})
 
+    async def health(self) -> dict[str, object]:
+        """Liveness for /healthz (and Docker's HEALTHCHECK). Unhealthy = a restart would help: pipeline not
+        running, a queue worker died, or the database doesn't answer. Provider outages are reported, not fatal
+        (a restart can't fix Gemini being down)."""
+        problems: list[str] = []
+        lanes: dict[str, object] = {}
+        if self.pipeline is None:
+            problems.append("pipeline not started")
+        else:
+            for lane in (self.pipeline.text_lane, self.pipeline.media_lane):
+                alive = sum(1 for t in lane._tasks if not t.done())
+                lanes[lane.name] = {"queued": lane.size, "inflight": lane.inflight, "workers_alive": alive,
+                                    "workers": lane.workers}
+                if alive < lane.workers:
+                    problems.append(f"{lane.name} lane: {lane.workers - alive} worker(s) dead")
+        try:
+            await self.storage.ping()
+        except Exception as exc:
+            problems.append(f"database: {type(exc).__name__}")
+        breakers = {n: b.state for n, b in self.orchestrator.breakers.items()} if self.orchestrator else {}
+        return {"ok": not problems, "problems": problems, "lanes": lanes, "providers": breakers,
+                "guard_blocked": self.guard.blocked}
+
     async def stop(self) -> None:
         for t in self._tasks:
             t.cancel()
@@ -173,6 +199,25 @@ class App:
                 await p.aclose()
         await self.storage.close()
         await self.bot.session.close()
+
+    async def _watchdog(self, interval: float = 60.0) -> None:
+        """Self-healing: when health problems persist across two checks (dead queue worker, database not
+        answering), request a clean shutdown with a non-zero exit so Docker/systemd restart the process.
+        (A Docker "unhealthy" status alone never triggers a restart.)"""
+        strikes = 0
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                h = await self.health()
+            except Exception as exc:  # health itself failing counts as a strike
+                h = {"ok": False, "problems": [f"health check failed: {type(exc).__name__}"]}
+            strikes = 0 if h["ok"] else strikes + 1
+            if strikes >= 2:
+                problems = h["problems"]
+                self.fatal_reason = "; ".join(str(x) for x in problems) if isinstance(problems, list) else str(problems)
+                log.critical("unhealthy, exiting for restart", extra={"problems": h["problems"]})
+                self.fatal.set()
+                return
 
     async def _maintenance(self) -> None:
         while True:

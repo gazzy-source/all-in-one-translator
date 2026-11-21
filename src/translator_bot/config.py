@@ -70,7 +70,6 @@ class Settings(BaseSettings):
     max_video_bytes: int = Field(20 * 1024 * 1024, alias="MAX_VIDEO_BYTES", ge=1024)  # Telegram getFile cap: 20 MB
     max_frames: int = Field(24, alias="MAX_FRAMES", ge=1, le=120)
     ffmpeg_path: str = Field("ffmpeg", alias="FFMPEG_PATH")
-    ffprobe_path: str = Field("ffprobe", alias="FFPROBE_PATH")
     media_timeout_s: float = Field(30.0, alias="MEDIA_TIMEOUT_S", ge=5)  # ffmpeg gets this minus 2 s
     media_workers: int = Field(2, alias="MEDIA_WORKERS", ge=1, le=16)
     ocr_min_confidence: float = Field(0.6, alias="OCR_MIN_CONFIDENCE", ge=0, le=1)

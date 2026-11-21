@@ -301,3 +301,14 @@ def test_chinese_script_conversion_routes_to_llm_only() -> None:
     routes = o.route(TranslationJob("我們明天下午在老地方見面吧，記得帶傘", "zh", "zh-Hant"),
                      Detection("zh-Hant", 0.9, Verdict.OTHER), "group")
     assert [r.provider for r in routes] == ["gemini"]  # DeepL returns Chinese unchanged
+
+
+def test_every_setting_is_documented_in_env_example() -> None:
+    import re
+
+    from translator_bot.config import Settings
+
+    example = (Path(__file__).resolve().parent.parent / ".env.example").read_text("utf-8")
+    aliases = {f.alias for f in Settings.model_fields.values() if f.alias}
+    missing = sorted(a for a in aliases if not re.search(rf"^#?\s*{a}=", example, re.M))
+    assert missing == [], f"document these in .env.example: {missing}"

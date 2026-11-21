@@ -46,3 +46,30 @@ jobs:
 
       - name: Tests (all providers and Telegram mocked; no secrets needed)
         run: pytest -q --tb=short
+
+      - name: Dependency vulnerability scan (pip-audit)
+        if: matrix.python-version == '3.13'
+        run: pip-audit --skip-editable --progress-spinner off
+
+  docker:
+    # Builds the production image and runs the native-media smoke test inside it (read-only root FS, as in
+    # docker-compose.yml), plus a config check: a bad config must exit with code 2, not crash.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build image
+        run: docker build -t all-in-one-translator:ci .
+
+      - name: Smoke test inside the image
+        run: >
+          docker run --rm --read-only --tmpfs /tmp --cap-drop ALL --security-opt no-new-privileges
+          -v "$PWD/scripts:/smoke:ro" all-in-one-translator:ci python /smoke/container_smoke.py
+
+      - name: Invalid config exits cleanly with code 2
+        run: |
+          set +e
+          docker run --rm --read-only --tmpfs /tmp -e BOT_TOKEN=bad all-in-one-translator:ci
+          code=$?
+          echo "exit code: $code"
+          test "$code" -eq 2
