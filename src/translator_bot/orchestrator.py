@@ -183,9 +183,14 @@ class Orchestrator:
             return hit if hit.needs_translation else None
         self.metrics.inc("cache_miss")
         # coalesce identical concurrent requests (e.g. same sticker text in many chats)
-        fut = self._inflight.get(key)
-        if fut is not None:
-            return await asyncio.shield(fut)
+        while (fut := self._inflight.get(key)) is not None:
+            try:
+                return await asyncio.shield(fut)
+            except asyncio.CancelledError:
+                task = asyncio.current_task()
+                if task is not None and task.cancelling():
+                    raise  # we are being cancelled ourselves
+                # the owner was cancelled (e.g. its queue job timed out): do the work ourselves
         loop = asyncio.get_running_loop()
         fut = loop.create_future()
         self._inflight[key] = fut
@@ -195,6 +200,9 @@ class Orchestrator:
                 self.cache.put(key, res)
             fut.set_result(res if res and res.needs_translation else None)
             return res if res and res.needs_translation else None
+        except asyncio.CancelledError:
+            fut.cancel()  # waiters retry instead of inheriting our cancellation
+            raise
         except BaseException as exc:
             fut.set_exception(exc)
             fut.exception()  # mark retrieved
@@ -274,7 +282,10 @@ class Orchestrator:
                     pass  # provider-side limiter state already updated; don't trip breaker for local caps
                 elif err.kind is ErrorKind.AUTH:
                     breaker.record_failure(open_for=600.0)
-                elif err.kind not in (ErrorKind.BAD_REQUEST, ErrorKind.UNSUPPORTED):
+                elif err.kind not in (ErrorKind.BAD_REQUEST, ErrorKind.UNSUPPORTED, ErrorKind.BLOCKED,
+                                      ErrorKind.INVALID_OUTPUT):
+                    # content-specific outcomes (safety block, truncated JSON for one message) say nothing about
+                    # provider health: a few profane messages must not open the breaker for everyone
                     breaker.record_failure()
                 if err.kind in RETRYABLE and attempt == 0 and deadline - time.monotonic() > 2.0:
                     await asyncio.sleep(backoff_delay(attempt))

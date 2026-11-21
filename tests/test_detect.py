@@ -62,3 +62,12 @@ def test_same_script_neighbours(detector: LanguageDetector) -> None:
     assert detector.detect("Привет, как дела?", "en").lang == "ru"
     assert detector.detect("Привіт, як справи?", "en").lang == "uk"
     assert detector.detect("Привіт, як справи?", "ru").verdict is not Verdict.TARGET
+
+
+def test_laughter_in_any_script_and_accentless_vietnamese_are_informal(detector: LanguageDetector) -> None:
+    # informal -> LLM route; DeepL left "555" untranslated and misread accentless Vietnamese (live holdout)
+    for text in ("555 ขำมากเลยอะ เดี๋ยวคืนนี้เจอกันนะ", "ㅋㅋㅋ 오늘 뭐해?", "хахаха ну ты даёшь", "ههههه شو هاد"):
+        assert detector.detect(text, "en").informal, text
+    assert detector.detect("toi nay di an lau khong may ba", "en").informal
+    for text in ("Где встречаемся завтра?", "मीटिंग कल है", "hôm nay mệt xỉu luôn á"):
+        assert not detector.detect(text, "en").informal, text

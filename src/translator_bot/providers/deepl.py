@@ -14,6 +14,7 @@ from typing import Any
 import httpx
 import regex as re
 
+from translator_bot.languages import same_language
 from translator_bot.providers.base import ErrorKind, ProviderError, TranslationJob, TranslationResult
 from translator_bot.resilience import SlidingWindowLimiter
 from translator_bot.textutil import CODE_FENCE_RE, EMAIL_RE, HASHTAG_RE, MENTION_RE, URL_RE, html_to_plain
@@ -155,7 +156,7 @@ class DeepLProvider:
             raise ProviderError(ErrorKind.INVALID_OUTPUT, self.name, "schema mismatch") from None
         self.local_chars += billed
         translation = out_html if job.html else html_to_plain(out_html)
-        same_lang = detected is not None and detected.split("-")[0] == job.target.split("-")[0].lower()
+        same_lang = same_language(detected, job.target)  # "zh" vs "zh-Hant" are different targets
         needs = not same_lang and translation.strip() != html_to_plain(job.text).strip()
         return TranslationResult(
             needs_translation=needs, translation=translation.strip() if needs else "", source_lang=detected,

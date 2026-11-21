@@ -48,13 +48,14 @@ Legend: ✅ done & mock-tested · 🟢 live-verified · ⏳ pending live verific
 | L12 | Real sticker from a member (Burmese text) read and translated into English and Hindi in the live group | 🟢 |
 | L13 | Slang into ru/ar/hi regressed after 0.2.0 routed laughter/slang to Gemini (matrix run 20:11: `Жестче азец гага Чтев деет завтра?`). Prompt A/B ruled out the prompt (old prompt garbled too). Model A/B, 27 samples per arm: 3.5-flash-lite garbled 3/25 at t=0.2 and 5/23 at t=0; 3.1-flash-lite 0/23 → text defaults switched to 3.1-flash-lite (3.5 failover; vision unchanged) + `looks_garbled` validation (mostly-non-word output → escalate → DeepL). Re-run: matrix 72 pairs, right-language 100%, 0 garbled, p50 2.3 s; translation benchmark chrF 76.8 (was 77.4, within run-to-run noise), silent-miss 0%, false-translation 0%, errors 0, **p50 1155 ms (was 776 ms)**. Remaining matrix flag: DeepL en→ja rendered 17:00 as 午後5時 (a valid conversion) | 🟢 |
 | L14 | Vision-model A/B (`bench_vision_ab.py`, 193 s): 20 real stickers from two public packs (Burmese captions on photos, Hinglish doge memes, English, photo stickers without text), 7 problem stickers, 6 non-English voice notes (edge-tts). Where vision answered: Burmese read + translated naturally by both; textless photo stickers silent; English stickers not echoed to English readers; Hinglish memes correct (`tu kon hai be?` → "who the hell are you?" / "ты кто вообще?"); prompt fixes worked (Tamil `machan` → "bro"/"भाई"); ja/pt voice transcribed exactly. Model verdict **inconclusive**: 3.1 better on 3 items (Burmese misread, Indonesian→ru/ar, Myanmar→ru tone), 3.5 better on 2 (3.1 gave "A / B" alternatives; missed Tamil text). ~1/3 of calls hit free-tier rate limits after a day of benchmarks (both arms ran concurrently), so vision stays on 3.5-flash-lite (recall validated in L11). | 🟢 partial |
+| L15 | Held-out text corpus (48 cases written before outputs): silent-miss 0%, false-translation 0%, source-lang 97.6%, p50 0.7 s; found accentless-Vietnamese and Thai-`555` routing bugs (fixed, live-rechecked). Pair accuracy, 119 pairs (16 sources × 8 targets incl. hi/ar/ru/ja/zh): 0 silent, 0 script problems, 0 garbled; lowest 20 by back-translation chrF all correct in meaning on reading | 🟢 |
 | L10 | Offline recipient: are ephemeral translations shown after reconnecting? after app restart? | ⏳ product decision depends on result |
 
 ## Measured so far (offline)
 
 * Language gate, 103-case corpus authored for this project (not held-out): false-translate 0%, missed 0%,
   source-language accuracy 98% (ms↔id confusion), deferred-to-LLM 6.8%, ~21–34 ms/message on this laptop.
-* Test suite: 353 passed (CI: ubuntu, Python 3.12 + 3.13) (all mocked; media tests use real ffmpeg/rlottie/RapidOCR on synthetic images).
+* Test suite: 370 passed (CI: ubuntu, Python 3.12 + 3.13) (all mocked; media tests use real ffmpeg/rlottie/RapidOCR on synthetic images).
 * ruff, mypy --strict, bandit: clean. pip-audit: no known vulnerabilities.
 
 ## Known gaps / next steps

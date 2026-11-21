@@ -21,10 +21,14 @@ MENTION_RE = re.compile(r"(?<![\w@])@[A-Za-z0-9_]{3,32}\b")
 HASHTAG_RE = re.compile(r"(?<![\w#])#[\p{L}\p{N}_]{1,64}")
 CASHTAG_RE = re.compile(r"(?<![\w$])\$[A-Z]{1,8}\b")
 COMMAND_RE = re.compile(r"^/[A-Za-z0-9_]{1,32}(?:@[A-Za-z0-9_]{3,32})?(?:\s|$)")
-NUMBER_RE = re.compile(r"(?<![\p{L}])[-+]?\d[\d.,:/]*\d%?|(?<![\p{L}\d])\d%?(?![\p{L}\d])")
+# Digits glued to *alphabetic* words ("mp3", "A4") aren't numbers; digits next to CJK/Hangul/Thai characters are
+# ("2枚", "2张", "10시"): those scripts don't put spaces around numbers.
+_ALPHA = r"\p{Latin}\p{Cyrillic}\p{Greek}\p{Armenian}\p{Georgian}"
+NUMBER_RE = re.compile(rf"(?<![{_ALPHA}])[-+]?\d[\d.,:/]*\d%?|(?<![{_ALPHA}\d])\d%?(?![{_ALPHA}\d])")
 EMOJI_RE = re.compile(r"[\p{Extended_Pictographic}\p{Emoji_Modifier}\p{Regional_Indicator}‍️⃣]+")
 CODE_FENCE_RE = re.compile(r"```.*?```|`[^`\n]+`", re.S)
 WORD_RE = re.compile(r"[\p{L}\p{M}']+")
+_SHORT_LAUGHS = frozenset({"xd", "kk", "ww", "ㅋㅋ", "ㅎㅎ", "草草"})
 LAUGH_RE = re.compile(
     r"(?i)^(?:(?:ha|he|hi|ja|je|ji|ka|kk|k|xa|xd|lo+l|lmf?a+o+|rofl|jk|w+|ㅋ+|ㅎ+|哈+|笑+|草+|ххх+|ахах[ах]*|хах[ах]*|5+|"
     r"wk+|awk+|kkk+|rsrs+|mdr+|jsjs+)+)$"
@@ -105,7 +109,8 @@ def profile_text(text: str | None) -> TextProfile:
             return TextProfile(ContentKind.NUMERIC, "", (), 0)
         return TextProfile(ContentKind.EMOJI_ONLY, "", (), 0)
     joined = "".join(words)
-    if len(words) <= 3 and LAUGH_RE.match(joined):
+    # one short syllable ("Ja" = yes, "he", "k") is a word, not laughter; "jaja", "xD", "kk", "ㅋㅋ" are
+    if len(words) <= 3 and LAUGH_RE.match(joined) and (len(joined) >= 3 or joined.lower() in _SHORT_LAUGHS):
         return TextProfile(ContentKind.LAUGHTER, core, words, letters)
     return TextProfile(ContentKind.TEXT, core, words, letters)
 
@@ -165,11 +170,14 @@ class ProtectedEntities:
 
 
 TIME_RE = re.compile(r"(\d{1,2})[:.h](\d{2})")
+CJK_TIME_RE = re.compile(r"(\d{1,2})\s*[時时点點시]\s*(?:(\d{1,2})\s*[分분])?")
+_THAI_RE = re.compile(r"\p{Thai}")
 AMPM_RE = re.compile(r"(?i)\b(\d{1,2})\s*(?:a\.?m\.?|p\.?m\.?)")
 
 
 def _digits(n: str) -> str:
-    return str(re.sub(r"\D", "", n))
+    """ASCII digit sequence; native digits ("۳", "१२", "٣") map to their values so 3 == ۳."""
+    return "".join(str(unicodedata.decimal(c)) for c in n if unicodedata.decimal(c, None) is not None)
 
 
 def extract_entities(text: str) -> ProtectedEntities:
@@ -206,8 +214,13 @@ def missing_entities(source: str, translation: str) -> list[str]:
     pool = list(out_digits)
     out_times = {(int(h) % 12, mm) for h, mm in TIME_RE.findall(out_plain)}
     out_times |= {(int(h) % 12, "00") for h in AMPM_RE.findall(out_plain)}
+    # CJK/Korean clock formats: 8時30分 / 8点30分 / 8시 30분 / 午後5時
+    out_times |= {(int(h) % 12, (mm or "00").zfill(2)) for h, mm in CJK_TIME_RE.findall(out_plain)}
+    thai = bool(_THAI_RE.search(source))
     for n in src.numbers:
         d = _digits(n)
+        if thai and re.fullmatch(r"5{3,}", d):
+            continue  # Thai laughter "555" ("ha ha ha") is meant to be translated, not kept
         t = TIME_RE.fullmatch(n)
         if d in pool:
             pool.remove(d)

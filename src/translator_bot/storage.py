@@ -277,9 +277,21 @@ class Storage:
         return [self._chat(r) for r in await cur.fetchall()]
 
     async def migrate_chat_id(self, old: int, new: int) -> None:
-        """Group upgraded to supergroup: chat id changes."""
+        """Group upgraded to supergroup: chat id changes.
+
+        The new id's row may already exist (its my_chat_member update can arrive before migrate_to_chat_id, and
+        is created disabled with default settings): the old row's enabled flag and settings win, then the old
+        row is removed. `UPDATE OR IGNORE` alone silently kept the old row and lost the configuration."""
+        cur = await self.db.execute("SELECT enabled, settings, title FROM chats WHERE chat_id=?", (old,))
+        old_row = await cur.fetchone()
+        cur = await self.db.execute("SELECT 1 FROM chats WHERE chat_id=?", (new,))
+        if old_row is not None and await cur.fetchone() is not None:
+            await self.db.execute(
+                "UPDATE chats SET enabled=?, settings=?, title=COALESCE(title, ?), active=1, updated_at=? "
+                "WHERE chat_id=?", (old_row["enabled"], old_row["settings"], old_row["title"], _now(), new))
         for table in ("chats", "topics", "user_chat", "messages", "deliveries", "glossary"):
             await self.db.execute(f"UPDATE OR IGNORE {table} SET chat_id=? WHERE chat_id=?", (new, old))  # noqa: S608  # nosec B608
+            await self.db.execute(f"DELETE FROM {table} WHERE chat_id=?", (old,))  # noqa: S608  # nosec B608
         await self.db.commit()
 
     async def topic_enabled(self, chat_id: int, thread_id: int | None) -> bool:
@@ -342,6 +354,12 @@ class Storage:
             " status=excluded.status, error=excluded.error",
             (chat_id, message_id, recipient_id, channel, ephemeral_id, dm_message_id, lang, status, error, _now()))
         await self.db.commit()
+
+    async def messages_for_ephemeral(self, chat_id: int, ephemeral_id: int) -> list[int]:
+        """Original message ids whose translation lives in this ephemeral (a burst covers several)."""
+        cur = await self.db.execute("SELECT DISTINCT message_id FROM deliveries WHERE chat_id=? AND ephemeral_id=?",
+                                    (chat_id, ephemeral_id))
+        return [int(r["message_id"]) for r in await cur.fetchall()]
 
     async def deliveries_for(self, chat_id: int, message_id: int) -> list[dict[str, Any]]:
         cur = await self.db.execute("SELECT * FROM deliveries WHERE chat_id=? AND message_id=?", (chat_id, message_id))

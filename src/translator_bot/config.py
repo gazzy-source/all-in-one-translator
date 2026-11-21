@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from functools import cached_property
 from pathlib import Path
 from typing import Annotated, Literal
@@ -57,7 +58,6 @@ class Settings(BaseSettings):
     max_text_chars: int = Field(3000, alias="MAX_TEXT_CHARS", ge=50)
     message_map_retention_h: int = Field(48, alias="MESSAGE_MAP_RETENTION_H", ge=1)
     cache_ttl_days: int = Field(30, alias="CACHE_TTL_DAYS", ge=0)
-    cache_max_rows: int = Field(200_000, alias="CACHE_MAX_ROWS", ge=100)
     edit_window_s: int = Field(48 * 3600, alias="EDIT_WINDOW_S", ge=0)
 
     # --- Media ----------------------------------------------------------------------------------
@@ -71,7 +71,7 @@ class Settings(BaseSettings):
     max_frames: int = Field(24, alias="MAX_FRAMES", ge=1, le=120)
     ffmpeg_path: str = Field("ffmpeg", alias="FFMPEG_PATH")
     ffprobe_path: str = Field("ffprobe", alias="FFPROBE_PATH")
-    media_timeout_s: float = Field(30.0, alias="MEDIA_TIMEOUT_S", gt=0)
+    media_timeout_s: float = Field(30.0, alias="MEDIA_TIMEOUT_S", ge=5)  # ffmpeg gets this minus 2 s
     media_workers: int = Field(2, alias="MEDIA_WORKERS", ge=1, le=16)
     ocr_min_confidence: float = Field(0.6, alias="OCR_MIN_CONFIDENCE", ge=0, le=1)
     vision_ocr: bool = Field(True, alias="VISION_OCR")  # use Gemini vision when key present
@@ -120,8 +120,13 @@ class Settings(BaseSettings):
     @model_validator(mode="after")
     def _check(self) -> Settings:
         token = self.bot_token.get_secret_value()
-        if ":" not in token or len(token) < 30:
-            raise ValueError("BOT_TOKEN does not look like a BotFather token (expected '<id>:<secret>')")
+        if not re.fullmatch(r"\d{3,20}:[A-Za-z0-9_-]{20,}", token):
+            raise ValueError("BOT_TOKEN does not look like a BotFather token (expected '<numeric id>:<secret>')")
+        if self.log_level.upper() not in ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"):
+            raise ValueError("LOG_LEVEL must be one of DEBUG, INFO, WARNING, ERROR, CRITICAL")
+        if self.edit_window_s > self.message_map_retention_h * 3600:
+            # once delivery rows are purged an edit can't find the ephemeral and would send a duplicate
+            raise ValueError("EDIT_WINDOW_S must not exceed MESSAGE_MAP_RETENTION_H * 3600")
         if self.run_mode == "webhook":
             if not self.webhook_url or not self.webhook_url.startswith("https://"):
                 raise ValueError("RUN_MODE=webhook requires WEBHOOK_URL starting with https://")

@@ -1,5 +1,55 @@
 # Changelog
 
+## 0.2.3 — 2026-11-21 (code review + cross-language accuracy)
+
+Three independent read-only reviews (flows/authorization, translation core/providers, delivery/storage/media):
+no authorization gap and no path to public group output; the bugs below were each reproduced or traced before
+fixing, with regression tests in `tests/test_review_fixes.py`.
+
+### Fixed — reliability
+* **Queue workers could die permanently.** When a coalesced request's owner was cancelled (its queue job timed
+  out), waiters inherited `CancelledError`, which the lane worker re-raised and exited on. A few collisions
+  (same sticker/text in two chats) silently stopped translation while `/healthz` stayed OK. Workers now survive
+  stray cancellations and waiters redo the work (orchestrator and media coalescing).
+* **Circuit breaker could stay half-open forever** when its single trial ended without an outcome (local rate
+  limit, quota, deadline): the provider was never used again until restart. Stale trials now expire.
+* Safety blocks / truncated output for one message no longer open the provider breaker for everyone.
+* A non-JSON 200 from Gemini (proxy/gateway page) is a provider error instead of an unhandled exception.
+* A slow media download no longer recycles the decode pool (which killed other jobs' renders).
+* Voice notes can't bypass the duration limit by declaring a short duration: larger files are trimmed.
+
+### Fixed — edits
+* Original translation and its edits are serialized per message: an edit racing the original sent a duplicate,
+  possibly stale, ephemeral.
+* Caption edits on photos/GIFs re-render caption *and* image text (the image text used to be dropped);
+  caption edits on videos/voice are now handled.
+* Editing one message of a burst after the in-memory record expired no longer erases the others' translation.
+* Failed edits retry (plain text on parse errors, short 429 waits) instead of sending a duplicate.
+* Supergroup migration keeps the group's enabled flag and settings when the new id's row already exists.
+
+### Fixed — translation accuracy
+* Simplified and Traditional Chinese are distinct targets (character-based variant test); they were treated as
+  the same language, so no conversion happened.
+* Numbers next to CJK/Hangul characters (`2枚`, `2张`, `10시`), native digits (`۳`, `१२`) and CJK clock formats
+  (`8時30分`, `8点30分`, `8시 30분`) no longer count as missing — each cost 2–3 extra API calls.
+* Laughter in any script (`555`, `ㅋㅋㅋ`, `хахаха`, `ههههه`), Korean `ㅠㅠ`, and Vietnamese typed without accents
+  route to the LLM; DeepL left `555`/`ㅠㅠ` as-is and misread accentless Vietnamese ("hotpot" became
+  "restaurant"). Thai `555` is translated instead of protected as a number; `ㅠㅠ` becomes `😭`.
+* German "Ja" (yes) is no longer classified as laughter and silently skipped.
+
+### Hardening
+* Hidden `/approve`/`/revoke` in forum topics ignore the topic's creation message (could approve the topic
+  creator); malformed callback data no longer raises.
+* Config fails fast on an invalid `LOG_LEVEL`, a non-numeric bot id, `MEDIA_TIMEOUT_S` < 5, or an
+  `EDIT_WINDOW_S` longer than delivery retention; unused `CACHE_MAX_ROWS` removed.
+
+### Measured
+* Held-out text corpus (48 new cases, 20+ languages, written before outputs): 0 silent misses, 0 false
+  translations, 0 errors, source language 97.6%, p50 0.7 s.
+* Pair accuracy (`bench_pair_accuracy.py`: 16 sources × 8 targets = 119 pairs, meaning checked by DeepL
+  back-translation and by reading): all translated, 0 script problems, 0 garbled; every one of the 20
+  lowest-scoring pairs was correct in meaning on reading (low scores = paraphrase).
+
 ## 0.2.2 — 2026-11-21 (media matrix testing)
 
 Found by a new live media benchmark (`benchmarks/bench_media_matrix.py`: 40 items, 22 scripts rendered with real

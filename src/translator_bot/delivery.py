@@ -314,13 +314,26 @@ class Deliverer:
 
     async def _edit_one(self, d: Delivery, r: Recipient, eph_id: int, show_original: bool) -> None:
         view = d if show_original else replace(d, original_plain=None)
-        try:
-            await self.transport.edit_ephemeral(d.chat_id, r.user_id, eph_id, format_delivery(view))
-            self.metrics.inc("delivery_edit.ok")
-        except DeliveryError as err:
-            if err.reason == "not_modified":
+        text = format_delivery(view)
+        for attempt in range(3):
+            try:
+                await self.transport.edit_ephemeral(d.chat_id, r.user_id, eph_id, text)
+                self.metrics.inc("delivery_edit.ok")
                 return
-            self.metrics.inc(f"delivery_edit.fail.{err.reason.split(':')[0]}")
-            # ephemeral may have expired: deliver a fresh one marked edited
-            await self._deliver_one(d, r, show_original)
+            except DeliveryError as err:
+                if err.reason == "not_modified":
+                    return
+                if err.reason == "parse_error" and attempt == 0:  # same plain-text fallback as sends
+                    text = format_delivery(replace(view, translation_html=html.escape(html_to_plain(
+                        view.translation_html))))
+                    continue
+                if err.retry_after is not None and err.retry_after <= 5 and attempt < 2:
+                    await asyncio.sleep(err.retry_after)
+                    continue
+                self.metrics.inc(f"delivery_edit.fail.{err.reason.split(':')[0]}")
+                if err.permanent and err.reason not in ("not_member", "forbidden", "parse_error"):
+                    # the ephemeral is gone (expired / not found): deliver a fresh one marked edited
+                    await self._deliver_one(d, r, show_original)
+                # transient failures (rate limits, network) keep the old translation rather than duplicating it
+                return
 

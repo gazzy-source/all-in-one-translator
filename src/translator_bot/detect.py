@@ -90,6 +90,35 @@ def _load_lexicon(name: str) -> dict[str, float]:
     return out
 
 
+_EXTRA_LAUGH_RE = re.compile(r"^(?:ه{3,}|(?:हा){2,}|(?:ха){2,}х?|5{3,}|h{3,}|xd+)$", re.IGNORECASE)
+# Korean crying/laughing jamo and similar 2-char chat tokens (DeepL leaves "ㅠㅠ" as-is in Arabic/Spanish)
+_SHORT_CHAT_TOKENS = frozenset({"ㅠㅠ", "ㅜㅜ", "ㅋㅋ", "ㅎㅎ", "ㅠㅠㅠ", "ㅜㅜㅜ"})
+_PUNCT_STRIP = "\"'.,!?¿¡()[]{}:;~…-—–*"
+
+
+def _has_laughter(text: str) -> bool:
+    """Laughter tokens of >= 3 characters in any script (short ones like "hi"/"ja"/"k" are real words)."""
+    for tok in text.split():
+        t = tok.strip(_PUNCT_STRIP).lower()
+        if t in _SHORT_CHAT_TOKENS or (len(t) >= 3 and (LAUGH_RE.match(t) or _EXTRA_LAUGH_RE.match(t))):
+            return True
+    return False
+
+
+# Common characters that exist in only one of the two scripts (simplified, traditional) - pairs of the same word.
+_SIMPLIFIED_ONLY = frozenset("们这个来说时会对国为么过还没后发见让给东车门问间听话关开学习买卖钱电视气爱样经长现从种")
+_TRADITIONAL_ONLY = frozenset("們這個來說時會對國為麼過還沒後發見讓給東車門問間聽話關開學習買賣錢電視氣愛樣經長現從種")
+
+
+def _han_variant(text: str) -> str | None:
+    """'zh' (Simplified), 'zh-Hant' (Traditional), or None when the text uses only shared characters."""
+    simp = sum(ch in _SIMPLIFIED_ONLY for ch in text)
+    trad = sum(ch in _TRADITIONAL_ONLY for ch in text)
+    if simp == trad:
+        return None
+    return "zh" if simp > trad else "zh-Hant"
+
+
 class LanguageDetector:
     """Thread-safe after construction. Construct once at startup (loads models/lexicons)."""
 
@@ -150,8 +179,14 @@ class LanguageDetector:
             # Latin share >= 20% alongside: mixed (e.g. Hindi + English code-switching)
             if latin / total >= 0.2:
                 det.mixed = True
+            # chat laughter ("555", "ㅋㅋㅋ", "хахаха", "ههههه", "草") marks informal chat -> the LLM route
+            # (DeepL leaves "555" untranslated and renders slang as textbook prose)
+            if _has_laughter(text):
+                det.informal = True
             return det
         det = self._detect_latin(prof.core, words, target)
+        if det.lang == "vi" and prof.core.isascii():
+            det.informal = True  # Vietnamese typed without diacritics: DeepL misreads it (live: "hotpot" lost)
         if non_latin and sum(non_latin.values()) / total >= 0.15:
             det.mixed = True
             if det.verdict is Verdict.TARGET:
@@ -175,6 +210,13 @@ class LanguageDetector:
                 lang, conf = wf_lang, (wf_conf + (1 - conf)) / 2 * 0.8
             if lang is None:
                 lang, conf = (candidates[0] if candidates else None), 0.5
+        if lang == "zh" and target_base == "zh":
+            # Simplified vs Traditional readers are different targets: decide from distinguishing characters
+            variant = _han_variant(core)
+            want = "zh-Hant" if target.lower() in ("zh-hant", "zh-tw", "zh-hk", "zh-mo") else "zh"
+            if variant is not None and variant != want:
+                return Detection(variant, 0.9, Verdict.OTHER, signals={"script": script, "han_variant": variant})
+            return Detection(want, conf, Verdict.TARGET, signals={"script": script, "han_variant": variant})
         if lang and lang.split("-")[0] == target_base:
             verdict = Verdict.TARGET if conf >= 0.5 else Verdict.UNSURE
         elif target_base in {c.split("-")[0] for c in candidates} and conf < 0.75:

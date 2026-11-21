@@ -5,11 +5,13 @@ per-recipient private (ephemeral) delivery. Handlers call `on_message` / `on_edi
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import html as _html
 import logging
 import time
 from collections import OrderedDict, defaultdict
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -20,6 +22,7 @@ from translator_bot.context import ContextStore
 from translator_bot.delivery import Deliverer, Delivery
 from translator_bot.detect import LanguageDetector, Verdict
 from translator_bot.eligibility import Eligible, Kind, Skip, classify, sender_id, sender_name
+from translator_bot.languages import same_language
 from translator_bot.media.processor import PERSISTED as PERSISTED_KINDS
 from translator_bot.media.processor import MediaProcessor, MediaText
 from translator_bot.metrics import Metrics
@@ -167,7 +170,8 @@ class Pipeline:
             self.metrics.inc("edit.too_old")
             return
         res = classify(msg, bot_id=self.bot_id, settings=chat.settings, media_enabled=self.s.media_enabled)
-        if isinstance(res, Skip) or res.kind not in (Kind.TEXT, Kind.CAPTION, Kind.GIF, Kind.IMAGE):
+        if isinstance(res, Skip) or res.kind not in (Kind.TEXT, Kind.CAPTION, Kind.GIF, Kind.IMAGE, Kind.VIDEO,
+                                                     Kind.VOICE):
             return
         if len(res.plain) > self.s.max_text_chars:
             res = Eligible(res.kind, html_escape_truncate(res.plain, self.s.max_text_chars),
@@ -186,8 +190,15 @@ class Pipeline:
                 return
         else:
             await self.storage.update_message(msg.chat.id, msg.message_id, content_hash=new_hash)
-        if res.kind is not Kind.TEXT and not res.plain:
-            return  # media edits (replaced file) are not re-OCR'd; caption edits are handled below
+        if res.has_media:
+            # caption edit (or replaced file) on media: re-render caption *and* media text together - a caption-only
+            # re-translation used to overwrite the combined ephemeral and drop the image/GIF text
+            meta_m = UnitMeta(msg.chat.id, msg.chat.title, thread, sid, sender_name(msg), self._reply_ctx(msg, sid),
+                              chat.settings)
+            self.metrics.inc("edit.retranslate_media")
+            await self.media_lane.submit(msg.chat.id, lambda: self._process_media(msg, res, meta_m, edited=True),
+                                         key=f"em:{msg.chat.id}:{msg.message_id}:{new_hash}")
+            return
         unit = self._units.get((msg.chat.id, msg.message_id))
         if unit is not None and time.monotonic() - unit.created <= self.edit_memory_s:
             for it in unit.items:
@@ -203,6 +214,39 @@ class Pipeline:
                                     key=f"e:{msg.chat.id}:{msg.message_id}:{new_hash}")
 
     # -- internals -------------------------------------------------------------------------------
+    @contextlib.asynccontextmanager
+    async def _message_locks(self, chat_id: int, message_ids: list[int]) -> AsyncIterator[None]:
+        """Serialize the original translation and edits of the same message(s): an edit racing the original
+        job sent a duplicate (and possibly stale) ephemeral. Sorted order avoids lock-order deadlocks."""
+        keys = sorted({(chat_id, m) for m in message_ids})
+        locks = [self._locks[k] for k in keys]
+        for lk in locks:
+            await lk.acquire()
+        try:
+            yield
+        finally:
+            for k, lk in zip(keys, locks, strict=True):
+                lk.release()
+                if not lk.locked() and not getattr(lk, "_waiters", None):
+                    self._locks.pop(k, None)
+
+    async def _already_delivered(self, chat_id: int, message_ids: list[int]) -> bool:
+        for m in message_ids:
+            if await self.storage.deliveries_for(chat_id, m):
+                return True
+        return False
+
+    async def _edit_would_split_burst(self, chat_id: int, items: list[BurstItem]) -> bool:
+        """True when the edited message shares its ephemeral with other messages this edit doesn't cover
+        (burst memory expired / restart): editing in place would erase their translations."""
+        ids = {i.message_id for i in items}
+        for m in ids:
+            for row in await self.storage.deliveries_for(chat_id, m):
+                eph = row.get("ephemeral_id")
+                if eph and set(await self.storage.messages_for_ephemeral(chat_id, int(eph))) - ids:
+                    return True
+        return False
+
     def _reply_ctx(self, msg: Message, sid: int | None) -> ContextLine | None:
         r = msg.reply_to_message
         quote = msg.quote.text if msg.quote is not None else None
@@ -263,7 +307,7 @@ class Pipeline:
         if res is None:
             return None
         src = res.source_lang or det.lang
-        if src and src.split("-")[0] == target.split("-")[0]:
+        if src and same_language(src, target):
             return None
         # Output is Telegram HTML. Plain sources: escape, so the model can't add markup (link spoofing).
         # HTML sources: keep formatting, but only links that were already in the message.
@@ -278,6 +322,16 @@ class Pipeline:
         return by_lang
 
     async def _process_text(self, meta: UnitMeta, items: list[BurstItem], *, edited: bool = False) -> None:
+        ids = [i.message_id for i in items]
+        async with self._message_locks(meta.chat_id, ids):
+            if not edited and await self._already_delivered(meta.chat_id, ids):
+                self.metrics.inc("skip.superseded_by_edit")  # an edit already delivered the newer text
+                return
+            fresh = edited and await self._edit_would_split_burst(meta.chat_id, items)
+            await self._process_text_locked(meta, items, edited=edited, fresh=fresh)
+
+    async def _process_text_locked(self, meta: UnitMeta, items: list[BurstItem], *, edited: bool,
+                                   fresh: bool) -> None:
         t0 = time.perf_counter()
         by_lang = await self._recipients_by_lang(meta)
         self._remember(meta, items)
@@ -296,9 +350,9 @@ class Pipeline:
             d = Delivery(meta.chat_id, meta.chat_title, meta.thread_id, [i.message_id for i in items],
                          meta.sender_name, src, lang, translation, "text", plain, edited,
                          show_sender=bool(meta.settings.get("show_sender")))
-            if edited:
+            if edited and not fresh:
                 await self.deliverer.update(d, rs, show_original=bool(meta.settings.get("show_original")))
-            else:
+            else:  # new message, or an edit that must not overwrite a burst's shared ephemeral
                 await self.deliverer.deliver(d, rs, show_original=bool(meta.settings.get("show_original")))
 
         await asyncio.gather(*(one(lang, rs) for lang, rs in by_lang.items()), return_exceptions=False)
@@ -306,7 +360,14 @@ class Pipeline:
             await self.storage.update_message(meta.chat_id, it.message_id, status="done")
         self.metrics.observe("pipeline_text_ms", (time.perf_counter() - t0) * 1000)
 
-    async def _process_media(self, msg: Message, el: Eligible, meta: UnitMeta) -> None:
+    async def _process_media(self, msg: Message, el: Eligible, meta: UnitMeta, *, edited: bool = False) -> None:
+        async with self._message_locks(meta.chat_id, [msg.message_id]):
+            if not edited and await self._already_delivered(meta.chat_id, [msg.message_id]):
+                self.metrics.inc("skip.superseded_by_edit")
+                return
+            await self._process_media_locked(msg, el, meta, edited=edited)
+
+    async def _process_media_locked(self, msg: Message, el: Eligible, meta: UnitMeta, *, edited: bool) -> None:
         t0 = time.perf_counter()
         by_lang = await self._recipients_by_lang(meta)
         if not by_lang:
@@ -363,9 +424,12 @@ class Pipeline:
                     Kind.GIF: "gif", Kind.IMAGE: "image", Kind.VIDEO: "video", Kind.VOICE: "voice"}.get(el.kind,
                                                                                                        "caption")
             d = Delivery(meta.chat_id, meta.chat_title, meta.thread_id, [msg.message_id], meta.sender_name, src, lang,
-                         "\n".join(parts), kind, el.plain or (media_text.text if media_text else None),
+                         "\n".join(parts), kind, el.plain or (media_text.text if media_text else None), edited,
                          show_sender=bool(meta.settings.get("show_sender")))
-            await self.deliverer.deliver(d, rs, show_original=bool(meta.settings.get("show_original")))
+            if edited:
+                await self.deliverer.update(d, rs, show_original=bool(meta.settings.get("show_original")))
+            else:
+                await self.deliverer.deliver(d, rs, show_original=bool(meta.settings.get("show_original")))
 
         await asyncio.gather(*(one(lang, rs) for lang, rs in by_lang.items()))
         await self.storage.update_message(meta.chat_id, msg.message_id, status="done")

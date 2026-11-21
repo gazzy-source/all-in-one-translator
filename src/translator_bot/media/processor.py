@@ -53,6 +53,10 @@ class MediaText:
     speech: bool = False
 
 
+class _WorkerTimeout(TimeoutError):
+    """A decode/render in the worker pool exceeded its time budget (the pool is recycled)."""
+
+
 class MediaProcessor:
     def __init__(self, bot: Bot, storage: Storage, metrics: Metrics, *, vision: VisionProvider | None,
                  max_download_bytes: int, max_image_pixels: int, max_tgs_json_bytes: int, max_video_seconds: float,
@@ -94,7 +98,10 @@ class MediaProcessor:
 
     async def _run(self, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
         loop = asyncio.get_running_loop()
-        return await asyncio.wait_for(loop.run_in_executor(self._pool, _call, fn, args, kwargs), self.timeout_s)
+        try:
+            return await asyncio.wait_for(loop.run_in_executor(self._pool, _call, fn, args, kwargs), self.timeout_s)
+        except TimeoutError:
+            raise _WorkerTimeout from None
 
     async def _download(self, file_id: str, declared_size: int | None, limit: int) -> bytes:
         if declared_size is not None and declared_size > limit:
@@ -127,15 +134,23 @@ class MediaProcessor:
             return MediaText(True, cached["text"] or "", cached["source_lang"], float(cached["confidence"] or 0),
                              dict(cached["translations"]), "cache")
         key = f"{file_unique_id}:{','.join(sorted(targets))}"
-        fut = self._inflight.get(key)
-        if fut is not None:
-            return await asyncio.shield(fut)
+        while (fut := self._inflight.get(key)) is not None:
+            try:
+                return await asyncio.shield(fut)
+            except asyncio.CancelledError:
+                task = asyncio.current_task()
+                if task is not None and task.cancelling():
+                    raise
+                # the owner was cancelled (its queue job timed out): do the work ourselves
         fut = asyncio.get_running_loop().create_future()
         self._inflight[key] = fut
         try:
             res = await self._extract_uncached(file_id, file_unique_id, size, kind, targets, caption_hint)
             fut.set_result(res)
             return res
+        except asyncio.CancelledError:
+            fut.cancel()  # waiters retry instead of inheriting our cancellation
+            raise
         except BaseException as exc:
             fut.set_exception(exc)
             fut.exception()
@@ -167,7 +182,9 @@ class MediaProcessor:
             elif kind == "animated_sticker":
                 fs = await self._run(F.render_tgs, data, self.max_tgs_json_bytes, self.max_frames)
             elif kind == "voice":
-                if len(data) <= 2 * 1024 * 1024 and data[:4] == b"OggS":
+                # The declared duration comes from the sender's client, so it can lie: only send small files as-is
+                # (<= 64 kbit/s for the allowed length); anything bigger is trimmed by ffmpeg (-t limit).
+                if len(data) <= self.max_media_seconds * 8000 and data[:4] == b"OggS":
                     audio, audio_mime = data, "audio/ogg"  # Telegram voice is already small Opus: send as-is
                 else:
                     audio = await self._run(F.extract_audio, data, ffmpeg=self.ffmpeg_path,
@@ -199,8 +216,10 @@ class MediaProcessor:
                     text_idx = [text_idx[round(k * (len(text_idx) - 1) / 3)] for k in range(4)]
                 images = [fs.frames[i] for i in text_idx]
         except (F.MediaRejected, TimeoutError) as exc:
-            if isinstance(exc, TimeoutError):
-                self._recycle_pool()  # a hung native render (rlottie/ffmpeg) must not occupy a worker forever
+            if isinstance(exc, _WorkerTimeout):
+                # a hung native render (rlottie/ffmpeg) must not occupy a worker forever. Only worker timeouts:
+                # a slow *download* recycling the pool used to kill other jobs' healthy renders.
+                self._recycle_pool()
             self.metrics.inc(f"media.rejected.{type(exc).__name__}")
             log.info("media rejected", extra={"kind": kind, "reason": str(exc)[:60]})
             return None

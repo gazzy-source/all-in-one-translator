@@ -122,6 +122,7 @@ class CircuitBreaker:
         self._failures: deque[float] = deque()
         self._opened_at: float | None = None
         self._trial_inflight = False
+        self._trial_started = 0.0
         self.cooldown_override: float | None = None
 
     @property
@@ -137,8 +138,11 @@ class CircuitBreaker:
         st = self.state
         if st == "closed":
             return True
-        if st == "half_open" and not self._trial_inflight:
+        # A trial that ended without recording an outcome (local rate limit, quota, bad request, deadline,
+        # cancellation) would otherwise hold the breaker half-open forever: let a new trial start after a while.
+        if st == "half_open" and (not self._trial_inflight or self._clock() - self._trial_started > self.cooldown):
             self._trial_inflight = True
+            self._trial_started = self._clock()
             return True
         return False
 

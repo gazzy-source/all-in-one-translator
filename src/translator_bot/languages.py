@@ -155,3 +155,19 @@ POPULAR: tuple[str, ...] = (
     "en", "es", "hi", "ar", "ru", "pt", "fr", "de", "tr", "id", "zh", "ja", "ko", "it", "uk", "fa", "ur",
     "bn", "vi", "pl",
 )
+
+
+_HANT_CODES = {"zh-hant", "zh-tw", "zh-hk", "zh-mo"}
+
+
+def same_language(a: str | None, b: str | None) -> bool:
+    """Base-language equality, except Simplified vs Traditional Chinese, which readers treat as different
+    targets ("zh" == "zh-Hans" == "zh-CN"; "zh-Hant" == "zh-TW"; but "zh" != "zh-Hant")."""
+    if not a or not b:
+        return False
+    a, b = a.lower(), b.lower()
+    if a.split("-")[0] != b.split("-")[0]:
+        return False
+    if a.split("-")[0] == "zh":
+        return (a in _HANT_CODES) == (b in _HANT_CODES)
+    return True

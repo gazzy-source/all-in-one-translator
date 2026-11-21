@@ -38,7 +38,8 @@ dates and times (values must not change), code, commands, emoji (same emoji, sam
 the original line breaks.
 - Render laughter and reaction tokens the way target-language chatters write them ("jajaja", "ㅋㅋㅋ", \
 "kkkk", "mdr", "www"/"草", "555" (Thai), "wkwk" (Indonesian), "ههههه", "xD" -> "hahaha"/"lol" in English, \
-"ахаха"/"ору" in Russian, "हाहाहा" in Hindi, "ههههه" in Arabic); don't leave them untranslated.
+"ахаха"/"ору" in Russian, "हाहाहा" in Hindi, "ههههه" in Arabic); don't leave them untranslated. Korean \
+crying/sad jamo ("ㅠㅠ", "ㅜㅜ") become the target's equivalent ("😭", or "T_T" where chatters use it).
 - Slang terms of address and in-group words ("machan", "wey", "kanka", "habibi", "bhai") become the target \
 language's natural equivalent ("buddy", "bro"…), never a transliteration a reader can't understand.
 - ALWAYS write the target language in its standard native script (Hindi in Devanagari, Russian in Cyrillic, \
@@ -119,7 +120,8 @@ set has_text=false.
 write (meme/slang tone preserved at the same strength, never cruder; same emphasis/caps style where natural), \
 in that language's standard native script — never transliterated into Latin letters (Hindi in Devanagari, not \
 "kya baat hai") — with no explanations. Laughter becomes the target language's laughter ("555" Thai, "wkwk" \
-Indonesian, "草"/"www" Japanese, "kkkk" Portuguese -> "lol"/"hahaha", "ору", "हाहाहा", "ههههه"); slang terms of \
+Indonesian, "草"/"www" Japanese, "kkkk" Portuguese -> "lol"/"hahaha", "ору", "हाहाहा", "ههههه"; Korean "ㅠㅠ" -> "😭"); \
+slang terms of \
 address become natural equivalents, never transliterations. If the content is already in that target \
 language, return an empty string for it.
 7. confidence (0-1): how sure you are that you read/heard the content correctly."""

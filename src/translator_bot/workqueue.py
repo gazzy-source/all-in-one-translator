@@ -96,7 +96,13 @@ class Lane:
                 self.metrics.inc(f"queue.{self.name}.timeout")
                 log.warning("job timeout", extra={"lane": self.name})
             except asyncio.CancelledError:
-                raise
+                task = asyncio.current_task()
+                if self._closing or (task is not None and task.cancelling()):
+                    raise  # the worker itself is being stopped
+                # a job surfaced someone else's cancellation (e.g. a coalesced request whose owner timed out):
+                # count it and keep serving — an escaping CancelledError used to kill this worker for good
+                self.metrics.inc(f"queue.{self.name}.error")
+                log.warning("job cancelled unexpectedly", extra={"lane": self.name})
             except Exception:
                 self.metrics.inc(f"queue.{self.name}.error")
                 log.exception("job failed", extra={"lane": self.name})

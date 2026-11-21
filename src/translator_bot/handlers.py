@@ -8,6 +8,7 @@ import hashlib
 import html
 import json
 import logging
+import re
 from typing import Any
 
 from aiogram import Bot, F, Router
@@ -36,6 +37,7 @@ from translator_bot.providers.base import TranslationJob
 from translator_bot.textutil import ContentKind, normalize_for_key, profile_text, truncate
 
 log = logging.getLogger(__name__)
+_INT_RE = re.compile(r"-?\d{1,20}")  # callback/command ids: "--5" or "x" must not reach int()
 
 GROUP = F.chat.type.in_({"group", "supergroup"})
 PRIVATE = F.chat.type == "private"
@@ -150,7 +152,11 @@ def _group_router(app: App) -> Router:
             return
         if cmd in ("approve", "revoke"):
             r_msg = msg.reply_to_message
-            if r_msg is None or r_msg.from_user is None or r_msg.from_user.is_bot:
+            # In forum topics Telegram fills reply_to_message with the topic's creation message when the owner
+            # didn't reply to anything: never approve/revoke the topic creator by accident.
+            if (r_msg is None or r_msg.from_user is None or r_msg.from_user.is_bot or r_msg.sender_chat is not None
+                    or r_msg.forum_topic_created is not None
+                    or (msg.is_topic_message and r_msg.message_id == msg.message_thread_id)):
                 await ephemeral_reply(bot, msg, "Reply to a member's message with /approve or /revoke.")
                 return
             member = r_msg.from_user
@@ -295,7 +301,7 @@ def _private_router(app: App) -> Router:
         if msg.from_user is None or not app.resolver.is_owner(msg.from_user.id):
             await msg.answer(ui.ACCESS_DENIED.format(uid=msg.from_user.id if msg.from_user else 0))
             return
-        ids = [int(x) for x in (command.args or "").replace(",", " ").split() if x.lstrip("-").isdigit()]
+        ids = [int(x) for x in (command.args or "").replace(",", " ").split() if _INT_RE.fullmatch(x)]
         if not ids or any(i <= 0 for i in ids):
             await msg.answer(f"Usage: <code>/{command.command} 123456789 [more ids]</code> — numeric Telegram user "
                              "IDs. Or reply to a member's message in the group with the hidden "
@@ -429,7 +435,7 @@ def _callback_router(app: App) -> Router:
                 await cb.answer("Saved")
                 return
             if action == "page":
-                kb = ui.language_page(int(val or 0), current, prefix)
+                kb = ui.language_page(int(val) if _INT_RE.fullmatch(val or "") else 0, current, prefix)
             else:
                 kb = ui.language_menu(current, prefix)
             with contextlib.suppress(TelegramAPIError):
@@ -446,7 +452,7 @@ def _callback_router(app: App) -> Router:
                 await _send_groups(app, msg, uid, edit=True)
                 await cb.answer()
                 return
-            elif action == "mute" and val.lstrip("-").isdigit():
+            elif action == "mute" and _INT_RE.fullmatch(val):
                 chat_id = int(val)
                 if not await app.membership.is_member(chat_id, uid):
                     await cb.answer("You're not a member of that group.", show_alert=True)
@@ -482,7 +488,7 @@ async def _owner_cb(app: App, cb: CallbackQuery, msg: Message, rest: str) -> Non
     if action == "chats":
         with contextlib.suppress(TelegramAPIError):
             await msg.edit_reply_markup(reply_markup=ui.chats_kb(await app.storage.active_chats()))
-    elif action in ("chat", "tog", "check") and len(parts) >= 2 and parts[1].lstrip("-").isdigit():
+    elif action in ("chat", "tog", "check") and len(parts) >= 2 and _INT_RE.fullmatch(parts[1]):
         chat_id = int(parts[1])
         chat = await app.storage.get_chat(chat_id)
         if chat is None:

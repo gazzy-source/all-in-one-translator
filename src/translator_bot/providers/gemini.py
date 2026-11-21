@@ -138,7 +138,12 @@ class GeminiProvider:
             except httpx.HTTPError as exc:
                 raise ProviderError(ErrorKind.TRANSIENT, self.name, type(exc).__name__) from None
             if resp.status_code == 200:
-                data: dict[str, Any] = resp.json()
+                try:
+                    data: dict[str, Any] = resp.json()
+                except ValueError:  # e.g. an HTML page from a proxy/gateway with status 200
+                    raise ProviderError(ErrorKind.TRANSIENT, self.name, "non-JSON 200 response") from None
+                if not isinstance(data, dict):
+                    raise ProviderError(ErrorKind.INVALID_OUTPUT, self.name, "unexpected JSON shape")
                 return data
             err = self._classify(resp, model)
             if attempt == 0 and err.kind is ErrorKind.BAD_REQUEST:
