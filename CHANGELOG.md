@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.2.4 — 2026-11-22 (live group test)
+
+* Song lyrics in voice/audio messages (within the 60 s limit) are transcribed and translated, marked ♪; speech
+  over background music still wins, and instrumental music stays silent (verified live).
+* `REPLY_MESSAGE_ID_INVALID` (current Telegram wording) now resends without the reply link instead of failing.
+* Media that produce no translation log why (too long / nothing to translate + confidence; never content), and
+  `/status` lists media skips.
+* Live: spoken voice notes in Spanish, Hindi, Egyptian Arabic, Russian and French-over-music transcribed and
+  translated correctly into en/hi/ru/ar.
+
 ## 0.2.3 — 2026-11-21 (code review + cross-language accuracy)
 
 Three independent read-only reviews (flows/authorization, translation core/providers, delivery/storage/media):
