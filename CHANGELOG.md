@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.1.2 — 2026-11-22 (Burmese groups)
+
+Live check for a Burmese group: Unicode Burmese, **Zawgyi-encoded** Burmese, Burmese digits (၇ → 7) and
+English → Burmese were already correct and fast (DeepL ~0.3 s).
+
+### Fixed
+* **Burglish (romanized Burmese)** — "mingalarpar, nay kaung lar?" was detected as Tagalog and DeepL invented
+  "Why are you staring at my feet?". New `burglish.txt` lexicon: romanized Burmese is detected as `my`, routed to
+  Gemini only, and left alone for Burmese readers. No matches across the 202 benchmark texts (no false positives).
+* **Binary junk in model output** (live, gemini-3.5-flash-lite: `"\x10Hola, \x11\x01…como estás?"`) passed
+  validation; outputs with control characters are rejected (text and media paths) and retried.
+
 ## 1.1.1 — 2026-11-22 (accuracy & speed)
 
 Measured with `bench_translation.py` on the held-out corpus (48 cases, realistic pace): source-language accuracy

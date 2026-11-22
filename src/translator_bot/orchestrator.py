@@ -30,6 +30,7 @@ from translator_bot.providers.base import (
 )
 from translator_bot.resilience import CircuitBreaker, backoff_delay
 from translator_bot.textutil import (
+    has_control_chars,
     html_to_plain,
     looks_garbled,
     missing_entities,
@@ -110,6 +111,9 @@ def validate(job: TranslationJob, res: TranslationResult) -> list[str]:
         return problems
     if out_plain == src_plain:
         problems.append("identical")
+    if has_control_chars(out_plain) and not has_control_chars(src_plain):
+        # live 2026-11-22 (gemini-3.5-flash-lite): "\x10Hola, \x11\x01\x12c\x00\x00…como estás?"
+        problems.append("garbled")
     missing = missing_entities(job.text, out)
     if missing:
         problems.append(f"missing:{len(missing)}")

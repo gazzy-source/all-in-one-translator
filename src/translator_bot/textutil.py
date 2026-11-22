@@ -401,6 +401,14 @@ _GARBLE_LANGS = frozenset({"ar", "bg", "bn", "el", "fa", "he", "hi", "mk", "ru",
 _LATIN_TOKEN_RE = re.compile(r"^[\p{Latin}\p{M}']+$")
 
 
+_CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
+
+
+def has_control_chars(text: str) -> bool:
+    """C0/C1 control characters other than tab/newline/CR: binary junk from a model, never chat text."""
+    return bool(_CONTROL_RE.search(text))
+
+
 def looks_garbled(source: str, translation: str, target: str) -> bool:
     """True when a translation into a non-Latin-script language is mostly non-words.
 
