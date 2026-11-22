@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.1.3 — 2026-11-22
+
+### Changed
+* **/help redesigned:** a status line ("Translating into Burmese"), three one-line ways to use the bot (here,
+  groups, anywhere), commands folded into an expandable block, and buttons for the common actions (change
+  language, settings, privacy). Role-aware: people who aren't approved see their ID; owners see their commands.
+* **/start** uses the same three lines and greets by first name.
+
 ## 1.1.2 — 2026-11-22 (Burmese groups)
 
 Live check for a Burmese group: Unicode Burmese, **Zawgyi-encoded** Burmese, Burmese digits (၇ → 7) and

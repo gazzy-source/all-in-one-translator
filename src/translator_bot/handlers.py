@@ -260,7 +260,8 @@ def _private_router(app: App) -> Router:
         assert user is not None
         await msg.answer(ui.welcome(user, default_lang=app.s.default_target_lang,
                                     is_owner=app.resolver.is_owner(user.user_id), bot_username=app.bot_username,
-                                    approved=approved, inline_ok=approved or app.s.inline_access == "everyone"))
+                                    approved=approved, inline_ok=approved or app.s.inline_access == "everyone",
+                                    max_seconds=int(app.s.max_media_seconds)))
         if not user.onboarded:
             prompt_language(user.user_id)
             await msg.answer(ui.LANGUAGE_PROMPT, reply_markup=ui.language_menu(user.lang or app.s.default_target_lang))
@@ -315,7 +316,10 @@ def _private_router(app: App) -> Router:
                                       or app.s.default_target_lang, bot_username=app.bot_username,
                                       approved=approved, private_ok=True,
                                       inline_ok=approved or app.s.inline_access == "everyone",
-                                      max_seconds=int(app.s.max_media_seconds)))
+                                      max_seconds=int(app.s.max_media_seconds),
+                                      is_owner=app.resolver.is_owner(msg.from_user.id),
+                                      paused=bool(user and user.paused)),
+                         reply_markup=ui.help_kb())
 
     @r.message(Command("privacy"))
     async def privacy(msg: Message) -> None:
@@ -638,6 +642,11 @@ def _callback_router(app: App) -> Router:
                 return
             elif action == "privacy":
                 await msg.answer(ui.PRIVACY)
+                await cb.answer()
+                return
+            elif action == "show":  # from /help: open settings below, keep the help message
+                await msg.answer(ui.settings_text(user, app.s.default_target_lang),
+                                 reply_markup=ui.settings_kb(user, app.s.default_target_lang))
                 await cb.answer()
                 return
             with contextlib.suppress(TelegramAPIError):
