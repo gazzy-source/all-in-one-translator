@@ -217,7 +217,7 @@ pytest && ruff check src tests && mypy && bandit -c pyproject.toml -r src
   later. The API can report success anyway.
 - Telegram sends bots no deletion events in groups, so translations of deleted messages are not removed.
 - Adding the bot creates Telegram's standard "added the bot" service message; the bot appears in the member list.
-- Free-tier AI providers may use submitted text to improve their services (stated in `/privacy`).
+- Free-tier AI providers may use submitted text to improve their services.
 - Very stylized single-glyph stickers are an edge case for the local text detector.
 
 ## 🗺 Roadmap

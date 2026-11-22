@@ -7,6 +7,8 @@
   groups, anywhere), commands folded into an expandable block, and buttons for the common actions (change
   language, settings, privacy). Role-aware: people who aren't approved see their ID; owners see their commands.
 * **/start** uses the same three lines and greets by first name.
+* `/privacy` no longer talks about provider tiers; it names the translation services and says their privacy
+  terms apply.
 
 ## 1.1.2 — 2026-11-22 (Burmese groups)
 

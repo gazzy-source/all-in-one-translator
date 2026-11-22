@@ -35,7 +35,7 @@ Scope: `src/translator_bot` at v0.2.1. Tools: bandit 1.9.4 (clean after reviewed
 
 ## Remaining concerns
 
-* Free-tier providers may use submitted text to improve their services (stated in `/privacy`). For sensitive
+* Free-tier providers may use submitted text to improve their services. For sensitive
   groups use paid tiers with no-training terms.
 * Ephemeral messages are processed by Telegram servers like any message; this is not end-to-end encryption.
 * Process-pool hard-kill uses a private CPython attribute (best effort); on hang the pool is replaced regardless.
