@@ -5,7 +5,9 @@ Uses raw httpx (no SDK) to keep dependencies small. Two model tiers: `fast` (fla
 
 from __future__ import annotations
 
+import asyncio
 import base64
+import copy
 import json
 import logging
 import time
@@ -51,6 +53,25 @@ def _parse_duration(s: str | None) -> float | None:
         return None
 
 
+
+async def _first_success(tasks: dict[asyncio.Future[dict[str, Any]], str]) -> tuple[str, dict[str, Any]]:
+    """First task to succeed wins (the other is cancelled); if all fail, the first error is raised."""
+    pending = set(tasks)
+    first_err: BaseException | None = None
+    try:
+        while pending:
+            done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+            for t in done:
+                exc = t.exception()
+                if exc is None:
+                    return tasks[t], t.result()
+                first_err = first_err or exc
+        assert first_err is not None
+        raise first_err
+    finally:
+        for t in pending:
+            t.cancel()
+
 class GeminiProvider:
     name = "gemini"
 
@@ -67,6 +88,7 @@ class GeminiProvider:
         rpm: int = 10,
         rpd: int = 1000,
         store: bool = False,
+        hedge_s: float = 2.5,
         base_url: str = "https://generativelanguage.googleapis.com/v1beta",
         client: httpx.AsyncClient | None = None,
     ) -> None:
@@ -80,6 +102,8 @@ class GeminiProvider:
             limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
         )
         self._store = store
+        self.hedge_s = hedge_s  # 0 = off
+        self.hedged = 0  # requests that also asked the other model (observability)
         models = {fast_model, quality_model, vision_model} | ({self.fallback_model} if self.fallback_model else set())
         self._rpm = {m: SlidingWindowLimiter(rpm, 60.0) for m in models}
         self._rpd = {m: DailyQuota(rpd, day_fn=pacific_today) for m in models}  # Google resets at Pacific midnight
@@ -98,25 +122,48 @@ class GeminiProvider:
         return {m: {"rpd_remaining": q.remaining(), "rpd_used": q.used} for m, q in self._rpd.items()}
 
     # -- core request ----------------------------------------------------------------------------
-    async def _generate(self, model: str, body: dict[str, Any], timeout: float, max_wait: float) -> dict[str, Any]:
-        """Call `model`; on overload (503/local cap) retry once on the fallback model (separate capacity pool)."""
+    async def _generate(self, model: str, body: dict[str, Any], timeout: float, max_wait: float,
+                        hedge_s: float | None = None) -> tuple[str, dict[str, Any]]:
+        """Call `model` and return (model that answered, response).
+
+        Speed, using the other model (separate free-tier capacity) as the fallback:
+        * no free RPM slot on `model` right now but one on the other: use the other at once (was: wait up to 8 s);
+        * hedging: no answer after `hedge_s` -> also ask the other model, first good answer wins (benchmarks
+          2026-11-22: Gemini p50 1.6 s but p90 7.4 s, p95 10.4 s - the tail is provider stalls);
+        * overload / quota / timeout errors fail over to the other model while time remains.
+        """
+        alt: str | None = self.fallback_model if model != self.fallback_model else self.quality_model
+        if alt == model:
+            alt = None
+        if alt is not None and not self.available(model) and self.available(alt):
+            model, alt = alt, model
+        hedge = self.hedge_s if hedge_s is None else hedge_s
         t0 = time.monotonic()
+        primary = asyncio.ensure_future(self._generate_one(model, copy.deepcopy(body), timeout, max_wait))
         try:
-            return await self._generate_one(model, body, timeout, max_wait)
-        except ProviderError as err:
-            # Vision may already run on the fallback model; then fail over to the text model instead.
-            alt = self.fallback_model if model != self.fallback_model else self.quality_model
-            overloaded = (err.kind is ErrorKind.TRANSIENT and err.status in (500, 503)) or (
-                err.kind in (ErrorKind.RATE_LIMITED, ErrorKind.QUOTA))
-            remaining = timeout - (time.monotonic() - t0)
-            if alt is None or alt == model or not overloaded or remaining < 2.0:
-                raise
-            self.last_model_used = alt
-            return await self._generate_one(alt, body, remaining, max_wait=min(1.0, remaining / 3))
+            if alt is not None and 0 < hedge < timeout - 1.0:
+                done, _ = await asyncio.wait({primary}, timeout=hedge)
+                if not done and self.available(alt):
+                    self.hedged += 1
+                    second = asyncio.ensure_future(
+                        self._generate_one(alt, copy.deepcopy(body), timeout - (time.monotonic() - t0), 0.0))
+                    return await _first_success({primary: model, second: alt})
+            try:
+                return model, await primary
+            except ProviderError as err:
+                retry = (err.kind is ErrorKind.TRANSIENT and err.status in (500, 503)) or err.kind in (
+                    ErrorKind.RATE_LIMITED, ErrorKind.QUOTA, ErrorKind.TIMEOUT)
+                remaining = timeout - (time.monotonic() - t0)
+                if alt is None or not retry or remaining < 2.0:
+                    raise
+                return alt, await self._generate_one(alt, copy.deepcopy(body), remaining,
+                                                     max_wait=min(1.0, remaining / 3))
+        finally:
+            if not primary.done():
+                primary.cancel()
 
     async def _generate_one(self, model: str, body: dict[str, Any], timeout: float,
                             max_wait: float) -> dict[str, Any]:
-        self.last_model_used = model
         if self._rpd[model].remaining() <= 0:
             raise ProviderError(ErrorKind.QUOTA, self.name, f"local daily cap reached for {model}")
         if not await self._rpm[model].acquire(max_wait=max_wait):
@@ -245,7 +292,7 @@ class GeminiProvider:
         }
         t0 = time.perf_counter()
         # Wait for a free-tier RPM slot: briefly on the inline path (short timeout), longer for groups.
-        data = await self._generate(model, body, timeout, max_wait=max(0.3, min(8.0, timeout - 4.0)))
+        used, data = await self._generate(model, body, timeout, max_wait=max(0.3, min(8.0, timeout - 4.0)))
         obj, tin, tout = self._extract_json(data, self.name)
         try:
             needs = bool(obj["needs_translation"])
@@ -258,7 +305,7 @@ class GeminiProvider:
             src = None
         return TranslationResult(
             needs_translation=needs and bool(translation), translation=translation, source_lang=src,
-            confidence=max(0.0, min(1.0, conf)), provider=self.name, model=self.last_model_used,
+            confidence=max(0.0, min(1.0, conf)), provider=self.name, model=used,
             latency_ms=(time.perf_counter() - t0) * 1000, input_tokens=tin, output_tokens=tout,
         )
 
@@ -291,7 +338,8 @@ class GeminiProvider:
             },
         }
         t0 = time.perf_counter()
-        data = await self._generate(model, body, timeout, max_wait=3.0)
+        # vision calls are slower (images/audio): hedge later
+        used, data = await self._generate(model, body, timeout, max_wait=3.0, hedge_s=self.hedge_s * 2)
         obj, tin, tout = self._extract_json(data, self.name)
         try:
             src = str(obj.get("source_language") or "").strip().lower() or None
@@ -310,7 +358,7 @@ class GeminiProvider:
                 source_lang=None if src in ("und", "unknown") else src,
                 translations=translations,
                 confidence=max(0.0, min(1.0, float(obj.get("confidence", 0.0)))),
-                provider=self.name, model=self.last_model_used, latency_ms=(time.perf_counter() - t0) * 1000,
+                provider=self.name, model=used, latency_ms=(time.perf_counter() - t0) * 1000,
                 input_tokens=tin, output_tokens=tout,
             )
         except (KeyError, TypeError, ValueError):

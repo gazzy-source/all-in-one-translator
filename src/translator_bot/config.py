@@ -40,6 +40,8 @@ class Settings(BaseSettings):
     gemini_quality_thinking: str = Field("LOW", alias="GEMINI_QUALITY_THINKING")
     gemini_vision_model: str = Field("gemini-3.5-flash-lite", alias="GEMINI_VISION_MODEL")
     gemini_rpm: int = Field(15, alias="GEMINI_RPM", ge=1)  # local guard, per model
+    # no answer after this many seconds -> also ask the fallback model, first answer wins (0 = off; vision x2)
+    gemini_hedge_s: float = Field(2.5, alias="GEMINI_HEDGE_S", ge=0)
     gemini_rpd: int = Field(1000, alias="GEMINI_RPD", ge=1)  # local guard, per model per day
     gemini_store: bool = Field(False, alias="GEMINI_STORE")
     gemini_base_url: str = Field("https://generativelanguage.googleapis.com/v1beta", alias="GEMINI_BASE_URL")

@@ -10,6 +10,7 @@ A failure or setting for one recipient never affects another: each recipient is 
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from collections.abc import Awaitable, Callable
@@ -95,13 +96,20 @@ class RecipientResolver:
 
     async def resolve(self, chat_id: int, sender_id: int | None) -> list[Recipient]:
         muted = await self.storage.muted_users(chat_id)
+        users = [u for u in await self.candidates()
+                 if u.user_id != sender_id and not u.paused and u.user_id not in muted
+                 and not (self.onboarding_required and not u.onboarded)]
+        # membership checks in parallel (each uncached one is a getChatMember round trip, ~0.1-0.3 s), bounded
+        sem = asyncio.Semaphore(8)
+
+        async def member(uid: int) -> bool:
+            async with sem:
+                return await self.membership.is_member(chat_id, uid)
+
+        flags = await asyncio.gather(*(member(u.user_id) for u in users))
         out: list[Recipient] = []
-        for u in await self.candidates():
-            if u.user_id == sender_id or u.paused or u.user_id in muted:
-                continue
-            if self.onboarding_required and not u.onboarded:
-                continue
-            if not await self.membership.is_member(chat_id, u.user_id):
+        for u, is_member in zip(users, flags, strict=True):
+            if not is_member:
                 continue
             using_default = not u.lang
             out.append(Recipient(

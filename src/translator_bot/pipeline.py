@@ -56,6 +56,7 @@ class UnitMeta:
     sender_name: str
     reply_ctx: ContextLine | None
     settings: dict[str, Any]
+    ctx_before: int | None = None  # ContextStore.mark when the (first) message arrived
 
 
 @dataclass(slots=True)
@@ -130,6 +131,7 @@ class Pipeline:
         chat = await self.chat(msg)
         sid = sender_id(msg)
         thread = topic_of(msg)  # one key for context, bursts, claims and delivery
+        ctx_mark = self.context.mark  # context = what was said *before* this message
         if msg.text and sid is not None and not msg.text.startswith("/"):
             self.context.add(msg.chat.id, thread, sid, msg.text)
         elif msg.caption and sid is not None:
@@ -157,7 +159,7 @@ class Pipeline:
             return
         self.metrics.inc(f"eligible.{res.kind.value}")
         meta = UnitMeta(msg.chat.id, msg.chat.title, thread, sid, sender_name(msg), self._reply_ctx(msg, sid),
-                        chat.settings)
+                        chat.settings, ctx_mark)
         if res.kind is Kind.TEXT:
             await self.bursts.add((msg.chat.id, thread, sid or 0),
                                   BurstItem(msg.message_id, res.text_html, res.plain), meta)
@@ -320,9 +322,10 @@ class Pipeline:
                                                           or verdict is Verdict.UNSURE)
         ctx: tuple[ContextLine, ...] = ()
         if use_ctx and self.s.context_messages:
-            ctx = self.context.get(meta.chat_id, meta.thread_id, meta.sender_id or 0, limit=self.s.context_messages)
-            # the current message itself is the last context entry: drop it
-            if ctx and ctx[-1].text.strip() == truncate(plain, 280).strip():
+            ctx = self.context.get(meta.chat_id, meta.thread_id, meta.sender_id or 0, limit=self.s.context_messages,
+                                   before=meta.ctx_before)
+            # no arrival mark (edit after restart): the current message itself is the last entry - drop it
+            if meta.ctx_before is None and ctx and ctx[-1].text.strip() == truncate(plain, 280).strip():
                 ctx = ctx[:-1]
         is_html = text_html != plain and "<" in text_html
         return TranslationJob(

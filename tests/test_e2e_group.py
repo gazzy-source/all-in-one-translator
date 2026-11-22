@@ -410,3 +410,28 @@ async def test_watchdog_requests_restart_when_unhealthy(h: Harness) -> None:
     await asyncio.sleep(0.05)
     await asyncio.wait_for(h.app._watchdog(interval=0.01), 2)  # two failed checks -> fatal
     assert h.app.fatal.is_set() and "text lane" in (h.app.fatal_reason or "")
+
+
+async def test_context_is_what_was_said_before_the_message(tmp_path: Path, detector: Any) -> None:
+    """Review finding: context was read when the job ran, so a burst's own lines (and later messages) were sent
+    as "context" too - the model could merge or re-translate them, and cache keys missed."""
+    tg = FakeTelegram(members={GROUP_ID: {OWNER, OUTSIDER, SPANISH_SPEAKER, BOT_ID}}, admins={GROUP_ID})
+    gemini = FakeProvider("gemini")
+    app = App(make_settings(tmp_path, BURST_WINDOW_MS=300), session=FakeSession(tg),
+              providers={"gemini": gemini}, detector=detector)
+    await app.start()
+    try:
+        await app.storage.upsert_chat(GROUP_ID, title="Test Group", type="supergroup", enabled=True,
+                                      bot_is_admin=True)
+        dp = Dispatcher()
+        for r in build_routers(app):
+            dp.include_router(r)
+        hh = Harness(app, dp, tg, gemini, gemini)
+        await hh.send(group_message("Are you coming tonight?", sender=OUTSIDER))
+        await hh.send(group_message("no sé todavía", sender=SPANISH_SPEAKER))
+        await hh.send(group_message("ni modo jaja", sender=SPANISH_SPEAKER))  # same burst
+        await hh.idle()
+        [(job, _q)] = [j for j in gemini.jobs if "ni modo" in j[0].text]
+        assert [c.text for c in job.context] == ["Are you coming tonight?"]
+    finally:
+        await app.stop()

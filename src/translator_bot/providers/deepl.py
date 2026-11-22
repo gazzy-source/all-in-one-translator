@@ -47,6 +47,21 @@ def _unprotect(text_html: str) -> str:
     return str(_KEEP_RE.sub(lambda m: m.group(1), text_html))
 
 
+
+_EM_DASH = "—"
+_DASH_RE = re.compile(r"\s*—\s*")
+
+
+def _chat_punctuation(translation: str, source: str, target: str) -> str:
+    """DeepL turns chat commas into em dashes ("See you tomorrow—don't be late!", benchmark 2026-11-22):
+    stiff in a chat. When the source had no dash, use a comma again. En dashes (ranges like 3–5) are kept;
+    CJK targets keep their own dash conventions."""
+    if (_EM_DASH not in translation or any(d in source for d in ("—", "–", " - "))
+            or target.split("-")[0].lower() in ("zh", "ja", "ko")):
+        return translation
+    return str(_DASH_RE.sub(", ", translation))
+
+
 class DeepLProvider:
     name = "deepl"
 
@@ -155,7 +170,7 @@ class DeepLProvider:
         except (KeyError, IndexError, TypeError, ValueError):
             raise ProviderError(ErrorKind.INVALID_OUTPUT, self.name, "schema mismatch") from None
         self.local_chars += billed
-        translation = out_html if job.html else html_to_plain(out_html)
+        translation = _chat_punctuation(out_html if job.html else html_to_plain(out_html), job.text, job.target)
         # DeepL reports both Chinese scripts as "zh": trust the detector's variant hint when it gave one
         src_lang = job.source_hint if (job.source_hint or "").lower().startswith("zh") and (detected or "").startswith(
             "zh") else detected

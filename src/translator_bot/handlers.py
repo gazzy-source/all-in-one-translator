@@ -561,7 +561,7 @@ def _status_text(app: App) -> str:
     for k in sorted(k for k in lat if k.startswith(("pipeline_media_ms.", "private_ms."))):
         lines.append(f"{html.escape(k)}: {lat[k]}")
     if app.gemini:
-        lines.append(f"gemini quota: {json.dumps(app.gemini.quota_snapshot())}")
+        lines.append(f"gemini quota: {json.dumps(app.gemini.quota_snapshot())} · hedged: {app.gemini.hedged}")
     if app.deepl and app.deepl.char_limit:
         lines.append(f"deepl chars: {app.deepl.char_count}/{app.deepl.char_limit}")
     if app.pipeline:

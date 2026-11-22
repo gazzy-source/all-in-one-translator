@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from pathlib import Path
 from typing import Any
 
@@ -433,3 +434,120 @@ async def test_caption_steered_media_reading_is_not_cached(tmp_path: Path) -> No
     finally:
         await p.close()
         await st.close()
+
+
+def test_bare_24h_hour_matches_12h_translation() -> None:
+    from translator_bot.textutil import missing_entities
+
+    assert missing_entities("Dove ci vediamo stasera? Io finisco alle 19.",
+                            "Where should we meet tonight? I'm done at 7 p.m.") == []
+    assert missing_entities("Io finisco alle 19.", "I'm done at 8 p.m.") == ["19"]  # changed value still flagged
+
+
+def test_deepl_em_dash_becomes_comma_in_chat() -> None:
+    from translator_bot.providers.deepl import _chat_punctuation
+
+    assert _chat_punctuation("See you tomorrow—don't be late!", "明天见，别迟到哦！", "en") == \
+        "See you tomorrow, don't be late!"
+    assert _chat_punctuation("Wait — what?", "Attends — quoi ?", "en") == "Wait — what?"  # source had one
+    assert _chat_punctuation("3–5 people", "3-5 Leute", "en") == "3–5 people"  # en dash range kept
+    assert _chat_punctuation("明天见——别迟到", "See you tomorrow, don't be late", "zh") == "明天见——别迟到"
+
+
+async def test_improving_a_usable_result_does_not_wait_for_retries() -> None:
+    from tests.conftest import FakeProvider
+
+    deepl = FakeProvider("deepl")
+    deepl.overrides["Wir treffen uns um 19 Uhr am Bahnhof"] = "We meet at the station at 8"  # number drift
+    gemini = FakeProvider("gemini")
+    gemini.fail = [ErrorKind.TIMEOUT, ErrorKind.TIMEOUT]
+    o = Orchestrator({"deepl": deepl, "gemini": gemini}, Metrics())
+    det = Detection("de", 0.95, Verdict.OTHER)
+    res = await o.translate(TranslationJob("Wir treffen uns um 19 Uhr am Bahnhof", "en", source_hint="de"), det)
+    assert res is not None and res.provider == "deepl"  # minor drift beats silence
+    assert len(gemini.jobs) == 1  # the improvement attempt is not retried after a timeout
+
+
+@pytest.mark.parametrize("wordlist", ["best", "small"])
+def test_russian_is_not_labelled_belarusian(wordlist: str) -> None:
+    """Holdout h-ru-idiom (2026-11-22): lingua said "be" (0.81) for a plain Russian line, so readers saw
+    "Belarusian → English". Real Belarusian/Kazakh keep their labels."""
+    from translator_bot.detect import LanguageDetector
+
+    det = LanguageDetector(wordlist=wordlist)
+    assert det.detect("Да ладно, не вешай нос, прорвёмся", "en").lang == "ru"
+    assert det.detect("Прывітанне, што ты робіш сёння ўвечары?", "en").lang == "be"
+    assert det.detect("Добры дзень, як справы? Дзякуй, усё добра", "en").lang == "be"
+    assert det.detect("Сәлем, қалың қалай?", "en").lang == "kk"
+
+
+def test_bare_24h_hour_without_ampm() -> None:
+    from translator_bot.textutil import missing_entities
+
+    assert missing_entities("che figata ragazzi, ci vediamo stasera alle 21?",
+                            "That's so cool, guys. See you tonight at 9?") == []
+
+
+def test_accentless_vietnamese_never_falls_back_to_deepl() -> None:
+    from tests.conftest import FakeProvider
+    from translator_bot.detect import LanguageDetector
+
+    det = LanguageDetector(wordlist="small").detect("toi nay di an lau khong may ba", "en")
+    assert det.lang == "vi" and det.romanized
+    o = Orchestrator({"deepl": FakeProvider("deepl"), "gemini": FakeProvider("gemini")}, Metrics())
+    routes = o.route(TranslationJob("toi nay di an lau khong may ba", "en", source_hint="vi"), det, "group")
+    assert [r.provider for r in routes] == ["gemini"]
+
+
+def _gemini_with(handler: Any, **kw: Any) -> Any:
+    from translator_bot.providers.gemini import GeminiProvider
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    return GeminiProvider("KEY", fast_model="fast-m", quality_model="qual-m", vision_model="vis-m",
+                          fallback_model="fb-m", client=client, **kw)
+
+
+def _ok(text: str) -> httpx.Response:
+    from tests.test_providers import gemini_ok
+
+    return httpx.Response(200, json=gemini_ok({"needs_translation": True, "source_language": "es",
+                                               "translation": text, "confidence": 0.9}))
+
+
+async def test_gemini_hedges_slow_primary_with_fallback_model() -> None:
+    async def handler(req: httpx.Request) -> httpx.Response:
+        if "fast-m" in str(req.url):
+            await asyncio.sleep(5)  # provider stall
+            return _ok("slow")
+        return _ok("fast answer")
+
+    g = _gemini_with(handler, hedge_s=0.2)
+    t = time.perf_counter()
+    res = await g.translate(TranslationJob("hola amigos", "en"), quality=False, timeout=8)
+    assert res.translation == "fast answer" and res.model == "fb-m" and g.hedged == 1
+    assert time.perf_counter() - t < 2  # did not wait for the stalled primary
+
+
+async def test_gemini_skips_rpm_wait_when_fallback_has_capacity() -> None:
+    seen: list[str] = []
+
+    async def handler(req: httpx.Request) -> httpx.Response:
+        seen.append(str(req.url))
+        return _ok("ok")
+
+    g = _gemini_with(handler, rpm=1, hedge_s=0)
+    await g.translate(TranslationJob("hola", "en"), quality=False, timeout=8)
+    t = time.perf_counter()
+    res = await g.translate(TranslationJob("adiós", "en"), quality=False, timeout=8)
+    assert res.model == "fb-m" and time.perf_counter() - t < 1  # no wait for fast-m's next RPM slot
+
+
+async def test_gemini_timeout_fails_over_to_other_model() -> None:
+    async def handler(req: httpx.Request) -> httpx.Response:
+        if "fast-m" in str(req.url):
+            raise httpx.ReadTimeout("stall", request=req)
+        return _ok("from fallback")
+
+    g = _gemini_with(handler, hedge_s=0)
+    res = await g.translate(TranslationJob("hola", "en"), quality=False, timeout=8)
+    assert res.translation == "from fallback" and res.model == "fb-m"
