@@ -110,7 +110,7 @@ class App:
                 quality_model=self.s.gemini_quality_model, vision_model=self.s.gemini_vision_model,
                 fallback_model=self.s.gemini_fallback_model, fast_thinking=self.s.gemini_fast_thinking,
                 quality_thinking=self.s.gemini_quality_thinking, rpm=self.s.gemini_rpm, rpd=self.s.gemini_rpd, store=self.s.gemini_store,
-                base_url=self.s.gemini_base_url)
+                hedge_s=self.s.gemini_hedge_s, base_url=self.s.gemini_base_url)
             self.providers["gemini"] = self.gemini
         if self.s.deepl_api_key and self._injected_providers is None:
             self.deepl = DeepLProvider(self.s.deepl_api_key.get_secret_value(), rpm=self.s.deepl_rpm,

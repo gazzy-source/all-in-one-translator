@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from pathlib import Path
 from typing import Any
 
@@ -496,3 +497,57 @@ def test_accentless_vietnamese_never_falls_back_to_deepl() -> None:
     o = Orchestrator({"deepl": FakeProvider("deepl"), "gemini": FakeProvider("gemini")}, Metrics())
     routes = o.route(TranslationJob("toi nay di an lau khong may ba", "en", source_hint="vi"), det, "group")
     assert [r.provider for r in routes] == ["gemini"]
+
+
+def _gemini_with(handler: Any, **kw: Any) -> Any:
+    from translator_bot.providers.gemini import GeminiProvider
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    return GeminiProvider("KEY", fast_model="fast-m", quality_model="qual-m", vision_model="vis-m",
+                          fallback_model="fb-m", client=client, **kw)
+
+
+def _ok(text: str) -> httpx.Response:
+    from tests.test_providers import gemini_ok
+
+    return httpx.Response(200, json=gemini_ok({"needs_translation": True, "source_language": "es",
+                                               "translation": text, "confidence": 0.9}))
+
+
+async def test_gemini_hedges_slow_primary_with_fallback_model() -> None:
+    async def handler(req: httpx.Request) -> httpx.Response:
+        if "fast-m" in str(req.url):
+            await asyncio.sleep(5)  # provider stall
+            return _ok("slow")
+        return _ok("fast answer")
+
+    g = _gemini_with(handler, hedge_s=0.2)
+    t = time.perf_counter()
+    res = await g.translate(TranslationJob("hola amigos", "en"), quality=False, timeout=8)
+    assert res.translation == "fast answer" and res.model == "fb-m" and g.hedged == 1
+    assert time.perf_counter() - t < 2  # did not wait for the stalled primary
+
+
+async def test_gemini_skips_rpm_wait_when_fallback_has_capacity() -> None:
+    seen: list[str] = []
+
+    async def handler(req: httpx.Request) -> httpx.Response:
+        seen.append(str(req.url))
+        return _ok("ok")
+
+    g = _gemini_with(handler, rpm=1, hedge_s=0)
+    await g.translate(TranslationJob("hola", "en"), quality=False, timeout=8)
+    t = time.perf_counter()
+    res = await g.translate(TranslationJob("adiós", "en"), quality=False, timeout=8)
+    assert res.model == "fb-m" and time.perf_counter() - t < 1  # no wait for fast-m's next RPM slot
+
+
+async def test_gemini_timeout_fails_over_to_other_model() -> None:
+    async def handler(req: httpx.Request) -> httpx.Response:
+        if "fast-m" in str(req.url):
+            raise httpx.ReadTimeout("stall", request=req)
+        return _ok("from fallback")
+
+    g = _gemini_with(handler, hedge_s=0)
+    res = await g.translate(TranslationJob("hola", "en"), quality=False, timeout=8)
+    assert res.translation == "from fallback" and res.model == "fb-m"

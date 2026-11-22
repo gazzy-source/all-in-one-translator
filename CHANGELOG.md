@@ -17,6 +17,10 @@ Measured with `bench_translation.py` on the held-out corpus (48 cases, realistic
 * DeepL's em dashes in chat ("See you tomorrow—don't be late!") become commas when the source had no dash.
 
 ### Performance
+* **Faster Gemini, using the fallback model:** hedged requests - no answer after `GEMINI_HEDGE_S` (2.5 s; vision
+  ×2) → the fallback model is asked too and the first answer wins; no waiting for a local RPM slot when the other
+  model has one; timeouts fail over too. Held-out benchmark (3 s hedge): p50 1.11 → 0.85 s, p90 11.0 → 4.6 s,
+  cases over 5 s 8 → 2; accuracy unchanged. `/status` shows the hedge count.
 * Recipient membership checks run in parallel (bounded), instead of one `getChatMember` round trip per approved
   user per message on a cold cache.
 
