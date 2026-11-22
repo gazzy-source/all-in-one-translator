@@ -252,13 +252,98 @@ async def test_burst_coalescing(tmp_path: Path, detector: Any) -> None:
         await app.stop()
 
 
-async def test_private_start_access_denied_for_unknown(h: Harness) -> None:
-    dm = {"message_id": 5, "date": int(time.time()), "chat": {"id": OUTSIDER, "type": "private"},
-          "from": {"id": OUTSIDER, "is_bot": False, "first_name": "Pat"}, "text": "/start",
-          "entities": [{"type": "bot_command", "offset": 0, "length": 6}]}
-    await h.send(dm)
+def dm(uid: int, text: str | None = None, mid: int = 5, **extra: Any) -> dict[str, Any]:
+    d: dict[str, Any] = {"message_id": mid, "date": int(time.time()), "chat": {"id": uid, "type": "private"},
+                         "from": {"id": uid, "is_bot": False, "first_name": "Pat"}, **extra}
+    if text is not None:
+        d["text"] = text
+        if text.startswith("/"):
+            d["entities"] = [{"type": "bot_command", "offset": 0, "length": len(text.split()[0])}]
+    return d
+
+
+async def test_private_start_access_denied_when_private_access_approved(tmp_path: Path, detector: Any) -> None:
+    tg = FakeTelegram(members={GROUP_ID: {OWNER, OUTSIDER, BOT_ID}}, admins={GROUP_ID})
+    gemini = FakeProvider("gemini")
+    app = App(make_settings(tmp_path, PRIVATE_ACCESS="approved"), session=FakeSession(tg),
+              providers={"gemini": gemini}, detector=detector)
+    await app.start()
+    try:
+        dp = Dispatcher()
+        for r in build_routers(app):
+            dp.include_router(r)
+        hh = Harness(app, dp, tg, gemini, gemini)
+        await hh.send(dm(OUTSIDER, "/start"))
+        await hh.send(dm(OUTSIDER, "Hola amigos, ¿qué tal?", mid=6))
+        await hh.idle()
+        out = tg.dms_to(OUTSIDER)
+        assert len(out) == 2 and all("approved" in c.params["text"] for c in out)
+        assert str(OUTSIDER) in out[0].params["text"] and gemini.jobs == []
+    finally:
+        await app.stop()
+
+
+async def test_private_start_open_to_everyone_by_default(h: Harness) -> None:
+    await h.send(dm(OUTSIDER, "/start"))
     out = h.tg.dms_to(OUTSIDER)
-    assert len(out) == 1 and "private" in out[0].params["text"] and str(OUTSIDER) in out[0].params["text"]
+    assert len(out) == 2  # welcome + language picker
+    assert "Send me any" in out[0].params["text"] and str(OUTSIDER) in out[0].params["text"]  # approval hint
+    assert "@babel_test_bot" not in out[0].params["text"]  # inline is approved-only by default
+
+
+async def test_private_chat_translates_text_for_anyone(h: Harness) -> None:
+    await h.send(dm(OUTSIDER, "¿Alguien sabe si mañana estará abierto? 😂", mid=9))
+    await h.idle()
+    [out] = h.tg.dms_to(OUTSIDER)
+    assert "Does anyone know if it will be open tomorrow? 😂" in out.params["text"]
+    assert "Spanish → English" in out.params["text"]
+    assert out.params["reply_parameters"]["message_id"] == 9
+    assert h.tg.public_group_output() == []
+
+
+async def test_private_chat_language_names_and_same_language(h: Harness) -> None:
+    await h.send(dm(OUTSIDER, "Hindi"))  # a language name: offer to switch, don't translate
+    await h.send(dm(OUTSIDER, "hi", mid=6))  # a bare code outside the prompt is a word
+    await h.idle()
+    a, b = h.tg.dms_to(OUTSIDER)
+    assert "Hindi" in a.params["text"] and a.params["reply_markup"]["inline_keyboard"][0][0]["callback_data"]         == "lang:set:hi"
+    assert "Already in" in b.params["text"]
+    await h.send(dm(OUTSIDER, "/language", mid=7))
+    await h.send(dm(OUTSIDER, "ja", mid=8))  # with the prompt open, codes resolve
+    out = h.tg.dms_to(OUTSIDER)
+    assert "Japanese" in out[-1].params["text"]
+    assert h.gemini.jobs == [] and h.deepl.jobs == []
+
+
+async def test_private_daily_limit_for_unapproved(tmp_path: Path, detector: Any) -> None:
+    tg = FakeTelegram(members={GROUP_ID: {OWNER, OUTSIDER, BOT_ID}}, admins={GROUP_ID})
+    gemini = FakeProvider("gemini")
+    app = App(make_settings(tmp_path, PRIVATE_DAILY_LIMIT=1), session=FakeSession(tg),
+              providers={"gemini": gemini}, detector=detector)
+    await app.start()
+    try:
+        dp = Dispatcher()
+        for r in build_routers(app):
+            dp.include_router(r)
+        hh = Harness(app, dp, tg, gemini, gemini)
+        for i, (uid, text) in enumerate([(OUTSIDER, "Hola amigos, ¿qué tal?"), (OUTSIDER, "¿Dónde estás ahora?"),
+                                         (OWNER, "¿Dónde estás ahora?"), (OWNER, "Hola amigos, ¿qué tal?")]):
+            await hh.send(dm(uid, text, mid=10 + i))
+        await hh.idle()
+        o = [c.params["text"] for c in tg.dms_to(OUTSIDER)]
+        assert len(o) == 2 and sum("[en]" in t for t in o) == 1 and sum("limit" in t for t in o) == 1
+        assert all("limit" not in c.params["text"] for c in tg.dms_to(OWNER))  # owners/approved: no daily cap
+    finally:
+        await app.stop()
+
+
+async def test_help_is_short_and_role_aware(h: Harness) -> None:
+    await h.send(dm(OUTSIDER, "/help"))
+    await h.send(dm(OWNER, "/help", mid=6))
+    outsider, owner = h.tg.dms_to(OUTSIDER)[0].params["text"], h.tg.dms_to(OWNER)[0].params["text"]
+    assert "Here:" in outsider and str(OUTSIDER) in outsider and "/pause" not in outsider
+    assert "Groups:" in owner and "/pause" in owner and "@babel_test_bot" in owner
+    assert len(owner) < 900
 
 
 async def test_private_start_onboarding_for_approved(h: Harness) -> None:

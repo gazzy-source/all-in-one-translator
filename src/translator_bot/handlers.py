@@ -1,4 +1,4 @@
-"""aiogram routers: group (silent), private (onboarding & settings), callbacks, inline mode."""
+"""aiogram routers: group (silent), private (1:1 translator, onboarding & settings), callbacks, inline mode."""
 
 from __future__ import annotations
 
@@ -9,10 +9,11 @@ import html
 import json
 import logging
 import re
+import time
 from typing import Any
 
 from aiogram import Bot, F, Router
-from aiogram.exceptions import TelegramAPIError
+from aiogram.exceptions import TelegramAPIError, TelegramBadRequest, TelegramRetryAfter
 from aiogram.filters import Command, CommandObject
 from aiogram.types import (
     BotCommand,
@@ -25,6 +26,7 @@ from aiogram.types import (
     InlineQueryResultArticle,
     InlineQueryResultsButton,
     InputTextMessageContent,
+    LinkPreviewOptions,
     Message,
     ReplyParameters,
 )
@@ -32,9 +34,11 @@ from aiogram.types import (
 from translator_bot import ui
 from translator_bot.app import App
 from translator_bot.detect import Verdict
+from translator_bot.eligibility import Eligible, Skip, classify
 from translator_bot.languages import lang_name, resolve_language, suggest_languages
+from translator_bot.pipeline import PrivateResult, html_escape_truncate
 from translator_bot.providers.base import TranslationJob
-from translator_bot.textutil import ContentKind, normalize_for_key, profile_text, truncate
+from translator_bot.textutil import ContentKind, html_to_plain, normalize_for_key, profile_text, truncate
 
 log = logging.getLogger(__name__)
 _INT_RE = re.compile(r"-?\d{1,20}")  # callback/command ids: "--5" or "x" must not reach int()
@@ -220,40 +224,62 @@ async def _glossary_cmd(app: App, chat_id: int, arg: str) -> str:
 def _private_router(app: App) -> Router:
     r = Router(name="private")
     r.message.filter(PRIVATE)
+    awaiting_lang: dict[int, float] = {}  # user id -> when the language prompt was shown (typed names resolve)
+
+    async def access(msg: Message) -> tuple[bool, bool]:
+        """(may use the private chat, is approved for group translations). Replies when access is denied."""
+        if msg.from_user is None:
+            return False, False
+        await app.storage.upsert_user(msg.from_user.id, first_name=msg.from_user.first_name, started=True)
+        approved = await app.resolver.is_approved(msg.from_user.id)
+        if approved or app.s.private_access == "everyone":
+            return True, approved
+        await msg.answer(ui.ACCESS_DENIED.format(uid=msg.from_user.id))
+        return False, False
 
     async def gate(msg: Message) -> bool:
-        if msg.from_user is None:
-            return False
-        await app.storage.upsert_user(msg.from_user.id, first_name=msg.from_user.first_name, started=True)
-        if await app.resolver.is_approved(msg.from_user.id):
-            return True
-        await msg.answer(ui.ACCESS_DENIED.format(uid=msg.from_user.id))
-        return False
+        """Group-translation features (groups, pause): approved users only."""
+        ok, approved = await access(msg)
+        if ok and not approved:
+            assert msg.from_user is not None
+            await msg.answer(ui.ACCESS_DENIED.format(uid=msg.from_user.id))
+        return approved
+
+    def prompt_language(uid: int) -> None:
+        awaiting_lang[uid] = time.monotonic()
+        if len(awaiting_lang) > 10_000:
+            awaiting_lang.pop(next(iter(awaiting_lang)))
 
     @r.message(Command("start"))
     async def start(msg: Message) -> None:
-        if not await gate(msg):
+        ok, approved = await access(msg)
+        if not ok:
             return
         assert msg.from_user is not None
         user = await app.storage.get_user(msg.from_user.id)
         assert user is not None
         await msg.answer(ui.welcome(user, default_lang=app.s.default_target_lang,
-                                    is_owner=app.resolver.is_owner(user.user_id), bot_username=app.bot_username))
+                                    is_owner=app.resolver.is_owner(user.user_id), bot_username=app.bot_username,
+                                    approved=approved, inline_ok=approved or app.s.inline_access == "everyone"))
         if not user.onboarded:
+            prompt_language(user.user_id)
             await msg.answer(ui.LANGUAGE_PROMPT, reply_markup=ui.language_menu(user.lang or app.s.default_target_lang))
 
     @r.message(Command("language"))
     async def language(msg: Message) -> None:
-        if not await gate(msg):
+        ok, _approved = await access(msg)
+        if not ok:
             return
         assert msg.from_user is not None
         user = await app.storage.get_user(msg.from_user.id)
+        prompt_language(msg.from_user.id)
         await msg.answer(ui.LANGUAGE_PROMPT, reply_markup=ui.language_menu(
             (user.lang if user else None) or app.s.default_target_lang))
 
     @r.message(Command("settings"))
     async def settings(msg: Message) -> None:
-        if not await gate(msg):
+        ok, _approved = await access(msg)
+        if not ok:
             return
         assert msg.from_user is not None
         user = await app.storage.get_user(msg.from_user.id)
@@ -280,9 +306,16 @@ def _private_router(app: App) -> Router:
 
     @r.message(Command("help"))
     async def help_(msg: Message) -> None:
-        if not await gate(msg):
+        ok, approved = await access(msg)
+        if not ok:
             return
-        await msg.answer(ui.HELP.format(bot=app.bot_username))
+        assert msg.from_user is not None
+        user = await app.storage.get_user(msg.from_user.id)
+        await msg.answer(ui.help_text(uid=msg.from_user.id, lang=(user.lang if user else None)
+                                      or app.s.default_target_lang, bot_username=app.bot_username,
+                                      approved=approved, private_ok=True,
+                                      inline_ok=approved or app.s.inline_access == "everyone",
+                                      max_seconds=int(app.s.max_media_seconds)))
 
     @r.message(Command("privacy"))
     async def privacy(msg: Message) -> None:
@@ -335,20 +368,152 @@ def _private_router(app: App) -> Router:
 
     @r.message(F.text)
     async def free_text(msg: Message) -> None:
-        if not await gate(msg) or not msg.text:
+        ok, approved = await access(msg)
+        if not ok or not msg.text:
+            return
+        assert msg.from_user is not None
+        uid = msg.from_user.id
+        user = await app.storage.get_user(uid)
+        current = (user.lang if user else None) or app.s.default_target_lang
+        text = msg.text.strip()
+        if text.startswith("/"):
+            await msg.answer("Unknown command — see /help.")
+            return
+        waiting = time.monotonic() - awaiting_lang.pop(uid, -1e9) < 600
+        exact = resolve_language(text) if len(text) <= 40 else None
+        if exact is not None and not waiting and text.lower() == exact.code.lower():
+            exact = None  # bare codes ("hi", "no", "it") are ordinary words unless the language prompt is open
+        if exact is not None:
+            await msg.answer(f"Translate into <b>{html.escape(exact.label)}</b>?",
+                             reply_markup=ui.suggestions_kb([exact], current))
+            return
+        if waiting and len(text) <= 40:
+            hits = suggest_languages(text)
+            if hits:
+                await msg.answer("Did you mean:", reply_markup=ui.suggestions_kb(hits, current))
+                return
+        await _private_translate(app, msg, current, approved)
+
+    @r.message()
+    async def media(msg: Message) -> None:
+        ok, approved = await access(msg)
+        if not ok:
             return
         assert msg.from_user is not None
         user = await app.storage.get_user(msg.from_user.id)
-        current = (user.lang if user else None) or app.s.default_target_lang
-        exact = resolve_language(msg.text)
-        hits = [exact] if exact else suggest_languages(msg.text)
-        if hits:
-            await msg.answer("Did you mean:", reply_markup=ui.suggestions_kb(hits, current))
-        else:
-            await msg.answer("I couldn't find that language. Try its English or native name, or browse:",
-                             reply_markup=ui.language_menu(current))
+        await _private_translate(app, msg, (user.lang if user else None) or app.s.default_target_lang, approved)
 
     return r
+
+
+_PRIVATE_REASONS = {
+    "same": "✅ Already in <b>{lang}</b>. To translate into another language: /language",
+    "no_text": "🤷 I couldn't find any text or speech to translate in that.",
+    "too_long": "⏱ That's longer than {secs} s — I translate voice notes and videos up to {secs} s.",
+    "failed": "⚠️ Translation is unavailable right now — please try again in a minute.",
+    "slow": "⏳ That took too long to read — please send it again in a minute.",
+}
+
+
+_GLOBAL_KEY = 0  # Telegram user ids are positive: key 0 counts all users who aren't approved
+
+
+def _daily_ok(app: App, uid: int) -> bool:
+    """Per-user and total per-day caps on private translations for users who aren't approved (protects the
+    groups' free-tier quota). In memory: a restart resets the counters."""
+    today = time.strftime("%Y-%m-%d", time.gmtime())
+
+    def count(key: int) -> int:
+        day, n = app.private_daily.get(key, (today, 0))
+        return n if day == today else 0
+
+    per_user, total = app.s.private_daily_limit, app.s.private_global_daily_limit
+    if (per_user and count(uid) >= per_user) or (total and count(_GLOBAL_KEY) >= total):
+        return False
+    app.private_daily[uid] = (today, count(uid) + 1)
+    app.private_daily[_GLOBAL_KEY] = (today, count(_GLOBAL_KEY) + 1)
+    if len(app.private_daily) > 50_000:  # bounded: forget other days' counters
+        for k in [k for k, (d, _n) in app.private_daily.items() if d != today]:
+            del app.private_daily[k]
+    return True
+
+
+async def _say(msg: Message, text: str) -> None:
+    with contextlib.suppress(TelegramAPIError):
+        await msg.answer(text)
+
+
+async def _reply_safe(msg: Message, body_html: str) -> None:
+    """Reply in the private chat; never silently lose the answer to length or markup problems."""
+    if len(body_html) > 4096:
+        body_html = html.escape(truncate(html_to_plain(body_html), 4000), quote=False)
+    preview = LinkPreviewOptions(is_disabled=True)
+    for attempt in range(2):
+        try:
+            await msg.reply(body_html, link_preview_options=preview)
+            return
+        except TelegramRetryAfter as exc:
+            if attempt or exc.retry_after > 10:
+                break
+            await asyncio.sleep(exc.retry_after)
+        except TelegramBadRequest as exc:
+            if "parse" not in str(exc).lower() and "tag" not in str(exc).lower():
+                break
+            with contextlib.suppress(TelegramAPIError):  # broken markup: send it as plain text
+                await msg.reply(truncate(html_to_plain(body_html), 4096), parse_mode=None,
+                                link_preview_options=preview)
+                return
+            break
+        except TelegramAPIError:
+            break
+    log.warning("private reply failed")
+
+
+async def _private_translate(app: App, msg: Message, target: str, approved: bool) -> None:
+    """1:1 translator: a message sent to the bot privately is translated into the user's language."""
+    pipeline = app.pipeline
+    if pipeline is None or msg.from_user is None:
+        return
+    el = classify(msg, bot_id=app.bot_id, settings={}, media_enabled=app.s.media_enabled, private=True)
+    if isinstance(el, Skip):
+        if el in (Skip.NON_LINGUISTIC, Skip.NO_CONTENT, Skip.UNSUPPORTED, Skip.MEDIA_DISABLED):
+            await _say(msg, f"Send me {ui.MEDIA_TYPES} to translate." if app.s.media_enabled
+                       else "Send me text or captions to translate.")
+        return
+    uid = msg.from_user.id
+    if not app.private_limiter.try_acquire(uid):
+        await _say(msg, "⏳ That's a lot at once — give me a few seconds.")
+        return
+    if not approved and not app.resolver.is_owner(uid) and not _daily_ok(app, uid):
+        await _say(msg, "📅 Today's limit of private translations is reached. It resets at 00:00 UTC.")
+        return
+    if len(el.plain) > app.s.max_text_chars:
+        el = Eligible(el.kind, html_escape_truncate(el.plain, app.s.max_text_chars),
+                      truncate(el.plain, app.s.max_text_chars), el.has_media)
+    lane = pipeline.media_lane if el.has_media else pipeline.text_lane
+
+    async def job() -> None:
+        t0 = time.perf_counter()
+        with contextlib.suppress(TelegramAPIError):
+            await app.bot.send_chat_action(uid, "typing")
+        try:
+            res = await asyncio.wait_for(pipeline.translate_private(msg, el, target),
+                                         timeout=max(3.0, lane.job_timeout - 2))
+        except Exception:
+            log.warning("private translation failed", exc_info=True)
+            res = PrivateResult(None, None, "failed")
+        lang = html.escape(lang_name(target))
+        if res.text:
+            pair = f"{lang_name(res.src)} → {lang_name(target)}" if res.src else lang_name(target)
+            body = f"{res.text}\n\n<i>{html.escape(pair)}</i>"
+        else:
+            body = _PRIVATE_REASONS.get(res.reason, _PRIVATE_REASONS["no_text"]).format(
+                lang=lang, secs=int(app.s.max_media_seconds))
+        await _reply_safe(msg, body)
+        pipeline.metrics.observe(f"private_ms.{el.kind.value}", (time.perf_counter() - t0) * 1000)
+
+    if not await lane.submit(uid, job, key=f"p:{uid}:{msg.message_id}"):
+        await _say(msg, "⏳ I'm busy right now — please try again in a moment.")
 
 
 async def _send_groups(app: App, msg: Message, user_id: int, edit: bool = False) -> None:
@@ -375,7 +540,8 @@ def _status_text(app: App) -> str:
     c = snap["counters"]
     assert isinstance(c, dict)
     keys = ("updates.message", "cache_hit", "cache_miss", "delivered.ephemeral", "delivered.dm_fallback",
-            "fallback", "validation_fail", "skip.already_target", "media.vision", "media.no_text")
+            "fallback", "validation_fail", "skip.already_target", "media.vision", "media.no_text",
+            "private.translated", "private.nothing")
     lines = ["<b>Status</b>", f"uptime {snap['uptime_s']}s · public output blocked: {app.guard.blocked}"]
     lines += [f"{k}: {c.get(k, 0)}" for k in keys]
     media = {k: v for k, v in c.items() if k.startswith(("media.too_long", "media.no_text.", "media.rejected",
@@ -392,6 +558,8 @@ def _status_text(app: App) -> str:
     for k in ("latency.gemini", "latency.deepl", "delivery_ms", "pipeline_text_ms"):
         if lat.get(k):
             lines.append(f"{k}: {lat[k]}")
+    for k in sorted(k for k in lat if k.startswith(("pipeline_media_ms.", "private_ms."))):
+        lines.append(f"{html.escape(k)}: {lat[k]}")
     if app.gemini:
         lines.append(f"gemini quota: {json.dumps(app.gemini.quota_snapshot())}")
     if app.deepl and app.deepl.char_limit:
@@ -415,7 +583,8 @@ def _callback_router(app: App) -> Router:
         uid = cb.from_user.id
         data = cb.data or ""
         msg = cb.message
-        if not await app.resolver.is_approved(uid):
+        if not await app.resolver.is_approved(uid) and (app.s.private_access != "everyone"
+                                                         or data.partition(":")[0] not in ("lang", "ilang", "me")):
             await cb.answer("This translator is private.", show_alert=True)
             return
         user = await app.storage.get_user(uid) or await app.storage.upsert_user(uid)
@@ -554,6 +723,8 @@ def _inline_router(app: App) -> Router:
             return
         # debounce: per-keystroke queries — only the newest one reaches a provider
         latest[uid] = q.id
+        if len(latest) > 10_000:
+            latest.pop(next(iter(latest)))
         await asyncio.sleep(0.35)
         if latest.get(uid) != q.id:
             return
@@ -600,5 +771,7 @@ def _inline_router(app: App) -> Router:
         with contextlib.suppress(TelegramAPIError):
             await q.answer(results, cache_time=300, is_personal=True)
         app.metrics.inc("inline.answered")
+        if latest.get(uid) == q.id:
+            del latest[uid]  # bounded: only users with a query in flight are tracked
 
     return r

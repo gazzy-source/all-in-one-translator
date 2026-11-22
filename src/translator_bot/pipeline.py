@@ -23,8 +23,8 @@ from translator_bot.delivery import Deliverer, Delivery
 from translator_bot.detect import LanguageDetector, Verdict
 from translator_bot.eligibility import Eligible, Kind, Skip, classify, sender_id, sender_name
 from translator_bot.languages import same_language
+from translator_bot.media.processor import AUDIO_KINDS, MediaProcessor, MediaText
 from translator_bot.media.processor import PERSISTED as PERSISTED_KINDS
-from translator_bot.media.processor import MediaProcessor, MediaText
 from translator_bot.metrics import Metrics
 from translator_bot.orchestrator import Orchestrator
 from translator_bot.providers.base import ContextLine, TranslationJob
@@ -38,6 +38,13 @@ log = logging.getLogger(__name__)
 MEDIA_KIND = {Kind.IMAGE: "image", Kind.CAPTION: "image", Kind.STICKER: "sticker",
               Kind.ANIMATED_STICKER: "animated_sticker", Kind.VIDEO_STICKER: "video_sticker", Kind.GIF: "gif",
               Kind.VIDEO: "video", Kind.VOICE: "voice"}
+
+
+@dataclass(slots=True)
+class PrivateResult:
+    text: str | None  # Telegram HTML, or None when there is nothing to send
+    src: str | None = None
+    reason: str = ""  # when text is None: "same" | "no_text" | "too_long" | "slow" | "failed"
 
 
 @dataclass(slots=True)
@@ -145,7 +152,7 @@ class Pipeline:
         if len(res.plain) > self.s.max_text_chars:
             res = Eligible(res.kind, html_escape_truncate(res.plain, self.s.max_text_chars), truncate(res.plain, self.s.max_text_chars), res.has_media)
         if not await self.storage.claim_message(msg.chat.id, msg.message_id, thread, sid,
-                                                content_hash(res.plain + str(res.kind.value))):
+                                                content_hash(res.plain + str(res.kind.value) + (_media_file(msg)[1] or ""))):
             self.metrics.inc("skip.duplicate")
             return
         self.metrics.inc(f"eligible.{res.kind.value}")
@@ -183,7 +190,7 @@ class Pipeline:
             res = Eligible(res.kind, html_escape_truncate(res.plain, self.s.max_text_chars),
                            truncate(res.plain, self.s.max_text_chars), res.has_media)
         sid = sender_id(msg)
-        new_hash = content_hash(res.plain + str(res.kind.value))
+        new_hash = content_hash(res.plain + str(res.kind.value) + (_media_file(msg)[1] or ""))
         row = await self.storage.get_message(msg.chat.id, msg.message_id)
         if row is not None and row["content_hash"] == new_hash:
             self.metrics.inc("edit.unchanged")  # e.g. link preview loaded / reactions: nothing to redo
@@ -273,7 +280,8 @@ class Pipeline:
         for m in ids:
             for row in await self.storage.deliveries_for(chat_id, m):
                 eph = row.get("ephemeral_id")
-                if eph and set(await self.storage.messages_for_ephemeral(chat_id, int(eph))) - ids:
+                if eph and set(await self.storage.messages_for_ephemeral(chat_id, int(eph),
+                                                                         int(row["recipient_id"]))) - ids:
                     return True
         return False
 
@@ -326,27 +334,86 @@ class Pipeline:
 
     async def _translate_for(self, meta: UnitMeta, text_html: str, plain: str, target: str, *, style: str = "chat",
                              glossary: tuple[tuple[str, str], ...] = ()) -> tuple[str, str | None] | None:
+        out, src, _why = await self._translate_outcome(meta, text_html, plain, target, style=style, glossary=glossary)
+        return (out, src) if out is not None else None
+
+    async def _translate_outcome(self, meta: UnitMeta, text_html: str, plain: str, target: str, *,
+                                 style: str = "chat", glossary: tuple[tuple[str, str], ...] = ()
+                                 ) -> tuple[str | None, str | None, str]:
+        """(translation HTML or None, source language, reason): reason is "" | "same" | "failed"."""
         det = await asyncio.to_thread(self.detector.detect, plain, target)
         if det.verdict is Verdict.TARGET:
             self.metrics.inc("skip.already_target")
-            return None
+            return None, det.lang, "same"
         job = self._job(meta, text_html, plain, target, det.verdict, det.lang, det.romanized, det.mixed, style,
                         glossary)
         res = await self.orch.translate(job, det, purpose="ocr" if style == "ocr" else "group",
                                         scope=str(meta.chat_id))
         if res is None:
-            return None
+            return None, det.lang, "failed"
         src = res.source_lang or det.lang
         # Providers report Chinese as plain "zh" for both scripts; the detector's Han-variant verdict is the
         # authority there (a Traditional message for a Simplified reader is a real conversion, not a no-op).
         if det.lang and det.lang.lower().startswith("zh") and src and src.lower().startswith("zh"):
             src = det.lang
         if src and same_language(src, target):
-            return None
+            return None, src, "same"
         # Output is Telegram HTML. Plain sources: escape, so the model can't add markup (link spoofing).
         # HTML sources: keep formatting, but only links that were already in the message.
         out = restrict_links(res.translation, job.text) if job.html else _html.escape(res.translation, quote=False)
-        return out, src
+        return out, src, ""
+
+    # -- private chat (1:1 translator) -------------------------------------------------------------
+    async def translate_private(self, msg: Message, el: Eligible, target: str) -> PrivateResult:
+        """Translate one message sent to the bot in a private chat into `target`. Nothing is stored; the
+        media cache (by Telegram file id) is shared with groups."""
+        uid = msg.chat.id
+        meta = UnitMeta(uid, None, None, uid, "", None, {"context": False})
+        parts: list[str] = []
+        src: str | None = None
+        reasons: list[str] = []
+        if el.plain:
+            out, s, why = await self._translate_outcome(meta, el.text_html, el.plain, target)
+            src = s
+            if out:
+                parts.append(out)
+            else:
+                reasons.append(why)
+        file_id, unique_id, size, duration = _media_file(msg)
+        mkind = MEDIA_KIND.get(el.kind)
+        if el.has_media and self.media is not None and file_id and unique_id and mkind:
+            if mkind in AUDIO_KINDS and duration is not None and duration > self.s.max_media_seconds:
+                reasons.append("too_long")
+            else:
+                mt = await self.media.extract(file_id=file_id, file_unique_id=unique_id, size=size,
+                                              kind=mkind, targets=[target],  # type: ignore[arg-type]
+                                              caption_hint=el.plain or None, duration=duration)
+                if mt is None and self.media.failure(unique_id) == "timeout":
+                    reasons.append("slow")  # never claim "no text" for a file we couldn't finish reading
+                elif mt is None or not mt.text or mt.text.strip() == el.plain.strip():
+                    reasons.append("no_text")
+                else:
+                    cached = mt.translations.get(target)
+                    tr: str | None
+                    if cached is not None:
+                        tr = _html.escape(cached, quote=False) if cached else None
+                        why = "" if cached else "same"
+                    else:
+                        tr, s, why = await self._translate_outcome(meta, mt.text, mt.text, target, style="ocr")
+                        src = src or s
+                    src = src or mt.source_lang
+                    if tr:
+                        icon = {Kind.VIDEO: "🎬 ", Kind.VOICE: "🎙 "}.get(el.kind, "🖼 ")
+                        parts.append((icon if el.plain else "") + tr)
+                    else:
+                        reasons.append(why)
+        self.metrics.inc("private.translated" if parts else "private.nothing")
+        if parts:
+            return PrivateResult("\n".join(parts), src)
+        for why in ("failed", "slow", "too_long", "same", "no_text"):
+            if why in reasons:
+                return PrivateResult(None, src, why)
+        return PrivateResult(None, src, "no_text")
 
     async def _recipients_by_lang(self, meta: UnitMeta) -> dict[str, list[Recipient]]:
         recipients = await self.resolver.resolve(meta.chat_id, meta.sender_id)
@@ -429,12 +496,16 @@ class Pipeline:
                 return None
             return await self._translate_for(meta, el.text_html, el.plain, lang, glossary=glossary)
 
-        captions = dict(zip(langs, await asyncio.gather(*(caption_for(lg) for lg in langs)), strict=True))
-        if reuse:
-            assert memo is not None
-            media_text = memo[2]
-        else:
-            media_text = await extract_task if extract_task is not None else None
+        try:
+            captions = dict(zip(langs, await asyncio.gather(*(caption_for(lg) for lg in langs)), strict=True))
+            if reuse:
+                assert memo is not None
+                media_text = memo[2]
+            else:
+                media_text = await extract_task if extract_task is not None else None
+        finally:
+            if extract_task is not None and not extract_task.done():
+                extract_task.cancel()  # caption failed / job cancelled: stop the download/ffmpeg/vision work
         if unique_id:
             self._media_memo[memo_key] = (time.monotonic(), unique_id, media_text)
             self._media_memo.move_to_end(memo_key)
@@ -456,11 +527,15 @@ class Pipeline:
                 if cached_tr is not None:
                     tr = _html.escape(cached_tr, quote=False)  # vision output is plain text, never markup
                 else:  # not produced by the media call (cache from other languages / local OCR)
-                    out = await self._translate_for(meta, media_text.text, media_text.text, lang, style="ocr")
-                    tr = out[0] if out else ""  # plain OCR job -> already escaped by _translate_for
-                    src = src or (out[1] if out else None)
-                    media_text.translations[lang] = _html.unescape(tr)
-                    if unique_id and mkind in PERSISTED_KINDS:
+                    out, s, why = await self._translate_outcome(meta, media_text.text, media_text.text, lang,
+                                                                style="ocr")
+                    tr = out or ""  # plain OCR job -> already escaped
+                    src = src or s
+                    # remember only real outcomes: a failure (quota, outage) must not become "nothing to translate"
+                    if why != "failed":
+                        media_text.translations[lang] = _html.unescape(tr)
+                    # caption-steered readings stay out of the shared (file id) cache, like in the processor
+                    if why != "failed" and unique_id and mkind in PERSISTED_KINDS and not el.plain:
                         await self.storage.put_media(unique_id, has_text=True, text=media_text.text,
                                                      source_lang=media_text.source_lang or src,
                                                      confidence=media_text.confidence,

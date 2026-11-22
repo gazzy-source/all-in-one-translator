@@ -359,10 +359,11 @@ class Storage:
         cur = await self.db.execute("SELECT 1")
         await cur.fetchone()
 
-    async def messages_for_ephemeral(self, chat_id: int, ephemeral_id: int) -> list[int]:
-        """Original message ids whose translation lives in this ephemeral (a burst covers several)."""
-        cur = await self.db.execute("SELECT DISTINCT message_id FROM deliveries WHERE chat_id=? AND ephemeral_id=?",
-                                    (chat_id, ephemeral_id))
+    async def messages_for_ephemeral(self, chat_id: int, ephemeral_id: int, recipient_id: int) -> list[int]:
+        """Original message ids whose translation lives in this recipient's ephemeral (a burst covers several).
+        Per recipient: ephemeral ids are only meaningful together with their receiver."""
+        cur = await self.db.execute("SELECT DISTINCT message_id FROM deliveries WHERE chat_id=? AND ephemeral_id=? "
+                                    "AND recipient_id=?", (chat_id, ephemeral_id, recipient_id))
         return [int(r["message_id"]) for r in await cur.fetchall()]
 
     async def deliveries_for(self, chat_id: int, message_id: int) -> list[dict[str, Any]]:

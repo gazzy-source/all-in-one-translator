@@ -16,10 +16,14 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import io
 import logging
+import multiprocessing
 import re
+import sys
 import time
+from collections import OrderedDict
 from collections.abc import Callable
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
@@ -27,7 +31,7 @@ from typing import Any, Literal
 
 from aiogram import Bot
 
-from translator_bot.languages import LANGUAGES
+from translator_bot.languages import LANGUAGES, same_language
 from translator_bot.media import frames as F
 from translator_bot.metrics import Metrics
 from translator_bot.providers.base import ProviderError, VisionProvider
@@ -54,14 +58,25 @@ class MediaText:
 
 
 class _WorkerTimeout(TimeoutError):
-    """A decode/render in the worker pool exceeded its time budget (the pool is recycled)."""
+    """A decode/render in the worker pool exceeded its time budget."""
+
+    def __init__(self, fn: str) -> None:
+        super().__init__(f"worker timeout: {fn}")
+        self.fn = fn
+
+
+# Native renderers that can hang inside the worker (rlottie): a timeout there recycles the pool. Everything else
+# is merely slow (ffmpeg has its own subprocess timeout; OCR/numpy always finish) - recycling for those made the
+# next job pay the OCR model load (~20 s on a throttled 1/8-core VM) and time out too.
+_MAY_HANG = frozenset({"render_tgs"})
 
 
 class MediaProcessor:
     def __init__(self, bot: Bot, storage: Storage, metrics: Metrics, *, vision: VisionProvider | None,
                  max_download_bytes: int, max_image_pixels: int, max_tgs_json_bytes: int, max_video_seconds: float,
                  max_frames: int, ffmpeg_path: str, timeout_s: float, workers: int, ocr_min_confidence: float,
-                 cache_ttl_s: int, max_media_seconds: float = 60.0, max_video_bytes: int = 20 * 1024 * 1024) -> None:
+                 cache_ttl_s: int, max_media_seconds: float = 60.0, max_video_bytes: int = 20 * 1024 * 1024,
+                 ocr_gate_frames: int = 6) -> None:
         self.bot, self.storage, self.metrics, self.vision = bot, storage, metrics, vision
         self.max_download_bytes, self.max_image_pixels = max_download_bytes, max_image_pixels
         self.max_tgs_json_bytes, self.max_video_seconds, self.max_frames = max_tgs_json_bytes, max_video_seconds, max_frames
@@ -70,9 +85,24 @@ class MediaProcessor:
         self._workers = workers
         self._pool = self._new_pool()
         self._inflight: dict[str, asyncio.Future[MediaText | None]] = {}
+        self.ocr_gate_frames = ocr_gate_frames
+        self._failures: OrderedDict[str, str] = OrderedDict()  # file_unique_id -> "timeout" | "rejected" (recent)
+
+    def _note_failure(self, file_unique_id: str, why: str) -> None:
+        self._failures[file_unique_id] = why
+        self._failures.move_to_end(file_unique_id)
+        while len(self._failures) > 1000:
+            self._failures.popitem(last=False)
+
+    def failure(self, file_unique_id: str) -> str | None:
+        """Why the last extraction of this file returned None without reading it ("timeout"/"rejected")."""
+        return self._failures.get(file_unique_id)
 
     def _new_pool(self) -> ProcessPoolExecutor:
-        return ProcessPoolExecutor(max_workers=self._workers, initializer=F.init_worker)
+        # forkserver (Linux) / spawn (Windows, macOS): fork() of the multi-threaded bot process (aiosqlite,
+        # detector threads) can deadlock a child, and it would copy the parent's ~0.2-1 GB heap per worker
+        ctx = multiprocessing.get_context("forkserver" if sys.platform.startswith("linux") else "spawn")
+        return ProcessPoolExecutor(max_workers=self._workers, initializer=F.init_worker, mp_context=ctx)
 
     async def warmup(self) -> None:
         """Spawn workers and load OCR models now, so the first sticker doesn't pay ~3 s of cold start."""
@@ -101,7 +131,7 @@ class MediaProcessor:
         try:
             return await asyncio.wait_for(loop.run_in_executor(self._pool, _call, fn, args, kwargs), self.timeout_s)
         except TimeoutError:
-            raise _WorkerTimeout from None
+            raise _WorkerTimeout(getattr(fn, "__name__", "?")) from None
 
     async def _download(self, file_id: str, declared_size: int | None, limit: int) -> bytes:
         if declared_size is not None and declared_size > limit:
@@ -135,7 +165,9 @@ class MediaProcessor:
             # languages missing from the cache are filled in by the text translator
             return MediaText(True, cached["text"] or "", cached["source_lang"], float(cached["confidence"] or 0),
                              dict(cached["translations"]), "cache")
-        key = f"{file_unique_id}:{','.join(sorted(targets))}"
+        # concurrent requests share one extraction only with the same caption hint (it steers the reading)
+        hint = hashlib.sha256((caption_hint or "").encode()).hexdigest()[:16]
+        key = f"{file_unique_id}:{','.join(sorted(targets))}:{hint}"
         while (fut := self._inflight.get(key)) is not None:
             try:
                 return await asyncio.shield(fut)
@@ -169,7 +201,10 @@ class MediaProcessor:
                                 targets: list[str], caption_hint: str | None) -> MediaText | None:
         self.metrics.inc(f"media.process.{kind}")
         t_start = t = time.perf_counter()
-        persist = kind in PERSISTED
+        # A caption steers the vision prompt, and the cache is keyed by file id alone and shared by every chat:
+        # a reading influenced by one sender's caption (e.g. prompt injection from a stranger's private chat)
+        # must never be served to other chats. Only caption-free readings are persisted.
+        persist = kind in PERSISTED and not caption_hint
         audio: bytes | None = None
         audio_mime: str | None = None
         fs: F.FrameSet | None = None
@@ -210,7 +245,8 @@ class MediaProcessor:
             t = self._stage("decode", t)
             if fs is not None:
                 distinct: list[int] = await self._run(F.select_distinct, fs.frames)
-                gate = distinct if len(distinct) <= 6 else [distinct[int(i * len(distinct) / 6)] for i in range(6)]
+                n = self.ocr_gate_frames  # each one is ~0.3 s on a desktop CPU, 2-5 s on a throttled 1/8-core VM
+                gate = distinct if len(distinct) <= n else [distinct[int(i * len(distinct) / n)] for i in range(n)]
                 found: list[F.TextBoxes] = await self._run(F.detect_text, fs.frames, gate)
                 t = self._stage("ocr_gate", t)
                 text_idx = [b.index for b in found if b.boxes > 0 and b.text_area >= 0.004]
@@ -218,12 +254,13 @@ class MediaProcessor:
                     text_idx = [text_idx[round(k * (len(text_idx) - 1) / 3)] for k in range(4)]
                 images = [fs.frames[i] for i in text_idx]
         except (F.MediaRejected, TimeoutError) as exc:
-            if isinstance(exc, _WorkerTimeout):
-                # a hung native render (rlottie/ffmpeg) must not occupy a worker forever. Only worker timeouts:
-                # a slow *download* recycling the pool used to kill other jobs' healthy renders.
+            if isinstance(exc, _WorkerTimeout) and exc.fn in _MAY_HANG:
+                # a hung native render must not occupy a worker forever. Only worker timeouts: a slow *download*
+                # recycling the pool used to kill other jobs' healthy renders.
                 self._recycle_pool()
+            self._note_failure(file_unique_id, "timeout" if isinstance(exc, TimeoutError) else "rejected")
             self.metrics.inc(f"media.rejected.{type(exc).__name__}")
-            log.info("media rejected", extra={"kind": kind, "reason": str(exc)[:60]})
+            log.info("media rejected", extra={"kind": kind, "reason": str(exc)[:60] or type(exc).__name__})
             return None
         except Exception:
             self.metrics.inc("media.error")
@@ -259,11 +296,15 @@ class MediaProcessor:
                 # the prompt marks on-screen text in videos with "[screen]"; show readers an icon, not a tag
                 vr.text = _SCREEN_TAG.sub("📺 ", vr.text)
                 vr.translations = {k: _SCREEN_TAG.sub("📺 ", v) for k, v in vr.translations.items()}
-                # "" = already in that language, so the text path doesn't redo it. A translation in the wrong
-                # script (e.g. Hebrew letters for a Hindi reader) is dropped: the text translator redoes it.
+                # "" = already in that language, so the text path doesn't redo it - only when the model says the
+                # source IS that language. A target the model left out is left out here too (the text translator
+                # decides), so a partial answer is never cached as "nothing to translate" for CACHE_TTL_DAYS.
+                # A translation in the wrong script (e.g. Hebrew letters for a Hindi reader) is dropped likewise.
                 translations: dict[str, str] = {}
                 for tg in targets:
                     tr = vr.translations.get(tg, "")
+                    if not tr and not (vr.source_lang and same_language(vr.source_lang, tg)):
+                        continue
                     lang = LANGUAGES.get(tg)
                     if tr and lang is not None and (wrong_script(tr, lang.script)
                                                     or romanized_output(vr.text, tr, lang.script, tg)):

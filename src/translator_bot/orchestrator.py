@@ -21,7 +21,6 @@ from translator_bot.detect import Detection, Verdict
 from translator_bot.languages import LANGUAGES
 from translator_bot.metrics import Metrics
 from translator_bot.providers.base import (
-    FALLBACK_OK,
     RETRYABLE,
     ErrorKind,
     ProviderError,
@@ -294,9 +293,7 @@ class Orchestrator:
                 if err.kind in RETRYABLE and attempt == 0 and deadline - time.monotonic() > 2.0:
                     await asyncio.sleep(backoff_delay(attempt))
                     continue
-                if err.kind not in FALLBACK_OK:
-                    return None
-                return None
+                return None  # the caller tries the next route (other provider family)
             breaker.record_success()
             self.metrics.observe(f"latency.{res.provider}", (time.perf_counter() - t0) * 1000)
             self.metrics.inc(f"translations.{res.provider}.{res.model}")

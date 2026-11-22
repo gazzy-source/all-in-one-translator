@@ -11,7 +11,7 @@ Telegram ──► aiogram Dispatcher ──► handlers (return immediately)
                                       │
              ┌────────────────────────┴───────────────────────────┐
              ▼                                                    ▼
-   group: Pipeline.on_message                          private: onboarding / settings
+   group: Pipeline.on_message                          private: 1:1 translator (Pipeline.translate_private) + onboarding / settings
      1 chat config (cached 30s) · enabled? bot admin?   inline:  debounce → detect → translate
      2 eligibility (pure): bots, own inline results,
        commands, emoji/URL/code-only, toggles

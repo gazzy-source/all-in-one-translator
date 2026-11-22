@@ -71,6 +71,12 @@ Maria: ¿Alguien sabe si mañana             Maria: ¿Alguien sabe si mañana   
 - Smart pipeline: textless media costs **zero AI calls**; animated text like "WAIT → WHAT → IS THIS" is read once,
   in order; repeated stickers are served from cache.
 
+### 1:1 translator in a private chat
+- Send or forward **any text, sticker, GIF, photo, video or voice note** to the bot → it replies with the translation
+  in your language (`English → Hindi` footer). Open to everyone by default (`PRIVATE_ACCESS`), with per-user rate
+  limits and a daily cap for users who aren't approved (`PRIVATE_PER_MIN`, `PRIVATE_DAILY_LIMIT`).
+- Typing a language name ("Hindi", "español") offers to switch your language instead of translating it.
+
 ### Inline translator everywhere
 - Type `@your_bot text` in any chat → tap the translated preview to send it. Debounced per keystroke, cached.
 
@@ -168,18 +174,19 @@ published image on GHCR, health checks with self-healing restarts, online backup
 
 | Who | Command | Purpose |
 |---|---|---|
-| Everyone approved | `/start` | Welcome, status, language picker |
-| | `/language` | Change translation language |
-| | `/settings` | Pause, private-chat backup, inline target language |
-| | `/groups` | Groups where you receive translations (mute per group) |
-| | `/pause` · `/resume` | Stop/restart all your translations |
+| Everyone (`PRIVATE_ACCESS=everyone`) | *any message* | Translated into your language, as a reply |
+| | `/start` · `/help` | Welcome and short help (role-aware), language picker |
+| | `/language` · `/settings` | Change translation language · preferences |
 | | `/privacy` · `/forgetme` | What's processed and stored · delete your data |
+| Approved recipients | `/groups` | Groups where you receive translations (mute per group) |
+| | `/pause` · `/resume` | Stop/restart your group translations |
 | Owners (private) | `/approve <id>` · `/revoke <id>` · `/recipients` | Manage recipients |
 | | `/chats` | Per-group toggles: text, captions, images, stickers, animated, GIFs, videos, voice, context, sender name |
 | | `/status` | Health, delivery counters, provider quota, latency |
 | Owners (hidden, in group) | `/approve` · `/revoke` (as replies) · `/check` · `/glossary term = rendering` | Invisible to members |
 
-Unknown users get a polite access-denied message showing their ID to send to the owner.
+Group translations always need approval; users who aren't approved see their ID to send to the owner (with
+`PRIVATE_ACCESS=approved` the whole private chat is limited to approved users).
 
 ## 🔒 Privacy & security
 

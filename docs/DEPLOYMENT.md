@@ -1,8 +1,21 @@
 # Deploying to production
 
 The bot is a single long-running process: Telegram updates in, private (ephemeral) translations out, SQLite on
-disk. It needs no public URL in the default **polling** mode, so any always-on Linux machine works: a small VPS
-(1 vCPU / 1 GB RAM is enough), a home server, or a Raspberry Pi 4+.
+disk. It needs no public URL in the default **polling** mode, so any always-on Linux machine works: a small VPS,
+a home server, or a Raspberry Pi 4+.
+
+**Memory:** about 1.2 GB with the default settings (most of it is the language gate's word-frequency tables), so
+plan for a 2 GB machine. On a **1 GB** machine set the low-memory mode in `.env`:
+
+```bash
+DETECTOR_WORDLIST=small   # ~0.1 GB of word lists instead of ~1 GB; same benchmark scores (PLAN.md L16)
+MEDIA_WORKERS=1           # one OCR/render worker process (~150 MB each)
+OCR_GATE_FRAMES=3         # slow/burstable CPUs: check fewer GIF frames locally
+MEDIA_TIMEOUT_S=40        # ... and allow each media step a bit longer
+```
+
+The bot then idles at about 250 MB. A 1/8-core burstable VM (e.g. Oracle's free E2.1.Micro) translates text in
+~1 s but is slow on stickers/GIFs while its CPU is throttled.
 
 ## 1. One-time Telegram setup
 
@@ -30,7 +43,7 @@ TRANSLATOR_IMAGE=ghcr.io/gazzy-source/all-in-one-translator:latest docker compos
 
 What the compose file sets up: automatic restart, a health check (`/healthz` reports a dead queue worker or an
 unresponsive database), `init` to reap ffmpeg child processes, read-only root filesystem, all capabilities
-dropped, 1 GB memory cap, JSON logs rotated at 5 × 10 MB. Self-healing: if a health problem persists for two
+dropped, 2 GB memory cap, JSON logs rotated at 5 × 10 MB. Self-healing: if a health problem persists for two
 checks (~2 min), the bot shuts down cleanly with a non-zero exit and Docker (or systemd) restarts it — Docker's
 "unhealthy" status alone never restarts a container.
 
@@ -74,7 +87,7 @@ Environment=LOG_JSON=true
 NoNewPrivileges=true
 ProtectSystem=strict
 ReadWritePaths=/opt/translator/app/data
-MemoryMax=1G
+MemoryMax=2G
 
 [Install]
 WantedBy=multi-user.target
@@ -93,6 +106,11 @@ journalctl -u translator -f
 3. Approve readers: reply `/approve` to one of their messages (only you see the command and the answer), or
    `/approve <user id>` in a private chat with the bot.
 4. Each reader opens the bot, sends `/start` and picks a language.
+
+**Private chat:** anyone can also send the bot text, stickers, GIFs, photos, videos or voice notes privately and get
+a translation back (`PRIVATE_ACCESS=everyone`, the default). Users who aren't approved are capped per day
+(`PRIVATE_DAILY_LIMIT`, `PRIVATE_GLOBAL_DAILY_LIMIT`), so strangers can't use up the Gemini quota your groups need.
+Set `PRIVATE_ACCESS=approved` to keep the bot entirely private.
 
 ## 5. Backups
 

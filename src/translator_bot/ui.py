@@ -53,57 +53,78 @@ def suggestions_kb(langs: list[Language], current: str | None, prefix: str = "la
 
 
 LANGUAGE_PROMPT = (
-    "🌐 <b>Choose the language you want translations in.</b>\n"
-    "Tap a language below, browse all languages, or just <b>type a language name</b> "
-    "(e.g. <i>Hindi</i>, <i>español</i>, <i>ja</i>)."
+    "🌐 <b>Which language should I translate into?</b>\n"
+    "Tap one below, or type its name (e.g. <i>Hindi</i>, <i>español</i>, <i>ja</i>)."
 )
 
 
-def welcome(user: User, *, default_lang: str, is_owner: bool, bot_username: str = "this_bot") -> str:
-    lang = user.lang or default_lang
-    status = "⏸ paused" if user.paused else "▶️ active"
-    default_note = (f"\n<i>{lang_name(default_lang)} is selected by default — choose your language below.</i>"
-                    if not user.lang else "")
-    owner = "\n👑 You are an owner. /recipients · /chats · /status" if is_owner else ""
-    return (
-        "👋 <b>Welcome to your private group interpreter.</b>\n\n"
-        "When I'm in a group with you, I translate messages you don't understand and show the translation "
-        "<b>only to you</b>, right inside the group (Telegram ephemeral messages). Nobody else sees them, and "
-        "I never post anything publicly.\n\n"
-        f"Your language: <b>{html.escape(lang_name(lang))}</b> · Translations: {status}{default_note}\n\n"
-        f"Inline translator: type <code>@{html.escape(bot_username)} text</code> in any chat to translate it.\n"
-        f"/language · /settings · /groups · /pause · /resume · /help{owner}"
-    )
+MEDIA_TYPES = "text, stickers, GIFs, photos, videos and voice notes"
+
+
+def _group_line(uid: int, approved: bool) -> str:
+    if approved:
+        return "💬 <b>In groups</b> where I'm an admin, messages in other languages are translated <b>only for you</b>."
+    return ("💬 <b>Group translations</b> need the bot owner's approval — send them your ID: "
+            f"<code>{uid}</code>")
+
+
+def welcome(user: User, *, default_lang: str, is_owner: bool, bot_username: str = "this_bot",
+            approved: bool = True, private_ok: bool = True, inline_ok: bool = True) -> str:
+    lang = html.escape(lang_name(user.lang or default_lang))
+    lines = ["👋 <b>Hi! I'm your translator.</b>", ""]
+    if private_ok:
+        lines.append(f"📩 Send me any {MEDIA_TYPES} — I'll reply in <b>{lang}</b>.")
+    lines.append(_group_line(user.user_id, approved))
+    if inline_ok:
+        lines.append(f"✍️ In any chat, type <code>@{html.escape(bot_username)} text</code> to send a translation.")
+    lines.append("")
+    status = " · ⏸ group translations paused" if user.paused and approved else ""
+    lines.append(f"Your language: <b>{lang}</b>{status}")
+    if not user.lang:
+        lines.append(f"<i>{html.escape(lang_name(default_lang))} is selected by default — choose yours below.</i>")
+    lines.append("/language · /settings · /help")
+    if is_owner:
+        lines.append("👑 Owner: /recipients · /chats · /status")
+    return "\n".join(lines)
 
 
 ACCESS_DENIED = (
-    "🙏 Sorry — this translator is private and only works for people approved by its owner.\n\n"
-    "If you know the owner, send them your Telegram ID: <code>{uid}</code>"
+    "🔒 This translator only works for people approved by its owner.\n"
+    "Send the owner your Telegram ID: <code>{uid}</code>"
 )
 
-HELP = (
-    "<b>How it works</b>\n"
-    "• I read messages in groups where I'm an admin and translate them privately for approved people.\n"
-    "• Translations appear only to you, as replies to the original message. Others see nothing.\n"
-    "• Your own messages are never translated back to you, and messages already in your language are skipped.\n"
-    "• Text, captions, and text inside images, stickers, animated stickers and GIFs are supported.\n\n"
-    "<b>Commands</b>\n"
-    "/language — choose your translation language\n"
-    "/settings — personal preferences\n"
-    "/groups — groups where you receive translations (mute per group)\n"
-    "/pause · /resume — stop or restart all your translations\n"
-    "/privacy — what is processed and stored · /forgetme — delete your data\n\n"
-    "<b>Inline</b>: type <code>@{bot} your text</code> in any chat and tap the translation to send it."
-)
+
+def help_text(*, uid: int, lang: str, bot_username: str, approved: bool, private_ok: bool, inline_ok: bool,
+              max_seconds: int = 60) -> str:
+    lines = ["<b>🌐 What I do</b>"]
+    if private_ok:
+        lines.append(f"📩 <b>Here:</b> send or forward {MEDIA_TYPES} — I translate them into "
+                     f"<b>{html.escape(lang_name(lang))}</b>. Speech up to {max_seconds} s, song lyrics included.")
+    if approved:
+        lines.append("💬 <b>Groups:</b> add me as an admin (no rights needed). Messages in other languages get a "
+                     "translation that <b>only you</b> can see. I never post in the group.")
+    else:
+        lines.append(_group_line(uid, approved))
+    if inline_ok:
+        lines.append(f"✍️ <b>Any chat:</b> type <code>@{html.escape(bot_username)} text</code> and tap the "
+                     "result to send the translation.")
+    lines += ["", "<b>Commands</b>", "/language — change your language"]
+    if approved:
+        lines += ["/settings — inline language, delivery backup", "/groups — mute me in a group",
+                  "/pause · /resume — stop or restart group translations"]
+    else:
+        lines.append("/settings — preferences")
+    lines.append("/privacy — what's stored · /forgetme — delete your data")
+    return "\n".join(lines)
 
 PRIVACY = (
     "<b>Privacy</b>\n"
-    "• To translate, the bot receives group messages (as an admin). Message text is processed in memory, "
-    "never written to disk, and never logged.\n"
+    "• To translate, the bot receives group messages (as an admin) and what you send it here. Message text "
+    "is processed in memory, never written to disk, and never logged.\n"
     "• Text that needs translating is sent to the configured translation provider(s): DeepL and/or Google "
     "Gemini. On free tiers, providers may use submitted data to improve their services — see their terms.\n"
-    "• Media (stickers, GIFs, images) is downloaded temporarily, processed, and deleted immediately. Text "
-    "recognized in stickers/GIFs is cached by Telegram file id for reuse.\n"
+    "• Media (stickers, GIFs, photos, voice notes, videos) is downloaded temporarily, processed and "
+    "deleted immediately. Text recognized in stickers/GIFs is cached by Telegram file id for reuse.\n"
     "• Stored: your user ID, chosen languages, pause/mute settings, approval status, and message/delivery "
     "IDs (no content) for up to 48 h to handle edits and avoid duplicates.\n"
     "• Translations are shown only to you via Telegram ephemeral messages. Telegram may not deliver them when "

@@ -16,7 +16,7 @@ from aiogram.types import ChatMemberAdministrator, ChatMemberOwner
 
 from translator_bot.config import Settings
 from translator_bot.context import ContextStore
-from translator_bot.delivery import Deliverer, TelegramTransport
+from translator_bot.delivery import Deliverer, TelegramTransport, drain_deliveries
 from translator_bot.detect import LanguageDetector
 from translator_bot.guard import PublicOutputGuard
 from translator_bot.media.processor import MediaProcessor
@@ -93,6 +93,8 @@ class App:
         self.media: MediaProcessor | None = None
         self.pipeline: Pipeline | None = None
         self.inline_limiter = KeyedLimiter(settings.inline_per_min, 60.0)
+        self.private_limiter = KeyedLimiter(settings.private_per_min, 60.0)
+        self.private_daily: dict[int, tuple[str, int]] = {}  # user id -> (UTC day, count); unapproved users only
         self.bot_username = ""
         self.bot_id = settings.bot_id
         self._tasks: list[asyncio.Task[None]] = []
@@ -124,7 +126,7 @@ class App:
         if self.gemini is not None:
             await self._check_gemini_models()
         if self.detector is None:
-            self.detector = await asyncio.to_thread(LanguageDetector)
+            self.detector = await asyncio.to_thread(LanguageDetector, wordlist=self.s.detector_wordlist)
         self.orchestrator = Orchestrator(self.providers, self.metrics, provider_timeout=self.s.provider_timeout_s)
         vision: VisionProvider | None = self._injected_vision or (
             self.gemini if (self.gemini and self.s.vision_ocr) else None)
@@ -135,7 +137,8 @@ class App:
                 max_video_seconds=self.s.max_video_seconds, max_frames=self.s.max_frames,
                 ffmpeg_path=self.s.ffmpeg_path, timeout_s=self.s.media_timeout_s, workers=self.s.media_workers,
                 ocr_min_confidence=self.s.ocr_min_confidence, cache_ttl_s=self.s.cache_ttl_days * 86400,
-                max_media_seconds=self.s.max_media_seconds, max_video_bytes=self.s.max_video_bytes)
+                max_media_seconds=self.s.max_media_seconds, max_video_bytes=self.s.max_video_bytes,
+                ocr_gate_frames=self.s.ocr_gate_frames)
             await self.media.warmup()
         self.pipeline = Pipeline(self.s, self.storage, self.detector, self.orchestrator, self.resolver,
                                  self.deliverer, self.context, self.metrics, self.media, bot_id=self.bot_id,
@@ -191,6 +194,7 @@ class App:
         await asyncio.gather(*self._tasks, return_exceptions=True)
         if self.pipeline:
             await self.pipeline.stop()
+        await drain_deliveries(10.0)  # shielded sends still in flight must record before the DB closes
         await self._flush_digest()
         if self.media:
             await self.media.close()

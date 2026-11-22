@@ -1,5 +1,40 @@
 # Changelog
 
+## 1.1.0 — 2026-11-22
+
+### Added
+* **1:1 translator in private chats:** any text, sticker, GIF, photo, video or voice note sent to the bot is
+  translated into the user's language (reply with a `Source → Target` footer, clear messages for "already in your
+  language", "no text found", "too long", "unavailable"). `PRIVATE_ACCESS` (everyone | approved, default
+  everyone), `PRIVATE_PER_MIN` (12), `PRIVATE_DAILY_LIMIT` (200/day per user) and `PRIVATE_GLOBAL_DAILY_LIMIT`
+  (500/day in total) for users who aren't approved. `/status` shows private and media latency.
+* **Low-memory mode for 1 GB servers:** `DETECTOR_WORDLIST=small` (language-gate word lists ~0.1 GB instead of
+  ~1 GB; same benchmark scores, PLAN.md L16).
+
+### Changed
+* `/start` and `/help` rewritten: short, role-aware (approved / not approved, inline access), no internals.
+* Compose/systemd memory cap 1 GB → 2 GB (default settings peak above 1 GB). OCR/render workers start via
+  `forkserver` on Linux instead of `fork()` of the multi-threaded bot process.
+
+### Fixed
+* GIFs on slow CPUs (live, 1/8-core VM): a slow OCR step recycled the worker pool, so the next job reloaded the OCR
+  model (~20 s) and timed out too, and private users were told "no text". Only renderers that can hang recycle
+  the pool now; a timeout is reported as "took too long"; `OCR_GATE_FRAMES` (default 6) sets how many frames
+  are checked locally.
+* **Security:** media readings steered by a caption (vision prompt hint) are no longer written to the shared
+  file-id media cache, so one sender's caption (e.g. prompt injection from a private chat) can't change what
+  other chats see for that sticker/GIF; concurrent extractions are only shared with the same caption.
+* One jittered retry for transient Telegram/network errors when sending a translation (was: lost, or DM fallback).
+* A provider failure (or a target the vision model left out) was cached as "already in that language" for
+  `CACHE_TTL_DAYS`: that sticker/GIF stayed silent for those readers for up to 30 days.
+* Deliveries are shielded from job timeouts: a translation sent to Telegram is always recorded (an unrecorded one
+  was duplicated by a later edit).
+* Replacing the photo/GIF of a message (same caption) is now treated as an edit.
+* Burst-split detection for edits is per recipient; delivery error mapping checks "not modified" / "not a member"
+  before the broad "ephemeral" match; a send without an ephemeral id is logged; burst flush tasks are kept alive;
+  the inline debounce map is bounded; the media extraction is cancelled when its job fails.
+* "media rejected" logs the error type when the message is empty (timeouts).
+
 ## 1.0.0 — 2026-11-22 (production release)
 
 ### Production
