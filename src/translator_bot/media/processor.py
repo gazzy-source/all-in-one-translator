@@ -36,7 +36,7 @@ from translator_bot.media import frames as F
 from translator_bot.metrics import Metrics
 from translator_bot.providers.base import ProviderError, VisionProvider
 from translator_bot.storage import Storage
-from translator_bot.textutil import has_control_chars, looks_garbled, romanized_output, wrong_script
+from translator_bot.textutil import has_control_chars, looks_garbled, romanized_output, script_counts, wrong_script
 
 log = logging.getLogger(__name__)
 _SCREEN_TAG = re.compile(r"(?m)^\s*\[\s*screen\s*\]\s*", re.IGNORECASE)
@@ -55,6 +55,14 @@ class MediaText:
     translations: dict[str, str]  # target lang -> translation ("" = already in that language)
     via: str  # "cache" | "vision" | "local_ocr"
     speech: bool = False
+
+
+
+def _mixed_scripts(text: str) -> bool:
+    """Two writing systems, each a real part of the text (>= 15% of letters and >= 3 letters)."""
+    counts = script_counts(text)
+    total = sum(counts.values())
+    return sum(1 for n in counts.values() if n >= 3 and n / max(1, total) >= 0.15) >= 2
 
 
 class _WorkerTimeout(TimeoutError):
@@ -296,6 +304,13 @@ class MediaProcessor:
                 # the prompt marks on-screen text in videos with "[screen]"; show readers an icon, not a tag
                 vr.text = _SCREEN_TAG.sub("📺 ", vr.text)
                 vr.translations = {k: _SCREEN_TAG.sub("📺 ", v) for k, v in vr.translations.items()}
+                mixed = _mixed_scripts(vr.text)
+                if mixed:
+                    # e.g. an English line + a Burmese line (live 2026-11-22): the vision answer dropped the
+                    # Burmese line for English readers and half-translated it for Burmese ones. The text path
+                    # translates code-switched text reliably, so leave every target to it.
+                    self.metrics.inc("media.mixed_scripts")
+                    vr.translations = {}
                 # "" = already in that language, so the text path doesn't redo it - only when the model says the
                 # source IS that language. A target the model left out is left out here too (the text translator
                 # decides), so a partial answer is never cached as "nothing to translate" for CACHE_TTL_DAYS.
@@ -303,7 +318,7 @@ class MediaProcessor:
                 translations: dict[str, str] = {}
                 for tg in targets:
                     tr = vr.translations.get(tg, "")
-                    if not tr and not (vr.source_lang and same_language(vr.source_lang, tg)):
+                    if not tr and (mixed or not (vr.source_lang and same_language(vr.source_lang, tg))):
                         continue
                     lang = LANGUAGES.get(tg)
                     if tr and lang is not None and (wrong_script(tr, lang.script)

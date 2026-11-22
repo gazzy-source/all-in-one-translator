@@ -94,12 +94,12 @@ async def test_acceptance_three_members(h: Harness) -> None:
     assert len(en) == 1 and len(hi) == 1
     assert "Does anyone know if it will be open tomorrow? 😂" in en[0].params["text"]
     assert "Maria" not in en[0].params["text"]  # no sender name by default: the reply quote shows who
-    assert "Spanish → English" in en[0].params["text"]
+    assert "→" not in en[0].params["text"] and "Spanish" not in en[0].params["text"]  # translation only
     assert "क्या किसी को पता है" in hi[0].params["text"]
     assert en[0].params["reply_parameters"]["message_id"] > 0  # reply context to the original
     assert en[0].params["disable_notification"] is True
     # OWNER never chose a language: default notice shown exactly once
-    assert "English is selected by default" in en[0].params["text"]
+    assert "Only you see this" in en[0].params["text"]
 
     await h.send(group_message("Are you coming tonight?", sender=OWNER, name="Owner"))
     await h.idle()
@@ -111,7 +111,7 @@ async def test_acceptance_three_members(h: Harness) -> None:
     await h.idle()
     en = h.tg.ephemeral_to(OWNER)
     assert len(en) == 2 and "dude, what's the plan?" in en[1].params["text"]
-    assert "English is selected by default" not in en[1].params["text"]  # notice only once
+    assert "Only you see this" not in en[1].params["text"]  # notice only once
     assert len(h.tg.ephemeral_to(HINDI)) == 2  # romanized Hindi is already Hindi for the Hindi reader
 
     await h.send(group_message("😂😂😂", sender=OUTSIDER))
@@ -196,7 +196,7 @@ async def test_edit_updates_existing_ephemeral(h: Harness) -> None:
     await h.send(edited, edited=True)
     await h.idle()
     edits = h.tg.ephemeral_edits_to(OWNER)
-    assert len(edits) == 1 and "locura total" in edits[0].params["text"] and "edited" in edits[0].params["text"]
+    assert len(edits) == 1 and "locura total" in edits[0].params["text"] and "✏️" in edits[0].params["text"]
     assert len(h.tg.ephemeral_to(OWNER)) == 1  # edited in place, not a second message
     # an edit that doesn't change text (e.g. link preview) does nothing
     await h.send(edited, edited=True)
@@ -296,7 +296,7 @@ async def test_private_chat_translates_text_for_anyone(h: Harness) -> None:
     await h.idle()
     [out] = h.tg.dms_to(OUTSIDER)
     assert "Does anyone know if it will be open tomorrow? 😂" in out.params["text"]
-    assert "Spanish → English" in out.params["text"]
+    assert "→" not in out.params["text"]  # only the translation
     assert out.params["reply_parameters"]["message_id"] == 9
     assert h.tg.public_group_output() == []
 
@@ -437,3 +437,50 @@ async def test_context_is_what_was_said_before_the_message(tmp_path: Path, detec
         assert [c.text for c in job.context] == ["Are you coming tonight?"]
     finally:
         await app.stop()
+
+
+async def _bg_idle(h: Harness) -> None:
+    p = h.app.pipeline
+    assert p is not None
+    for _ in range(200):
+        pending = [t for t in p._bg if not t.done()]
+        if not pending:
+            return
+        await asyncio.gather(*pending, return_exceptions=True)
+        await asyncio.sleep(0)
+
+
+async def test_approved_member_gets_their_own_language_automatically(h: Harness) -> None:
+    """Approve and done: a member who never opened the bot is translated into the language they write in."""
+    await h.app.storage.set_approved(SPANISH_SPEAKER, True, by=OWNER)
+    for t in ("¿Dónde están todos ahora mismo?", "Yo llego en diez minutos, esperen"):
+        await h.send(group_message(t, sender=SPANISH_SPEAKER))
+        await h.idle()
+        await _bg_idle(h)
+    u = await h.app.storage.get_user(SPANISH_SPEAKER)
+    assert u is not None and u.lang is None and u.lang_guess == "es"
+    await h.send(group_message("Are you guys coming to the party tonight?", sender=OWNER))
+    await h.idle()
+    got = h.tg.ephemeral_to(SPANISH_SPEAKER)
+    assert len(got) == 1 and "[es] Are you guys coming" in got[0].params["text"]
+
+
+async def test_telegram_app_language_is_used_until_they_write(h: Harness) -> None:
+    await h.app.storage.set_approved(OUTSIDER, True, by=OWNER)
+    m = group_message("👍", sender=OUTSIDER)
+    m["from"]["language_code"] = "de"
+    await h.send(m)
+    await h.idle()
+    await _bg_idle(h)
+    await h.send(group_message("¿Alguien sabe si mañana estará abierto?", sender=SPANISH_SPEAKER))
+    await h.idle()
+    got = h.tg.ephemeral_to(OUTSIDER)
+    assert len(got) == 1 and got[0].params["text"].startswith("[de]")
+
+
+async def test_explicit_language_choice_beats_automatic(h: Harness) -> None:
+    await h.app.storage.set_approved(SPANISH_SPEAKER, True, by=OWNER)
+    await h.app.storage.upsert_user(SPANISH_SPEAKER, lang="fr", lang_guess="es", tg_lang="es")
+    await h.send(group_message("Are you guys coming to the party tonight?", sender=OWNER))
+    await h.idle()
+    assert h.tg.ephemeral_to(SPANISH_SPEAKER)[0].params["text"].startswith("[fr]")

@@ -10,7 +10,7 @@ import hashlib
 import html as _html
 import logging
 import time
-from collections import OrderedDict, defaultdict
+from collections import Counter, OrderedDict, defaultdict, deque
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
@@ -22,7 +22,7 @@ from translator_bot.context import ContextStore
 from translator_bot.delivery import Deliverer, Delivery
 from translator_bot.detect import LanguageDetector, Verdict
 from translator_bot.eligibility import Eligible, Kind, Skip, classify, sender_id, sender_name
-from translator_bot.languages import same_language
+from translator_bot.languages import LANGUAGES, same_language
 from translator_bot.media.processor import AUDIO_KINDS, MediaProcessor, MediaText
 from translator_bot.media.processor import PERSISTED as PERSISTED_KINDS
 from translator_bot.metrics import Metrics
@@ -93,6 +93,7 @@ class Pipeline:
         self._media_memo: OrderedDict[tuple[int, int], tuple[float, str, MediaText | None]] = OrderedDict()
         self._bg: set[asyncio.Task[None]] = set()
         self._chat_cache: dict[int, tuple[float, Chat]] = {}
+        self._lang_votes: OrderedDict[int, deque[str]] = OrderedDict()  # approved sender -> recent languages
 
     def start(self) -> None:
         self.text_lane.start()
@@ -147,6 +148,10 @@ class Pipeline:
         if not await self.storage.topic_enabled(msg.chat.id, thread):
             self.metrics.inc("skip.topic_disabled")
             return
+        if sid is not None and sid > 0 and msg.from_user is not None and not msg.from_user.is_bot:
+            raw = msg.text or msg.caption or ""
+            self._spawn(self._learn_language(sid, msg.from_user.language_code,
+                                             "" if raw.startswith("/") else raw[:500]))
         res = classify(msg, bot_id=self.bot_id, settings=chat.settings, media_enabled=self.s.media_enabled)
         if isinstance(res, Skip):
             self.metrics.inc(f"skip.{res.value}")
@@ -268,6 +273,41 @@ class Pipeline:
         task = asyncio.create_task(later())
         self._bg.add(task)
         task.add_done_callback(self._bg.discard)
+
+    def _spawn(self, coro: Awaitable[None]) -> None:
+        task = asyncio.ensure_future(coro)
+        self._bg.add(task)
+        task.add_done_callback(self._bg.discard)
+
+    async def _learn_language(self, uid: int, telegram_lang: str | None, plain: str) -> None:
+        """Automatic reader language for approved members who never chose one: the language they write in the
+        group (majority of their last 5 messages), else their Telegram app language. Codes only, never text."""
+        try:
+            if not await self.resolver.is_approved(uid):
+                return
+            user = await self.storage.get_user(uid)
+            if user is not None and user.lang:
+                return  # an explicit choice always wins
+            fields: dict[str, str] = {}
+            tg = _supported_lang(telegram_lang)
+            if tg and (user is None or user.tg_lang != tg):
+                fields["tg_lang"] = tg
+            if len(plain.split()) >= 2 or (plain and not plain.isascii()):
+                det = await asyncio.to_thread(self.detector.detect, plain, "en")
+                code = _supported_lang(det.lang) if not det.neutral and det.confidence >= 0.6 else None
+                if code:
+                    votes = self._lang_votes.setdefault(uid, deque(maxlen=5))
+                    self._lang_votes.move_to_end(uid)
+                    while len(self._lang_votes) > 10_000:
+                        self._lang_votes.popitem(last=False)
+                    votes.append(code)
+                    top, n = Counter(votes).most_common(1)[0]
+                    if n >= 2 and (user is None or user.lang_guess != top):
+                        fields["lang_guess"] = top
+            if fields:
+                await self.storage.upsert_user(uid, **fields)
+        except Exception:
+            log.debug("language learning failed", exc_info=True)
 
     async def _already_delivered(self, chat_id: int, message_ids: list[int]) -> bool:
         for m in message_ids:
@@ -563,6 +603,20 @@ class Pipeline:
         await self.storage.update_message(meta.chat_id, msg.message_id, status="done")
         self.metrics.observe(f"pipeline_media_ms.{el.kind.value}", (time.perf_counter() - t0) * 1000)
 
+
+
+def _supported_lang(code: str | None) -> str | None:
+    """A language code the bot supports (Telegram sends e.g. "en", "pt-br", "zh-hans"), or None."""
+    if not code:
+        return None
+    c = code.strip()
+    if c in LANGUAGES:
+        return c
+    low = c.lower()
+    if low in ("zh-hant", "zh-tw", "zh-hk", "zh-mo"):
+        return "zh-Hant" if "zh-Hant" in LANGUAGES else None
+    base = low.split("-")[0]
+    return base if base in LANGUAGES else None
 
 def topic_of(msg: Message) -> int | None:
     """Forum topic id, or None. Non-forum replies may carry message_thread_id; it is not a topic."""

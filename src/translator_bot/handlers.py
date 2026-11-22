@@ -264,7 +264,7 @@ def _private_router(app: App) -> Router:
                                     max_seconds=int(app.s.max_media_seconds)))
         if not user.onboarded:
             prompt_language(user.user_id)
-            await msg.answer(ui.LANGUAGE_PROMPT, reply_markup=ui.language_menu(user.lang or app.s.default_target_lang))
+            await msg.answer(ui.LANGUAGE_PROMPT, reply_markup=ui.language_menu(user.effective_lang or app.s.default_target_lang))
 
     @r.message(Command("language"))
     async def language(msg: Message) -> None:
@@ -275,7 +275,7 @@ def _private_router(app: App) -> Router:
         user = await app.storage.get_user(msg.from_user.id)
         prompt_language(msg.from_user.id)
         await msg.answer(ui.LANGUAGE_PROMPT, reply_markup=ui.language_menu(
-            (user.lang if user else None) or app.s.default_target_lang))
+            (user.effective_lang if user else None) or app.s.default_target_lang))
 
     @r.message(Command("settings"))
     async def settings(msg: Message) -> None:
@@ -312,7 +312,7 @@ def _private_router(app: App) -> Router:
             return
         assert msg.from_user is not None
         user = await app.storage.get_user(msg.from_user.id)
-        await msg.answer(ui.help_text(uid=msg.from_user.id, lang=(user.lang if user else None)
+        await msg.answer(ui.help_text(uid=msg.from_user.id, lang=(user.effective_lang if user else None)
                                       or app.s.default_target_lang, bot_username=app.bot_username,
                                       approved=approved, private_ok=True,
                                       inline_ok=approved or app.s.inline_access == "everyone",
@@ -378,7 +378,7 @@ def _private_router(app: App) -> Router:
         assert msg.from_user is not None
         uid = msg.from_user.id
         user = await app.storage.get_user(uid)
-        current = (user.lang if user else None) or app.s.default_target_lang
+        current = (user.effective_lang if user else None) or app.s.default_target_lang
         text = msg.text.strip()
         if text.startswith("/"):
             await msg.answer("Unknown command — see /help.")
@@ -405,7 +405,7 @@ def _private_router(app: App) -> Router:
             return
         assert msg.from_user is not None
         user = await app.storage.get_user(msg.from_user.id)
-        await _private_translate(app, msg, (user.lang if user else None) or app.s.default_target_lang, approved)
+        await _private_translate(app, msg, (user.effective_lang if user else None) or app.s.default_target_lang, approved)
 
     return r
 
@@ -508,8 +508,7 @@ async def _private_translate(app: App, msg: Message, target: str, approved: bool
             res = PrivateResult(None, None, "failed")
         lang = html.escape(lang_name(target))
         if res.text:
-            pair = f"{lang_name(res.src)} → {lang_name(target)}" if res.src else lang_name(target)
-            body = f"{res.text}\n\n<i>{html.escape(pair)}</i>"
+            body = res.text  # only the translation
         else:
             body = _PRIVATE_REASONS.get(res.reason, _PRIVATE_REASONS["no_text"]).format(
                 lang=lang, secs=int(app.s.max_media_seconds))
@@ -594,7 +593,7 @@ def _callback_router(app: App) -> Router:
         user = await app.storage.get_user(uid) or await app.storage.upsert_user(uid)
         prefix, _, rest = data.partition(":")
         if prefix in ("lang", "ilang"):
-            current = (user.lang if prefix == "lang" else user.inline_lang) or (
+            current = (user.effective_lang if prefix == "lang" else user.inline_lang) or (
                 app.s.default_target_lang if prefix == "lang" else "en")
             action, _, val = rest.partition(":")
             if action == "set":

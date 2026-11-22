@@ -1,5 +1,23 @@
 # Changelog
 
+## 1.2.0 — 2026-11-23
+
+### Changed
+* **Only the translation is delivered** — no "Spanish → English" / "sticker" header (groups and private chat).
+  Edits are marked ✏️; `show_sender` still prefixes the name.
+* **Approve and done:** approved members no longer need to open the bot. Their language is automatic — the
+  language they write in the group (majority of recent messages), else their Telegram app language — until
+  they choose one with `/language` (an explicit choice always wins). Only language codes are stored.
+
+### Fixed (mixed languages, live-tested)
+* A short foreign phrase inside a message in the reader's language was not translated ("Mañana voy, but I'm not
+  sure about the time" lost "I'm going tomorrow"): now left to the provider to translate the mix.
+* Readers of a non-Latin language missed an English sentence mixed into their script or Burglish ("Let's go
+  tonight, mingalarpar everyone" for Burmese readers): now translated; short "ok bro"/"Hey guys!" still skipped.
+* Stickers/GIFs with two scripts (English line + Burmese line): the vision answer dropped or half-translated a
+  line; such media now go through the text translator, which handles code-switching (verified live).
+* Vision prompt: an empty answer only when the content is *entirely* in the target language.
+
 ## 1.1.3 — 2026-11-22
 
 ### Changed

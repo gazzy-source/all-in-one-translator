@@ -4,7 +4,9 @@ Recipients = (owners ∪ owner-approved users) who are
   * current members of the group (verified with getChatMember, short-lived cache),
   * not paused globally and not muted for this group,
   * not the author of the message (you never get your own message translated back to you),
-  * onboarded, unless onboarding is optional (then English is used and the user is told once).
+  * onboarded, unless onboarding is optional.
+Language: their choice, else the language they write in (`lang_guess`), else their Telegram app language,
+else the default; when not chosen explicitly they are told once how to change it.
 A failure or setting for one recipient never affects another: each recipient is resolved independently.
 """
 
@@ -111,9 +113,9 @@ class RecipientResolver:
         for u, is_member in zip(users, flags, strict=True):
             if not is_member:
                 continue
-            using_default = not u.lang
+            using_default = not u.lang  # automatic language (or the default): told once how to change it
             out.append(Recipient(
-                user_id=u.user_id, lang=u.lang or self.default_lang, using_default=using_default,
+                user_id=u.user_id, lang=u.effective_lang or self.default_lang, using_default=using_default,
                 dm_fallback=u.dm_fallback and u.started, notice_pending=using_default and not u.default_notice_sent,
             ))
         return out

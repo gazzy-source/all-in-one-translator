@@ -25,7 +25,6 @@ from aiogram.exceptions import (
 )
 from aiogram.types import EphemeralMessageParameters, LinkPreviewOptions, ReplyParameters
 
-from translator_bot.languages import lang_name
 from translator_bot.metrics import Metrics
 from translator_bot.recipients import Recipient
 from translator_bot.resilience import KeyedLimiter, SlidingWindowLimiter
@@ -154,26 +153,20 @@ class Delivery:
 
 
 def format_delivery(d: Delivery, *, notice: str | None = None) -> str:
-    src = lang_name(d.source_lang) if d.source_lang else None
-    meta = " · ".join(x for x in (
-        {"text": None, "caption": "caption", "sticker": "sticker", "gif": "GIF", "image": "image",
-         "album": "album", "video": "video", "voice": "voice"}.get(d.kind),
-        f"{src} → {lang_name(d.target_lang)}" if src else lang_name(d.target_lang),
-        "edited" if d.edited else None) if x)
-    # The translation is delivered as a reply to the original, so the sender is visible from the quote;
-    # the name is shown only if the chat enables show_sender.
-    who = f"<b>{html.escape(d.sender_name or 'Someone')}</b> " if d.show_sender else ""
-    head = f"🌐 {who}<i>{html.escape(meta)}</i>"
-    parts = [head]
+    # Only the translation: no "Spanish → English" / kind labels (the reply quote shows what it belongs to).
+    # The sender's name is shown only if the chat enables show_sender; edits get a small marker.
+    who = f"<b>{html.escape(d.sender_name or 'Someone')}:</b> " if d.show_sender else ""
+    head = who + ("✏️ " if d.edited else "")
+    parts = []
     if d.original_plain:
         parts.append(f"<blockquote>{html.escape(truncate(d.original_plain, 300))}</blockquote>")
-    parts.append(sanitize_html(d.translation_html))
+    parts.append(head + sanitize_html(d.translation_html))
     if notice:
         parts.append(f"<i>{html.escape(notice)}</i>")
     text = "\n".join(parts)
     if len(text) > MAX_TEXT:  # keep valid HTML: truncate the plain body instead of slicing tags
         body = truncate(html_to_plain(d.translation_html), MAX_TEXT - len(head) - 200)
-        text = "\n".join([head, html.escape(body)] + ([f"<i>{html.escape(notice)}</i>"] if notice else []))
+        text = "\n".join([head + html.escape(body)] + ([f"<i>{html.escape(notice)}</i>"] if notice else []))
     return text
 
 
@@ -192,7 +185,7 @@ def message_link(chat_id: int, message_id: int, thread_id: int | None) -> str | 
     return f"https://t.me/c/{internal}/{thread_id}/{message_id}" if thread_id else f"https://t.me/c/{internal}/{message_id}"
 
 
-DEFAULT_NOTICE = "English is selected by default. Open a private chat with me and send /language to change it."
+DEFAULT_NOTICE = "Only you see this. To change the language, message me and send /language."
 
 
 # --- deliverer -----------------------------------------------------------------------------------

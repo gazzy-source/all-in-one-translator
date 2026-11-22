@@ -78,14 +78,15 @@ def _how_lines(*, uid: int, bot_username: str, approved: bool, private_ok: bool,
 
 def welcome(user: User, *, default_lang: str, is_owner: bool, bot_username: str = "this_bot",
             approved: bool = True, private_ok: bool = True, inline_ok: bool = True, max_seconds: int = 60) -> str:
-    lang = html.escape(lang_name(user.lang or default_lang))
+    lang = html.escape(lang_name(user.effective_lang or default_lang))
     name = html.escape((user.first_name or "").strip()[:40])
     lines = [f"👋 <b>Hi{' ' + name if name else ''}! I translate into {lang}.</b>", ""]
     lines += _how_lines(uid=user.user_id, bot_username=bot_username, approved=approved, private_ok=private_ok,
                         inline_ok=inline_ok, max_seconds=max_seconds)
     lines.append("")
     if not user.lang:
-        lines.append(f"<i>{html.escape(lang_name(default_lang))} is selected by default — choose yours below.</i>")
+        lines.append("<i>Picked automatically — change it below.</i>" if user.effective_lang
+                     else f"<i>{html.escape(lang_name(default_lang))} is selected by default — choose yours below.</i>")
     elif user.paused and approved:
         lines.append("⏸ Group translations are paused — /resume")
     lines.append("/help · /language" + (" · 👑 /status" if is_owner else ""))
@@ -139,7 +140,7 @@ PRIVACY = (
 
 def settings_kb(user: User, default_lang: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [_btn(f"🌐 Language: {lang_name(user.lang or default_lang)}", "lang:menu")],
+        [_btn(f"🌐 Language: {lang_name(user.effective_lang or default_lang)}", "lang:menu")],
         [_btn("▶️ Resume translations" if user.paused else "⏸ Pause translations", "me:pause")],
         [_btn(("✅" if user.dm_fallback else "⬜") + " Private-chat backup if in-group delivery fails",
               "me:dm")],
@@ -151,7 +152,7 @@ def settings_kb(user: User, default_lang: str) -> InlineKeyboardMarkup:
 def settings_text(user: User, default_lang: str) -> str:
     return (
         "<b>Your settings</b>\n"
-        f"Language: <b>{html.escape(lang_name(user.lang or default_lang))}</b>"
+        f"Language: <b>{html.escape(lang_name(user.effective_lang or default_lang))}</b>"
         f"{' (default)' if not user.lang else ''}\n"
         f"Translations: {'⏸ paused' if user.paused else '▶️ active'}\n"
         f"Private-chat backup: {'on' if user.dm_fallback else 'off'} — if a private in-group translation can't "
@@ -192,6 +193,6 @@ def chat_settings_kb(chat: Chat) -> InlineKeyboardMarkup:
 
 
 def recipients_kb(users: list[User]) -> InlineKeyboardMarkup:
-    rows = [[_btn(f"❌ {html.escape(u.first_name or '')[:24]} ({u.user_id}) · {lang_name(u.lang or 'en')}",
+    rows = [[_btn(f"❌ {html.escape(u.first_name or '')[:24]} ({u.user_id}) · {lang_name(u.effective_lang or 'en')}",
                   f"own:revoke:{u.user_id}")] for u in users]
     return InlineKeyboardMarkup(inline_keyboard=rows or [[_btn("↻ Refresh", "own:recipients")]])
