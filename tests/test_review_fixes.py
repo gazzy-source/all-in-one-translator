@@ -576,3 +576,10 @@ def test_control_characters_in_output_are_rejected() -> None:
     bad = TranslationResult(True, "\x10Hola, \x11\x01\x12c\x00\x00\x00como estás?", "my", 0.9, "gemini", "m")
     good = TranslationResult(True, "Hola, ¿cómo estás?\nHace tiempo", "my", 0.9, "gemini", "m")
     assert "garbled" in validate(job, bad) and validate(job, good) == []
+
+
+def test_mixed_script_media_is_left_to_the_text_path() -> None:
+    from translator_bot.media.processor import _mixed_scripts
+
+    assert _mixed_scripts("WHEN THE TEACHER SAYS\nစာမေးပွဲ မနက်ဖြန်")
+    assert not _mixed_scripts("NO WAY BRO") and not _mixed_scripts("စာမေးပွဲ မနက်ဖြန် OK")

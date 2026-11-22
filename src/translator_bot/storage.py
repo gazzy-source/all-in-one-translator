@@ -99,6 +99,11 @@ MIGRATIONS: list[str] = [
         PRIMARY KEY (chat_id, term)
     );
     """,
+    # 2: automatic reader language for approved members who never chose one (codes only, never text)
+    """
+    ALTER TABLE users ADD COLUMN lang_guess TEXT;
+    ALTER TABLE users ADD COLUMN tg_lang TEXT;
+    """,
 ]
 
 DEFAULT_CHAT_SETTINGS: dict[str, Any] = {
@@ -129,6 +134,13 @@ class User:
     dm_fallback: bool = False
     inline_lang: str | None = None
     default_notice_sent: bool = False
+    lang_guess: str | None = None  # language they write in (majority of recent messages)
+    tg_lang: str | None = None  # their Telegram app language
+
+    @property
+    def effective_lang(self) -> str | None:
+        """Chosen language, else the one they write in, else their Telegram app language."""
+        return self.lang or self.lang_guess or self.tg_lang
 
 
 @dataclass(slots=True)
@@ -194,6 +206,7 @@ class Storage:
             approved=bool(row["approved"]), paused=bool(row["paused"]), started=bool(row["started"]),
             dm_fallback=bool(row["dm_fallback"]), inline_lang=row["inline_lang"],
             default_notice_sent=bool(row["default_notice_sent"]),
+            lang_guess=row["lang_guess"], tg_lang=row["tg_lang"],
         )
 
     async def get_user(self, user_id: int) -> User | None:
@@ -203,7 +216,7 @@ class Storage:
 
     async def upsert_user(self, user_id: int, **fields: Any) -> User:
         allowed = {"first_name", "lang", "onboarded", "approved", "approved_by", "approved_at", "paused", "started",
-                   "dm_fallback", "inline_lang", "default_notice_sent"}
+                   "dm_fallback", "inline_lang", "default_notice_sent", "lang_guess", "tg_lang"}
         bad = set(fields) - allowed
         if bad:
             raise ValueError(f"unknown user fields: {bad}")

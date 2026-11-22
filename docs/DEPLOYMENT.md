@@ -105,7 +105,8 @@ journalctl -u translator -f
 2. You receive a setup report by private message. Groups added by non-owners start disabled.
 3. Approve readers: reply `/approve` to one of their messages (only you see the command and the answer), or
    `/approve <user id>` in a private chat with the bot.
-4. Each reader opens the bot, sends `/start` and picks a language.
+4. That's it: an approved member gets translations right away, in the language they write in (or their
+   Telegram app language). They can pick another one anytime: private chat → `/language`.
 
 **Private chat:** anyone can also send the bot text, stickers, GIFs, photos, videos or voice notes privately and get
 a translation back (`PRIVATE_ACCESS=everyone`, the default). Users who aren't approved are capped per day

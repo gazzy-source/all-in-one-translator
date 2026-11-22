@@ -59,7 +59,7 @@ async def test_sticker_text_translated_privately(mh: Harness) -> None:
     await mh.send(group_message(sender=SPANISH_SPEAKER, name="Maria", extra=sticker("st1")))
     await mh.idle(timeout=60)
     sent = mh.tg.ephemeral_to(OWNER)
-    assert len(sent) == 1 and "¡NI DE BROMA!" in sent[0].params["text"] and "sticker" in sent[0].params["text"]
+    assert len(sent) == 1 and sent[0].params["text"].startswith("¡NI DE BROMA!")  # translation only
     assert mh.tg.public_group_output() == []
     # the same sticker again: cached, no new download, no new vision call
     await mh.send(group_message(sender=SPANISH_SPEAKER, extra=sticker("st1")))
@@ -80,7 +80,7 @@ async def test_sticker_translated_in_private_chat(mh: Harness) -> None:
     await mh.send(dm(OUTSIDER, mid=22, **sticker("st10")))
     await mh.idle(timeout=60)
     a, b = mh.tg.dms_to(OUTSIDER)
-    assert "¡NI DE BROMA!" in a.params["text"] and "English → Spanish" in a.params["text"]
+    assert a.params["text"] == "¡NI DE BROMA!"  # only the translation
     assert "couldn't find any text" in b.params["text"]
     assert mh.tg.public_group_output() == []
 

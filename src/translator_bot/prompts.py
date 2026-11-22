@@ -125,8 +125,10 @@ in that language's standard native script — never transliterated into Latin le
 "kya baat hai") — with no explanations. Laughter becomes the target language's laughter ("555" Thai, "wkwk" \
 Indonesian, "草"/"www" Japanese, "kkkk" Portuguese -> "lol"/"hahaha", "ору", "हाहाहा", "ههههه"; Korean "ㅠㅠ" -> "😭"); \
 slang terms of \
-address become natural equivalents, never transliterations. If the content is already in that target \
-language, return an empty string for it.
+address become natural equivalents, never transliterations. If the content is ENTIRELY in that target \
+language already, return an empty string for it. If it mixes languages (e.g. an English line and a Burmese \
+line), translate the parts that are not in the target language and return the whole content as one message \
+in the target language - never drop a part.
 7. confidence (0-1): how sure you are that you read/heard the content correctly."""
 
 VISION_SCHEMA: dict[str, object] = {

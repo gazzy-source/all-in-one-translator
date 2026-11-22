@@ -161,6 +161,11 @@ class LanguageDetector:
             self._zipf("the", lang)  # loads frequency tables (first call is slow: ~2s total)
         self._get_lingua()
 
+    def _english_words(self, words: list[str]) -> int:
+        """Real English words (not chat tokens/laughter/slang) - to spot an English sentence inside a message."""
+        return sum(1 for w in words if len(w) >= 2 and w not in NEUTRAL_TOKENS and w not in EN_SLANG
+                   and not LAUGH_RE.match(w) and self._zipf(w, "en") >= 3.5)
+
     def _zipf(self, word: str, lang: str) -> float:
         return float(zipf_frequency(word, lang, wordlist=self._wordlist))
 
@@ -185,6 +190,10 @@ class LanguageDetector:
             # Latin share >= 20% alongside: mixed (e.g. Hindi + English code-switching)
             if latin / total >= 0.2:
                 det.mixed = True
+                # the reader's own script plus a real English sentence ("Let's go tonight, ..."): the English
+                # part needs translating for them - let the provider decide (was: TARGET, nothing sent)
+                if det.verdict is Verdict.TARGET and self._english_words(words) >= 3:
+                    det.verdict = Verdict.UNSURE
             # chat laughter ("555", "ㅋㅋㅋ", "хахаха", "ههههه", "草") marks informal chat -> the LLM route
             # (DeepL leaves "555" untranslated and renders slang as textbook prose)
             if _has_laughter(text):
@@ -347,6 +356,9 @@ class LanguageDetector:
                     or (max(burm_w, default=0.0) >= 1.0 and burm / n >= 0.5))
         if burglish and burm > hing and not (best == "en" and coverage["en"] >= 0.9):
             verdict = Verdict.TARGET if target_base == "my" else Verdict.OTHER
+            if verdict is Verdict.TARGET and self._english_words(
+                    [w for w, x in zip(content, burm_w, strict=True) if x < 0.6]) >= 3:
+                verdict = Verdict.UNSURE  # Burglish + an English sentence: the English part is for translating
             mixed = coverage["en"] >= 0.25 and best == "en"
             return Detection("my", min(0.9, 0.5 + 0.1 * burm_hits), verdict, romanized=True, mixed=mixed,
                              informal=True, signals=signals | {"rule": "burglish", "burglish": round(burm, 2)})
@@ -376,6 +388,11 @@ class LanguageDetector:
             if foreign_share >= 0.3 and len(foreign_tokens) >= 1:
                 return Detection(best, conf, Verdict.OTHER, mixed=True, informal=informal,
                                  signals=signals | {"foreign": foreign_tokens[:5]})
+            if len(foreign_tokens) >= 2 and foreign_share >= 0.15:
+                # a short foreign phrase inside a target-language message ("Mañana voy, but I'm not sure about
+                # the time" lost "I'm going tomorrow"): let the provider decide and translate the mix
+                return Detection(best, conf, Verdict.UNSURE, mixed=True, informal=informal,
+                                 signals=signals | {"foreign": foreign_tokens[:5], "rule": "code-switch"})
             verdict = Verdict.TARGET if (conf >= 0.45 or target_cov >= 0.85) else Verdict.UNSURE
             return Detection(best, conf, verdict, informal=informal, signals=signals)
 

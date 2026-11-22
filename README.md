@@ -51,7 +51,11 @@ Maria: ¿Alguien sabe si mañana             Maria: ¿Alguien sabe si mañana   
 
 ### Private, per-person translation
 - **Owner-approved recipients** (default: owners only). Approve with a hidden reply-command in the group, or by ID.
-- **Each recipient picks their own language** (79 languages, native-name picker, type-to-search). Default English.
+- **Approve and done:** each reader's language is picked automatically (the language they write in the group,
+  else their Telegram app language); anyone can choose one of 79 languages with `/language`. Nobody has to
+  message the bot first.
+- **Only the translation** is shown (no language labels); mixed-language messages and stickers are translated
+  in full.
 - Translated **once per language** and delivered separately to each person; one person's settings, pause or
   failure never affects another.
 - Your own messages are never translated back to you; messages already in your language are skipped.
