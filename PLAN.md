@@ -9,13 +9,13 @@ Legend: ✅ done & mock-tested · 🟢 live-verified · ⏳ pending live verific
 |---|---|
 | 1 Research & audit (repo was empty; Telegram Bot API 10.4; competitors; Gemini/DeepL docs; OCR options) | ✅ |
 | 2 Architecture (ARCHITECTURE.md) | ✅ |
-| 3 Core private group translator | ✅ mock · ⏳ live |
-| 4 Inline translator | ✅ mock · ⏳ live |
-| 5 Media (captions, images, stickers, TGS, video stickers, GIFs) | ✅ mock (real ffmpeg/rlottie/RapidOCR on synthetic fixtures) · ⏳ live vision |
-| 6 Intelligence (context, glossary, mixed/romanized, routing, validation) | ✅ mock · ⏳ live quality |
+| 3 Core private group translator | ✅ mock · 🟢 live (L3–L5, L9, live group test 2026-11-22) |
+| 4 Inline translator | ✅ mock · ⏳ live (not exercised in the live group yet) |
+| 5 Media (captions, images, stickers, TGS, video stickers, GIFs, voice, video) | ✅ mock · 🟢 live (L11, L12, L14, media matrix, live group stickers/GIFs) |
+| 6 Intelligence (context, glossary, mixed/romanized, routing, validation) | ✅ mock · 🟢 live quality (L8, L13, L15) |
 | 7 Reliability (queues, breakers, fallbacks, shutdown, metrics, health) | ✅ mock |
-| 8 Testing (unit, e2e mocked, detection benchmark, security tools) | ✅ · ⏳ live benchmark & 3-account test |
-| 9 Optimization (measure latency/quota live) | ⏳ |
+| 8 Testing (unit, e2e mocked, detection benchmark, security tools) | ✅ · 🟢 live benchmarks & 3-account test (L8, L9) |
+| 9 Optimization (measure latency/quota live) | 🟢 latency measured (p50 0.4–0.7 s text, ~2–3 s media); ⏳ load test |
 | 10 Finalization (docs, deployment) | ✅ |
 
 ## Decisions log
