@@ -156,7 +156,7 @@ the same port.
 | Telegram | undocumented limits for ephemeral messages | per-chat and global send pacing (`EPHEMERAL_PER_CHAT_PER_MIN`, `GLOBAL_SENDS_PER_S`) |
 
 Voice/video/audio longer than `MAX_MEDIA_SECONDS` (60 s) are skipped. Free-tier providers may use submitted text
-to improve their services — `/privacy` tells users so.
+to improve their services; `/privacy` tells users that the providers' own terms apply.
 
 ## 9. Troubleshooting
 

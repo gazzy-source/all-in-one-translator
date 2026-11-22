@@ -61,30 +61,34 @@ LANGUAGE_PROMPT = (
 MEDIA_TYPES = "text, stickers, GIFs, photos, videos and voice notes"
 
 
-def _group_line(uid: int, approved: bool) -> str:
+def _how_lines(*, uid: int, bot_username: str, approved: bool, private_ok: bool, inline_ok: bool,
+               max_seconds: int) -> list[str]:
+    """The three ways to use the bot, one short line each (shared by /start and /help)."""
+    lines = []
+    if private_ok:
+        lines.append(f"📩 <b>Here</b> — send or forward text, stickers, GIFs, photos or voice (≤ {max_seconds} s)")
     if approved:
-        return "💬 <b>In groups</b> where I'm an admin, messages in other languages are translated <b>only for you</b>."
-    return ("💬 <b>Group translations</b> need the bot owner's approval — send them your ID: "
-            f"<code>{uid}</code>")
+        lines.append("💬 <b>Groups</b> — translations appear right in the chat, visible <b>only to you</b>")
+    else:
+        lines.append(f"💬 <b>Groups</b> — ask the owner to approve you · your ID <code>{uid}</code>")
+    if inline_ok:
+        lines.append(f"✍️ <b>Anywhere</b> — type <code>@{html.escape(bot_username)} hello</code>, tap to send")
+    return lines
 
 
 def welcome(user: User, *, default_lang: str, is_owner: bool, bot_username: str = "this_bot",
-            approved: bool = True, private_ok: bool = True, inline_ok: bool = True) -> str:
+            approved: bool = True, private_ok: bool = True, inline_ok: bool = True, max_seconds: int = 60) -> str:
     lang = html.escape(lang_name(user.lang or default_lang))
-    lines = ["👋 <b>Hi! I'm your translator.</b>", ""]
-    if private_ok:
-        lines.append(f"📩 Send me any {MEDIA_TYPES} — I'll reply in <b>{lang}</b>.")
-    lines.append(_group_line(user.user_id, approved))
-    if inline_ok:
-        lines.append(f"✍️ In any chat, type <code>@{html.escape(bot_username)} text</code> to send a translation.")
+    name = html.escape((user.first_name or "").strip()[:40])
+    lines = [f"👋 <b>Hi{' ' + name if name else ''}! I translate into {lang}.</b>", ""]
+    lines += _how_lines(uid=user.user_id, bot_username=bot_username, approved=approved, private_ok=private_ok,
+                        inline_ok=inline_ok, max_seconds=max_seconds)
     lines.append("")
-    status = " · ⏸ group translations paused" if user.paused and approved else ""
-    lines.append(f"Your language: <b>{lang}</b>{status}")
     if not user.lang:
         lines.append(f"<i>{html.escape(lang_name(default_lang))} is selected by default — choose yours below.</i>")
-    lines.append("/language · /settings · /help")
-    if is_owner:
-        lines.append("👑 Owner: /recipients · /chats · /status")
+    elif user.paused and approved:
+        lines.append("⏸ Group translations are paused — /resume")
+    lines.append("/help · /language" + (" · 👑 /status" if is_owner else ""))
     return "\n".join(lines)
 
 
@@ -95,34 +99,34 @@ ACCESS_DENIED = (
 
 
 def help_text(*, uid: int, lang: str, bot_username: str, approved: bool, private_ok: bool, inline_ok: bool,
-              max_seconds: int = 60) -> str:
-    lines = ["<b>🌐 What I do</b>"]
-    if private_ok:
-        lines.append(f"📩 <b>Here:</b> send or forward {MEDIA_TYPES} — I translate them into "
-                     f"<b>{html.escape(lang_name(lang))}</b>. Speech up to {max_seconds} s, song lyrics included.")
+              max_seconds: int = 60, is_owner: bool = False, paused: bool = False) -> str:
+    status = " · ⏸ paused" if paused and approved else ""
+    lines = [f"🌐 <b>Translating into {html.escape(lang_name(lang))}</b>{status}", ""]
+    lines += _how_lines(uid=uid, bot_username=bot_username, approved=approved, private_ok=private_ok,
+                        inline_ok=inline_ok, max_seconds=max_seconds)
+    cmds = ["/language — change your language", "/settings — preferences"]
     if approved:
-        lines.append("💬 <b>Groups:</b> add me as an admin (no rights needed). Messages in other languages get a "
-                     "translation that <b>only you</b> can see. I never post in the group.")
-    else:
-        lines.append(_group_line(uid, approved))
-    if inline_ok:
-        lines.append(f"✍️ <b>Any chat:</b> type <code>@{html.escape(bot_username)} text</code> and tap the "
-                     "result to send the translation.")
-    lines += ["", "<b>Commands</b>", "/language — change your language"]
-    if approved:
-        lines += ["/settings — inline language, delivery backup", "/groups — mute me in a group",
-                  "/pause · /resume — stop or restart group translations"]
-    else:
-        lines.append("/settings — preferences")
-    lines.append("/privacy — what's stored · /forgetme — delete your data")
+        cmds += ["/groups — mute me in one group", "/pause · /resume — group translations"]
+    cmds.append("/privacy · /forgetme — your data")
+    if is_owner:
+        cmds.append("👑 /recipients · /chats · /status")
+    lines += ["", "<blockquote expandable><b>All commands</b>\n" + "\n".join(cmds) + "</blockquote>"]
     return "\n".join(lines)
+
+
+def help_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [_btn("🌐 Change language", "lang:menu"), _btn("⚙️ Settings", "me:show")],
+        [_btn("🔒 Privacy", "me:privacy")],
+    ])
+
 
 PRIVACY = (
     "<b>Privacy</b>\n"
     "• To translate, the bot receives group messages (as an admin) and what you send it here. Message text "
     "is processed in memory, never written to disk, and never logged.\n"
-    "• Text that needs translating is sent to the configured translation provider(s): DeepL and/or Google "
-    "Gemini. On free tiers, providers may use submitted data to improve their services — see their terms.\n"
+    "• Text that needs translating is sent to the translation services (DeepL, Google Gemini); their privacy "
+    "terms apply to what they receive.\n"
     "• Media (stickers, GIFs, photos, voice notes, videos) is downloaded temporarily, processed and "
     "deleted immediately. Text recognized in stickers/GIFs is cached by Telegram file id for reuse.\n"
     "• Stored: your user ID, chosen languages, pause/mute settings, approval status, and message/delivery "

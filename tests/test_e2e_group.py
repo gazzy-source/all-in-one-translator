@@ -287,7 +287,7 @@ async def test_private_start_open_to_everyone_by_default(h: Harness) -> None:
     await h.send(dm(OUTSIDER, "/start"))
     out = h.tg.dms_to(OUTSIDER)
     assert len(out) == 2  # welcome + language picker
-    assert "Send me any" in out[0].params["text"] and str(OUTSIDER) in out[0].params["text"]  # approval hint
+    assert "send or forward" in out[0].params["text"] and str(OUTSIDER) in out[0].params["text"]  # approval hint
     assert "@babel_test_bot" not in out[0].params["text"]  # inline is approved-only by default
 
 
@@ -341,9 +341,11 @@ async def test_help_is_short_and_role_aware(h: Harness) -> None:
     await h.send(dm(OUTSIDER, "/help"))
     await h.send(dm(OWNER, "/help", mid=6))
     outsider, owner = h.tg.dms_to(OUTSIDER)[0].params["text"], h.tg.dms_to(OWNER)[0].params["text"]
-    assert "Here:" in outsider and str(OUTSIDER) in outsider and "/pause" not in outsider
-    assert "Groups:" in owner and "/pause" in owner and "@babel_test_bot" in owner
-    assert len(owner) < 900
+    assert "<b>Here</b>" in outsider and str(OUTSIDER) in outsider and "/pause" not in outsider
+    assert "only to you" in owner and "/pause" in owner and "@babel_test_bot" in owner and "/status" in owner
+    assert "<blockquote expandable>" in owner and len(owner) < 700
+    kb = h.tg.dms_to(OWNER)[0].params["reply_markup"]["inline_keyboard"]
+    assert {b["callback_data"] for row in kb for b in row} == {"lang:menu", "me:show", "me:privacy"}
 
 
 async def test_private_start_onboarding_for_approved(h: Harness) -> None:
