@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import io
 import logging
 import multiprocessing
@@ -164,7 +165,9 @@ class MediaProcessor:
             # languages missing from the cache are filled in by the text translator
             return MediaText(True, cached["text"] or "", cached["source_lang"], float(cached["confidence"] or 0),
                              dict(cached["translations"]), "cache")
-        key = f"{file_unique_id}:{','.join(sorted(targets))}"
+        # concurrent requests share one extraction only with the same caption hint (it steers the reading)
+        hint = hashlib.sha256((caption_hint or "").encode()).hexdigest()[:16]
+        key = f"{file_unique_id}:{','.join(sorted(targets))}:{hint}"
         while (fut := self._inflight.get(key)) is not None:
             try:
                 return await asyncio.shield(fut)
@@ -198,7 +201,10 @@ class MediaProcessor:
                                 targets: list[str], caption_hint: str | None) -> MediaText | None:
         self.metrics.inc(f"media.process.{kind}")
         t_start = t = time.perf_counter()
-        persist = kind in PERSISTED
+        # A caption steers the vision prompt, and the cache is keyed by file id alone and shared by every chat:
+        # a reading influenced by one sender's caption (e.g. prompt injection from a stranger's private chat)
+        # must never be served to other chats. Only caption-free readings are persisted.
+        persist = kind in PERSISTED and not caption_hint
         audio: bytes | None = None
         audio_mime: str | None = None
         fs: F.FrameSet | None = None

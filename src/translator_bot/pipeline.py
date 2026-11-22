@@ -534,7 +534,8 @@ class Pipeline:
                     # remember only real outcomes: a failure (quota, outage) must not become "nothing to translate"
                     if why != "failed":
                         media_text.translations[lang] = _html.unescape(tr)
-                    if why != "failed" and unique_id and mkind in PERSISTED_KINDS:
+                    # caption-steered readings stay out of the shared (file id) cache, like in the processor
+                    if why != "failed" and unique_id and mkind in PERSISTED_KINDS and not el.plain:
                         await self.storage.put_media(unique_id, has_text=True, text=media_text.text,
                                                      source_lang=media_text.source_lang or src,
                                                      confidence=media_text.confidence,

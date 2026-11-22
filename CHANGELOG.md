@@ -21,6 +21,9 @@
   model (~20 s) and timed out too, and private users were told "no text". Only renderers that can hang recycle
   the pool now; a timeout is reported as "took too long"; `OCR_GATE_FRAMES` (default 6) sets how many frames
   are checked locally.
+* **Security:** media readings steered by a caption (vision prompt hint) are no longer written to the shared
+  file-id media cache, so one sender's caption (e.g. prompt injection from a private chat) can't change what
+  other chats see for that sticker/GIF; concurrent extractions are only shared with the same caption.
 * One jittered retry for transient Telegram/network errors when sending a translation (was: lost, or DM fallback).
 * A provider failure (or a target the vision model left out) was cached as "already in that language" for
   `CACHE_TTL_DAYS`: that sticker/GIF stayed silent for those readers for up to 30 days.
