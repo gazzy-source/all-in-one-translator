@@ -56,6 +56,9 @@ class Settings(BaseSettings):
     context_messages: int = Field(6, alias="CONTEXT_MESSAGES", ge=0, le=20)
     context_ttl_s: int = Field(900, alias="CONTEXT_TTL_S", ge=0)
     max_text_chars: int = Field(3000, alias="MAX_TEXT_CHARS", ge=50)
+    # Language-gate word lists: "best" (~1 GB RAM once all scripts are seen) or "small" (~0.1 GB, for 1 GB hosts;
+    # same benchmark scores, ~1% of gate decisions differ on code-switched/slang lines - see PLAN.md L16)
+    detector_wordlist: Literal["best", "small"] = Field("best", alias="DETECTOR_WORDLIST")
     message_map_retention_h: int = Field(48, alias="MESSAGE_MAP_RETENTION_H", ge=1)
     cache_ttl_days: int = Field(30, alias="CACHE_TTL_DAYS", ge=0)
     edit_window_s: int = Field(48 * 3600, alias="EDIT_WINDOW_S", ge=0)
@@ -73,6 +76,8 @@ class Settings(BaseSettings):
     media_timeout_s: float = Field(30.0, alias="MEDIA_TIMEOUT_S", ge=5)  # ffmpeg gets this minus 2 s
     media_workers: int = Field(2, alias="MEDIA_WORKERS", ge=1, le=16)
     ocr_min_confidence: float = Field(0.6, alias="OCR_MIN_CONFIDENCE", ge=0, le=1)
+    # frames of a GIF/video the local text detector checks before any AI call (fewer = faster on slow CPUs)
+    ocr_gate_frames: int = Field(6, alias="OCR_GATE_FRAMES", ge=1, le=12)
     vision_ocr: bool = Field(True, alias="VISION_OCR")  # use Gemini vision when key present
 
     # --- Throughput -----------------------------------------------------------------------------
@@ -83,12 +88,19 @@ class Settings(BaseSettings):
     ephemeral_per_chat_per_min: int = Field(60, alias="EPHEMERAL_PER_CHAT_PER_MIN", ge=1)
     global_sends_per_s: int = Field(25, alias="GLOBAL_SENDS_PER_S", ge=1)  # Telegram: ~30/s
     inline_per_min: int = Field(30, alias="INLINE_PER_MIN", ge=1)
+    private_per_min: int = Field(12, alias="PRIVATE_PER_MIN", ge=1)  # 1:1 translations per user per minute
+    # 1:1 translations per day for users who are not approved (0 = unlimited); keeps free-tier quota for groups
+    private_daily_limit: int = Field(200, alias="PRIVATE_DAILY_LIMIT", ge=0)
+    # ... and in total across all of them (0 = unlimited). In memory: a restart resets both counters.
+    private_global_daily_limit: int = Field(500, alias="PRIVATE_GLOBAL_DAILY_LIMIT", ge=0)
     burst_window_ms: int = Field(700, alias="BURST_WINDOW_MS", ge=0, le=5000)
     failure_digest_minutes: int = Field(30, alias="FAILURE_DIGEST_MINUTES", ge=1)
 
     # --- Access -------------------------------------------------------------------------------
     onboarding_required: bool = Field(False, alias="ONBOARDING_REQUIRED")
     inline_access: Literal["approved", "everyone"] = Field("approved", alias="INLINE_ACCESS")
+    # who may use the 1:1 translator in a private chat with the bot (group translations always need approval)
+    private_access: Literal["approved", "everyone"] = Field("everyone", alias="PRIVATE_ACCESS")
     enable_new_groups: Literal["owner_added", "all", "none"] = Field("owner_added", alias="ENABLE_NEW_GROUPS")
 
     # --- Storage / logging ----------------------------------------------------------------------

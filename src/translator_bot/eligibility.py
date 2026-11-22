@@ -58,8 +58,10 @@ def sender_id(msg: Message) -> int | None:
     return msg.from_user.id if msg.from_user else None
 
 
-def classify(msg: Message, *, bot_id: int, settings: dict[str, Any], media_enabled: bool) -> Eligible | Skip:
-    if msg.chat.type not in ("group", "supergroup"):
+def classify(msg: Message, *, bot_id: int, settings: dict[str, Any], media_enabled: bool,
+             private: bool = False) -> Eligible | Skip:
+    """What to translate in a message. `private=True` classifies a message sent to the bot in a private chat."""
+    if msg.chat.type not in (("private",) if private else ("group", "supergroup")):
         return Skip.NOT_GROUP
     if msg.via_bot is not None and msg.via_bot.id == bot_id:
         return Skip.OWN_INLINE  # our own inline result posted by a user: never re-translate

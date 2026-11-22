@@ -9,11 +9,12 @@ from __future__ import annotations
 import asyncio
 import html
 import logging
+import random
 import time
 from collections import defaultdict
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Coroutine, Iterable
 from dataclasses import dataclass, field, replace
-from typing import Protocol
+from typing import Any, Protocol
 
 from aiogram import Bot
 from aiogram.exceptions import (
@@ -79,12 +80,13 @@ class TelegramTransport:
             if ("message to be replied not found" in msg or "replied message not found" in msg
                     or "reply_message_id_invalid" in msg or "message to reply not found" in msg):
                 return DeliveryError("reply_not_found")
-            if "not enough rights" in msg or "administrator" in msg or "ephemeral" in msg:
-                return DeliveryError("ephemeral_not_allowed", permanent=True)
-            if "user not found" in msg or "participant" in msg or "not a member" in msg:
-                return DeliveryError("not_member", permanent=True)
+            # specific outcomes first: their texts can also mention "ephemeral"
             if "message is not modified" in msg:
                 return DeliveryError("not_modified", permanent=True)
+            if "user not found" in msg or "participant" in msg or "not a member" in msg:
+                return DeliveryError("not_member", permanent=True)
+            if "not enough rights" in msg or "administrator" in msg or "ephemeral" in msg:
+                return DeliveryError("ephemeral_not_allowed", permanent=True)
             return DeliveryError(f"bad_request:{msg[:60]}", permanent=True)
         return DeliveryError(f"api:{type(exc).__name__}")
 
@@ -102,7 +104,10 @@ class TelegramTransport:
             )
         except TelegramAPIError as exc:
             raise self._map(exc) from None
-        return int(msg.ephemeral_message_id or 0)
+        if not msg.ephemeral_message_id:
+            log.warning("ephemeral send returned no ephemeral_message_id")
+            return 0  # recorded as "no id": later edits send a fresh message instead of editing
+        return int(msg.ephemeral_message_id)
 
     async def edit_ephemeral(self, chat_id: int, user_id: int, ephemeral_id: int, text_html: str) -> None:
         await self._limit(chat_id)
@@ -215,6 +220,25 @@ class FailureDigest:
         return "\n".join(lines)
 
 
+_inflight: set[asyncio.Task[None]] = set()
+
+
+async def _finish(coros: Iterable[Coroutine[Any, Any, None]]) -> None:
+    """Run per-recipient sends concurrently and shield them from the job's timeout/cancellation: a send that
+    reached Telegram is always recorded (an unrecorded ephemeral would be duplicated by a later edit)."""
+    tasks = [asyncio.ensure_future(c) for c in coros]
+    for t in tasks:
+        _inflight.add(t)
+        t.add_done_callback(_inflight.discard)
+    await asyncio.gather(*(asyncio.shield(t) for t in tasks), return_exceptions=True)
+
+
+async def drain_deliveries(timeout: float) -> None:
+    """Shutdown: wait for shielded per-recipient sends that outlived their (cancelled) jobs."""
+    if _inflight:
+        await asyncio.wait(set(_inflight), timeout=timeout)
+
+
 class Deliverer:
     def __init__(self, transport: Transport, storage: Storage, metrics: Metrics,
                  member_check: Callable[[int, int], Awaitable[bool]] | None = None) -> None:
@@ -226,8 +250,7 @@ class Deliverer:
 
     async def deliver(self, d: Delivery, recipients: list[Recipient], *, show_original: bool = False) -> None:
         """Deliver to every recipient concurrently; one recipient's failure never affects another."""
-        await asyncio.gather(*(self._deliver_one(d, r, show_original) for r in recipients),
-                             return_exceptions=True)
+        await _finish(self._deliver_one(d, r, show_original) for r in recipients)
 
     async def _deliver_one(self, d: Delivery, r: Recipient, show_original: bool) -> None:
         anchor = d.message_ids[-1]
@@ -272,6 +295,12 @@ class Deliverer:
                     self.metrics.inc("delivery_retry_after")
                     await asyncio.sleep(err.retry_after)
                     continue
+                if err.reason.startswith("api:") and attempt == 0:
+                    # network blip / Telegram 5xx: one jittered retry. Rarely the first request did arrive and
+                    # the reader sees the translation twice - better than losing it (observed: laptop outages). Jitter only.
+                    self.metrics.inc("delivery_retry_transient")
+                    await asyncio.sleep(1.0 + random.random())  # nosec B311
+                    continue
                 raise
         raise DeliveryError("retries exhausted")
 
@@ -312,7 +341,7 @@ class Deliverer:
                 tasks.append(self._edit_one(d, r, int(row["ephemeral_id"]), show_original))
             else:
                 tasks.append(self._deliver_one(d, r, show_original))
-        await asyncio.gather(*tasks, return_exceptions=True)
+        await _finish(tasks)
 
     async def _edit_one(self, d: Delivery, r: Recipient, eph_id: int, show_original: bool) -> None:
         view = d if show_original else replace(d, original_plain=None)

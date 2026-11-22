@@ -145,6 +145,17 @@ class BurstCoalescer:
         self._flush_cb = flush
         self.window, self.max_items, self.max_chars = window, max_items, max_chars
         self._pending: dict[tuple[int, int | None, int], tuple[list[BurstItem], object, asyncio.TimerHandle]] = {}
+        self._flushing: set[asyncio.Task[None]] = set()  # strong refs: the loop only keeps weak ones
+
+    def _spawn_flush(self, key: tuple[int, int | None, int]) -> None:
+        task = asyncio.ensure_future(self.flush(key))
+        self._flushing.add(task)
+        task.add_done_callback(self._flushed)
+
+    def _flushed(self, task: asyncio.Task[None]) -> None:
+        self._flushing.discard(task)
+        if not task.cancelled() and task.exception() is not None:
+            log.error("burst flush failed", exc_info=task.exception())
 
     async def add(self, key: tuple[int, int | None, int], item: BurstItem, meta: object) -> None:
         if self.window <= 0:
@@ -153,7 +164,7 @@ class BurstCoalescer:
         entry = self._pending.get(key)
         if entry is None:
             loop = asyncio.get_running_loop()
-            handle = loop.call_later(self.window, lambda: asyncio.ensure_future(self.flush(key)))
+            handle = loop.call_later(self.window, lambda: self._spawn_flush(key))
             self._pending[key] = ([item], meta, handle)
         else:
             items, _meta, handle = entry

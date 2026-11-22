@@ -70,6 +70,45 @@ async def test_sticker_text_translated_privately(mh: Harness) -> None:
 
 
 @pytest.mark.media
+async def test_sticker_translated_in_private_chat(mh: Harness) -> None:
+    from tests.test_e2e_group import dm
+
+    await mh.app.storage.upsert_user(OUTSIDER, lang="es")
+    mh.tg.files["st9"] = text_image("NO WAY BRO", transparent=True, fmt="WEBP")
+    await mh.send(dm(OUTSIDER, mid=21, **sticker("st9")))
+    mh.tg.files["st10"] = blank_image()
+    await mh.send(dm(OUTSIDER, mid=22, **sticker("st10")))
+    await mh.idle(timeout=60)
+    a, b = mh.tg.dms_to(OUTSIDER)
+    assert "¡NI DE BROMA!" in a.params["text"] and "English → Spanish" in a.params["text"]
+    assert "couldn't find any text" in b.params["text"]
+    assert mh.tg.public_group_output() == []
+
+
+@pytest.mark.media
+async def test_private_media_timeout_says_slow_and_keeps_pool(mh: Harness) -> None:
+    """Live 2026-11-22 (1/8-core VM): two GIFs hit the 30 s worker timeout; the user was told "no text", and the
+    pool recycle made the next job reload the OCR model and time out as well."""
+    from tests.test_e2e_group import dm
+    from translator_bot.media.processor import _WorkerTimeout
+
+    proc = mh.app.media
+    assert proc is not None
+    recycled: list[bool] = []
+
+    async def slow(fn: Any, *a: Any, **k: Any) -> Any:
+        raise _WorkerTimeout(fn.__name__)
+
+    proc._run = slow  # type: ignore[method-assign]
+    proc._recycle_pool = lambda: recycled.append(True)  # type: ignore[method-assign]
+    mh.tg.files["st11"] = text_image("NO WAY BRO", transparent=True, fmt="WEBP")
+    await mh.send(dm(OUTSIDER, mid=31, **sticker("st11")))
+    await mh.idle(timeout=60)
+    [out] = mh.tg.dms_to(OUTSIDER)
+    assert "took too long" in out.params["text"] and recycled == []
+
+
+@pytest.mark.media
 async def test_textless_sticker_silent(mh: Harness) -> None:
     mh.tg.files["st2"] = blank_image()
     await mh.send(group_message(sender=SPANISH_SPEAKER, extra=sticker("st2")))

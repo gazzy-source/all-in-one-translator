@@ -122,7 +122,9 @@ def _han_variant(text: str) -> str | None:
 class LanguageDetector:
     """Thread-safe after construction. Construct once at startup (loads models/lexicons)."""
 
-    def __init__(self, preload: bool = True) -> None:
+    def __init__(self, preload: bool = True, wordlist: str = "best") -> None:
+        # "small" keeps only common words per language (~0.1 GB instead of ~1 GB of frequency tables)
+        self._wordlist = wordlist
         self._hinglish = _load_lexicon("hinglish.txt")
         self._lingua: Any = None
         self._lingua_lock = threading.Lock()
@@ -155,8 +157,11 @@ class LanguageDetector:
 
     def warmup(self) -> None:
         for lang in WORDFREQ_LATIN:
-            zipf_frequency("the", lang)  # loads frequency tables (first call is slow: ~2s total)
+            self._zipf("the", lang)  # loads frequency tables (first call is slow: ~2s total)
         self._get_lingua()
+
+    def _zipf(self, word: str, lang: str) -> float:
+        return float(zipf_frequency(word, lang, wordlist=self._wordlist))
 
     # -- public ----------------------------------------------------------------------------------
     def detect(self, text: str, target: str) -> Detection:
@@ -225,8 +230,7 @@ class LanguageDetector:
             verdict = Verdict.OTHER
         return Detection(lang, conf, verdict, signals={"script": script})
 
-    @staticmethod
-    def _wordfreq_best(text: str, candidates: tuple[str, ...]) -> tuple[str | None, float]:
+    def _wordfreq_best(self, text: str, candidates: tuple[str, ...]) -> tuple[str | None, float]:
         """Word-frequency vote among same-script candidates wordfreq supports (ru/uk/bg/mk, ar/fa/ur...)."""
         langs = [c for c in candidates if c in WORDFREQ_NONLATIN]
         if len(langs) < 2:
@@ -234,7 +238,7 @@ class LanguageDetector:
         words = [w.lower() for w in re.findall(r"[\p{L}\p{M}]+", text)]
         if not words:
             return None, 0.0
-        scores = {lang: sum(zipf_frequency(w, lang) for w in words) / len(words) for lang in langs}
+        scores = {lang: sum(self._zipf(w, lang) for w in words) / len(words) for lang in langs}
         ranked = sorted(scores.items(), key=lambda kv: -kv[1])
         if ranked[0][1] < 1.5:
             return None, 0.0
@@ -277,7 +281,7 @@ class LanguageDetector:
         scores: dict[str, float] = {}
         coverage: dict[str, float] = {}
         per_token_best: list[str | None] = []
-        token_tables = [{lang: zipf_frequency(w, lang) for lang in WORDFREQ_LATIN} for w in content]
+        token_tables = [{lang: self._zipf(w, lang) for lang in WORDFREQ_LATIN} for w in content]
         token_max = [max(t.values()) for t in token_tables]
         for lang in WORDFREQ_LATIN:
             zs = [t[lang] for t in token_tables]

@@ -312,3 +312,102 @@ def test_every_setting_is_documented_in_env_example() -> None:
     aliases = {f.alias for f in Settings.model_fields.values() if f.alias}
     missing = sorted(a for a in aliases if not re.search(rf"^#?\s*{a}=", example, re.M))
     assert missing == [], f"document these in .env.example: {missing}"
+
+
+def test_small_wordlist_gate_keeps_core_decisions() -> None:
+    """DETECTOR_WORDLIST=small (1 GB hosts): common-language decisions stay the same as with the full lists."""
+    from translator_bot.detect import LanguageDetector
+
+    det = LanguageDetector(wordlist="small")
+    assert det.detect("¿Alguien sabe si mañana estará abierto?", "en").verdict is Verdict.OTHER
+    assert det.detect("Can someone send me the link again?", "en").verdict is Verdict.TARGET
+    assert det.detect("Kann mir jemand den Link nochmal schicken?", "en").lang == "de"
+    assert det.detect("Кто-нибудь знает, открыто ли завтра?", "uk").verdict is not Verdict.TARGET
+
+
+def test_garble_check_uses_full_wordlist() -> None:
+    """'перезвоним' is absent from wordfreq's small Russian list: the garble check must not treat it as a
+    non-word (that would silently drop a correct translation on a small-wordlist host)."""
+    from translator_bot.textutil import looks_garbled
+
+    src = "We will definitely call you back tomorrow morning, sorry for the trouble"
+    assert not looks_garbled(src, "Мы обязательно перезвоним вам завтра утром, извините за беспокойство", "ru")
+    assert not looks_garbled(src, "Мы перезвоним, перезвонят, перезвонила вам завтра", "ru")
+
+
+@pytest.mark.media
+async def test_vision_omitted_target_is_not_cached_as_already_translated(tmp_path: Path) -> None:
+    """A target the vision model left out must not become "" ("already in that language") - that was cached
+    for CACHE_TTL_DAYS and silenced the sticker for those readers. Only the source language itself gets ""."""
+    from tests.fixtures import text_image
+    from tests.test_media import FakeBot, FakeVision, processor
+
+    st = Storage(tmp_path / "m.sqlite3")
+    await st.open()
+    vision = FakeVision()  # answers "en" source, translations for every target except "en"
+    orig = vision.read_images
+
+    async def partial(images: Any, targets: list[str], **kw: Any) -> Any:
+        res = await orig(images, targets, **kw)
+        res.translations.pop("hi", None)  # model skipped Hindi
+        return res
+
+    vision.read_images = partial  # type: ignore[method-assign]
+    p = processor(FakeBot(text_image("NO WAY BRO", transparent=True, fmt="WEBP")), st, vision)
+    try:
+        r = await p.extract(file_id="f", file_unique_id="u9", size=None, kind="sticker", targets=["es", "hi", "en"])
+        assert r is not None and r.translations["es"] == "¡NI DE BROMA!"
+        assert "hi" not in r.translations  # the text translator decides, nothing cached as "no translation"
+        assert r.translations["en"] == ""  # genuinely already English
+    finally:
+        await p.close()
+        await st.close()
+
+
+def test_delivery_error_mapping_prefers_specific_reasons() -> None:
+    from aiogram.exceptions import TelegramBadRequest
+    from aiogram.methods import SendMessage
+
+    from translator_bot.delivery import TelegramTransport
+
+    m = SendMessage(chat_id=-1, text="x")
+    for text, reason in [("Bad Request: ephemeral message is not modified", "not_modified"),
+                         ("Bad Request: ephemeral receiver is not a member of the chat", "not_member"),
+                         ("Bad Request: not enough rights to send ephemeral messages", "ephemeral_not_allowed")]:
+        assert TelegramTransport._map(TelegramBadRequest(method=m, message=text)).reason == reason
+
+
+def test_private_daily_caps_per_user_and_total() -> None:
+    from types import SimpleNamespace
+
+    from translator_bot.handlers import _daily_ok
+
+    app: Any = SimpleNamespace(private_daily={}, s=SimpleNamespace(private_daily_limit=2,
+                                                                    private_global_daily_limit=3))
+    assert _daily_ok(app, 11) and _daily_ok(app, 11)
+    assert not _daily_ok(app, 11)  # per-user cap
+    assert _daily_ok(app, 12)
+    assert not _daily_ok(app, 13)  # total cap across users who aren't approved
+
+
+async def test_send_retries_once_on_network_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    from translator_bot import delivery as dmod
+    from translator_bot.delivery import Deliverer
+
+    calls: list[int] = []
+
+    class T:
+        async def send_ephemeral(self, *a: Any, **kw: Any) -> int:
+            calls.append(1)
+            if len(calls) == 1:
+                raise DeliveryError("api:TelegramNetworkError")
+            return 77
+
+    async def no_sleep(_s: float) -> None:
+        return None
+
+    monkeypatch.setattr(dmod.asyncio, "sleep", no_sleep)
+    d = Deliverer.__new__(Deliverer)
+    d.transport, d.metrics = T(), Metrics()  # type: ignore[assignment]
+    dl = Delivery(1, "g", None, [5], "M", "es", "en", "hi")
+    assert await d._send_with_retries(1, 42, "hi", 5, None, dl, None) == 77 and len(calls) == 2

@@ -419,7 +419,8 @@ def looks_garbled(source: str, translation: str, target: str) -> bool:
             words.append(lw)
         if len(words) < 4:
             return False
-        unknown = sum(zipf_frequency(w, target) < 1.0 for w in words)
+        # always the full list (lazily, target language only): "small" lists omit ordinary inflected forms
+        unknown = sum(zipf_frequency(w, target, wordlist="best") < 1.0 for w in words)
     except Exception:  # a validation helper must never break delivery
         return False
     return unknown >= 2 and unknown / len(words) > 0.3
