@@ -551,3 +551,28 @@ async def test_gemini_timeout_fails_over_to_other_model() -> None:
     g = _gemini_with(handler, hedge_s=0)
     res = await g.translate(TranslationJob("hola", "en"), quality=False, timeout=8)
     assert res.translation == "from fallback" and res.model == "fb-m"
+
+
+@pytest.mark.parametrize("wordlist", ["best", "small"])
+def test_burglish_is_romanized_burmese(wordlist: str) -> None:
+    """Live 2026-11-22: "mingalarpar, nay kaung lar?" was detected as Tagalog and DeepL invented a sentence.
+    Romanized Burmese must be "my", romanized (Gemini only), and left alone for Burmese readers."""
+    from translator_bot.detect import LanguageDetector
+
+    det = LanguageDetector(wordlist=wordlist)
+    for text in ("mingalarpar, nay kaung lar? ma twy tar kyar pyi", "sar pyi pi lar? lar mal naw", "mingalarpar"):
+        d = det.detect(text, "en")
+        assert d.lang == "my" and d.romanized and d.verdict is Verdict.OTHER, text
+    assert det.detect("mingalarpar, nay kaung lar?", "my").verdict is Verdict.TARGET
+    for text in ("The bar is far from my place", "Let me know tal", "kumain ka na ba?", "yaar kya scene hai"):
+        assert det.detect(text, "en").signals.get("rule") != "burglish", text
+
+
+def test_control_characters_in_output_are_rejected() -> None:
+    from translator_bot.orchestrator import validate
+    from translator_bot.providers.base import TranslationResult
+
+    job = TranslationJob("mingalarpar, nay kaung lar?", "es")
+    bad = TranslationResult(True, "\x10Hola, \x11\x01\x12c\x00\x00\x00como estás?", "my", 0.9, "gemini", "m")
+    good = TranslationResult(True, "Hola, ¿cómo estás?\nHace tiempo", "my", 0.9, "gemini", "m")
+    assert "garbled" in validate(job, bad) and validate(job, good) == []

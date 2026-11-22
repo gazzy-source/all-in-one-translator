@@ -126,6 +126,7 @@ class LanguageDetector:
         # "small" keeps only common words per language (~0.1 GB instead of ~1 GB of frequency tables)
         self._wordlist = wordlist
         self._hinglish = _load_lexicon("hinglish.txt")
+        self._burglish = _load_lexicon("burglish.txt")
         self._lingua: Any = None
         self._lingua_lock = threading.Lock()
         self._lingua_map: dict[object, str] = {}
@@ -338,8 +339,20 @@ class LanguageDetector:
             "hinglish": round(hing, 2), "arabizi": arabizi, "n": n,
         }
 
+        # Romanized Burmese ("Burglish"; live 2026-11-22: "mingalarpar, nay kaung lar?" was read as Tagalog and
+        # DeepL invented "why are you staring at my feet"). Stricter than Hinglish: short tokens overlap.
+        burm_w = [self._burglish.get(w, 0.0) for w in content]
+        burm, burm_hits = sum(burm_w), sum(1 for x in burm_w if x >= 0.6)
+        burglish = ((burm_hits >= 2 and burm / n >= 0.34) or (burm_hits >= 3 and burm / n >= 0.25)
+                    or (max(burm_w, default=0.0) >= 1.0 and burm / n >= 0.5))
+        if burglish and burm > hing and not (best == "en" and coverage["en"] >= 0.9):
+            verdict = Verdict.TARGET if target_base == "my" else Verdict.OTHER
+            mixed = coverage["en"] >= 0.25 and best == "en"
+            return Detection("my", min(0.9, 0.5 + 0.1 * burm_hits), verdict, romanized=True, mixed=mixed,
+                             informal=True, signals=signals | {"rule": "burglish", "burglish": round(burm, 2)})
+
         # Romanized Hindi: needs at least one strong token and lexicon mass over ~1/3 of tokens.
-        hinglish = (hing_hits >= 1 and hing / n >= 0.34) or (hing_hits >= 2 and hing / n >= 0.25)
+        hinglish =(hing_hits >= 1 and hing / n >= 0.34) or (hing_hits >= 2 and hing / n >= 0.25)
         if hinglish and not (best == "en" and coverage["en"] >= 0.9 and hing_hits < 2):
             romanized_conf = min(0.95, 0.5 + 0.15 * hing_hits)
             verdict = Verdict.TARGET if target_base in ("hi", "ur") else Verdict.OTHER

@@ -36,7 +36,7 @@ from translator_bot.media import frames as F
 from translator_bot.metrics import Metrics
 from translator_bot.providers.base import ProviderError, VisionProvider
 from translator_bot.storage import Storage
-from translator_bot.textutil import looks_garbled, romanized_output, wrong_script
+from translator_bot.textutil import has_control_chars, looks_garbled, romanized_output, wrong_script
 
 log = logging.getLogger(__name__)
 _SCREEN_TAG = re.compile(r"(?m)^\s*\[\s*screen\s*\]\s*", re.IGNORECASE)
@@ -310,7 +310,7 @@ class MediaProcessor:
                                                     or romanized_output(vr.text, tr, lang.script, tg)):
                         self.metrics.inc("media.wrong_script")
                         continue
-                    if tr and looks_garbled(vr.text, tr, tg):  # word salad: the text translator redoes it
+                    if tr and (looks_garbled(vr.text, tr, tg) or has_control_chars(tr)):  # text translator redoes it
                         self.metrics.inc("media.garbled")
                         continue
                     translations[tg] = tr
