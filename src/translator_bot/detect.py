@@ -192,6 +192,9 @@ class LanguageDetector:
         det = self._detect_latin(prof.core, words, target)
         if det.lang == "vi" and prof.core.isascii():
             det.informal = True  # Vietnamese typed without diacritics: DeepL misreads it (live: "hotpot" lost)
+            # ...also as a fallback (holdout 2026-11-22: Gemini timed out, DeepL said "I haven't been to a
+            # restaurant in a while"): treat it like other romanized text - Gemini only, no DeepL
+            det.romanized = True
         if non_latin and sum(non_latin.values()) / total >= 0.15:
             det.mixed = True
             if det.verdict is Verdict.TARGET:
@@ -215,6 +218,21 @@ class LanguageDetector:
                 lang, conf = wf_lang, (wf_conf + (1 - conf)) / 2 * 0.8
             if lang is None:
                 lang, conf = (candidates[0] if candidates else None), 0.5
+            elif lang not in WORDFREQ_NONLATIN:
+                # lingua picked a language word lists can't check (be, kk, ky, mn, tg...): if most words are listed
+                # (and half are common) in a word-list language, that's the language ("Да ладно, не вешай нос"
+                # was "be", 0.81). The best-covered language wins, not the zipf vote (small lists: "mk").
+                words = [w.lower() for w in re.findall(r"[\p{L}\p{M}]+", core)]
+                best_cov: tuple[float, float, str] | None = None
+                for cand in (c for c in candidates if c in WORDFREQ_NONLATIN):
+                    zs = [self._zipf(w, cand) for w in words]
+                    known = sum(1 for z in zs if z > 0) / max(1, len(zs))
+                    common = sum(1 for z in zs if z >= 3.0) / max(1, len(zs))
+                    if words and known >= 0.6 and common >= 0.5 and (best_cov is None or (known, common) >
+                                                                    best_cov[:2]):
+                        best_cov = (known, common, cand)
+                if best_cov is not None:
+                    lang, conf = best_cov[2], max(conf, wf_conf if wf_lang == best_cov[2] else 0.6)
         if lang == "zh" and target_base == "zh":
             # Simplified vs Traditional readers are different targets: decide from distinguishing characters
             variant = _han_variant(core)

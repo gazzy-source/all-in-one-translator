@@ -226,6 +226,11 @@ def missing_entities(source: str, translation: str) -> list[str]:
             pool.remove(d)
         elif t and (int(t.group(1)) % 12, t.group(2)) in out_times:
             continue  # 18:30 -> 6:30 p.m. (and 18:00 -> 6 pm) are the same time
+        elif re.fullmatch(r"1[3-9]|2[0-3]", d) and ((int(d) % 12, "00") in out_times or str(int(d) - 12) in pool):
+            # bare 24-hour clock: "finisco alle 19" -> "done at 7 p.m.", "alle 21?" -> "at 9?" (benchmark 2026-11-22)
+            if str(int(d) - 12) in pool:
+                pool.remove(str(int(d) - 12))
+            continue
         elif not any(d in od for od in out_digits):
             missing.append(n)
     return missing

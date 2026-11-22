@@ -18,6 +18,7 @@ class _Entry:
     ts: float
     sender_id: int
     text: str
+    seq: int = 0
 
 
 class ContextStore:
@@ -25,10 +26,17 @@ class ContextStore:
                  max_chars: int = 280) -> None:
         self.max_messages, self.ttl_s, self.max_chats, self.max_chars = max_messages, ttl_s, max_chats, max_chars
         self._buf: OrderedDict[tuple[int, int | None], deque[_Entry]] = OrderedDict()
+        self._seq = 0
+
+    @property
+    def mark(self) -> int:
+        """Position in the stream: get(before=mark) returns only lines added before this moment."""
+        return self._seq + 1
 
     def add(self, chat_id: int, thread_id: int | None, sender_id: int, text: str) -> None:
         if self.max_messages <= 0 or not text.strip():
             return
+        self._seq += 1
         key = (chat_id, thread_id)
         dq = self._buf.get(key)
         if dq is None:
@@ -36,15 +44,17 @@ class ContextStore:
             while len(self._buf) > self.max_chats:
                 self._buf.popitem(last=False)
         self._buf.move_to_end(key)
-        dq.append(_Entry(time.monotonic(), sender_id, truncate(text, self.max_chars)))
+        dq.append(_Entry(time.monotonic(), sender_id, truncate(text, self.max_chars), self._seq))
 
     def get(self, chat_id: int, thread_id: int | None, current_sender: int,
-            limit: int | None = None) -> tuple[ContextLine, ...]:
+            limit: int | None = None, before: int | None = None) -> tuple[ContextLine, ...]:
+        """Recent lines, oldest first. `before` (a `mark` taken when the message arrived) excludes the message
+        itself, the rest of its burst and anything posted while it waited in the queue."""
         dq = self._buf.get((chat_id, thread_id))
         if not dq:
             return ()
         now = time.monotonic()
-        entries = [e for e in dq if now - e.ts <= self.ttl_s]
+        entries = [e for e in dq if now - e.ts <= self.ttl_s and (before is None or e.seq < before)]
         if limit is not None:
             entries = entries[-limit:]
         labels: dict[int, str] = {current_sender: "A"}

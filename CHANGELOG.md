@@ -1,5 +1,25 @@
 # Changelog
 
+## 1.1.1 — 2026-11-22 (accuracy & speed)
+
+Measured with `bench_translation.py` on the held-out corpus (48 cases, realistic pace): source-language accuracy
+97.6% → 100%, p50 1.21 → 1.04 s, worst DeepL case 14.2 s → 0.4 s; silent misses / false translations still 0.
+
+### Fixed
+* **Context:** short messages were given "context" read when the job ran - the burst's own lines and messages
+  posted later leaked in. Context is now what was said *before* the message (arrival mark per message/burst).
+* **24-hour times:** "alle 19" → "7 p.m." / "alle 21?" → "at 9?" was flagged as a missing number; the bot then
+  waited up to 15 s on another provider before using the correct translation.
+* **Improving a usable result** (only a number check failed) gets one short attempt (≤ 6 s, no retry).
+* **Source labels:** plain Russian was labelled Belarusian ("Belarusian → English"); languages without word lists
+  (be, kk, mn, ...) now yield to a word-list language that covers most of the words.
+* **Accentless Vietnamese** never falls back to DeepL (it produced unrelated sentences when Gemini timed out).
+* DeepL's em dashes in chat ("See you tomorrow—don't be late!") become commas when the source had no dash.
+
+### Performance
+* Recipient membership checks run in parallel (bounded), instead of one `getChatMember` round trip per approved
+  user per message on a cold cache.
+
 ## 1.1.0 — 2026-11-22
 
 ### Added

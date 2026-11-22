@@ -232,7 +232,8 @@ class Orchestrator:
             if not breaker.allow():
                 self.metrics.inc(f"breaker_open.{route.provider}")
                 continue
-            res = await self._call(provider, breaker, job, route, deadline, has_fallback=i < len(routes))
+            res = await self._call(provider, breaker, job, route, deadline, has_fallback=i < len(routes),
+                                   settle=best is not None and all(p.startswith("missing") for p in best_problems))
             if res is None:
                 if i < len(routes):
                     self.metrics.inc("fallback")
@@ -268,15 +269,19 @@ class Orchestrator:
         return max(0.5, min(share, self.provider_timeout))
 
     async def _call(self, provider: TranslationProvider, breaker: CircuitBreaker, job: TranslationJob,
-                    route: Route, deadline: float, *, has_fallback: bool = False) -> TranslationResult | None:
+                    route: Route, deadline: float, *, has_fallback: bool = False,
+                    settle: bool = False) -> TranslationResult | None:
+        """`settle`: a usable (minor-problem) result is already in hand and this attempt only tries to improve
+        it - keep it short and don't retry (benchmark it-1: 15 s waiting on Gemini timeouts for a good answer)."""
         for attempt in range(2):
             remaining = deadline - time.monotonic()
             if remaining < 0.5:
                 self.metrics.inc("deadline_exceeded")
                 return None
             t0 = time.perf_counter()
+            budget = min(self._budget(remaining, has_fallback), 6.0) if settle else self._budget(remaining, has_fallback)
             try:
-                res = await provider.translate(job, quality=route.quality, timeout=self._budget(remaining, has_fallback))
+                res = await provider.translate(job, quality=route.quality, timeout=budget)
             except ProviderError as err:
                 self.metrics.inc(f"provider_error.{err.provider}.{err.kind.value}")
                 log.warning("provider error", extra={"provider": err.provider, "kind": err.kind.value,
@@ -290,7 +295,7 @@ class Orchestrator:
                     # content-specific outcomes (safety block, truncated JSON for one message) say nothing about
                     # provider health: a few profane messages must not open the breaker for everyone
                     breaker.record_failure()
-                if err.kind in RETRYABLE and attempt == 0 and deadline - time.monotonic() > 2.0:
+                if err.kind in RETRYABLE and attempt == 0 and not settle and deadline - time.monotonic() > 2.0:
                     await asyncio.sleep(backoff_delay(attempt))
                     continue
                 return None  # the caller tries the next route (other provider family)

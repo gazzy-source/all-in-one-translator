@@ -433,3 +433,66 @@ async def test_caption_steered_media_reading_is_not_cached(tmp_path: Path) -> No
     finally:
         await p.close()
         await st.close()
+
+
+def test_bare_24h_hour_matches_12h_translation() -> None:
+    from translator_bot.textutil import missing_entities
+
+    assert missing_entities("Dove ci vediamo stasera? Io finisco alle 19.",
+                            "Where should we meet tonight? I'm done at 7 p.m.") == []
+    assert missing_entities("Io finisco alle 19.", "I'm done at 8 p.m.") == ["19"]  # changed value still flagged
+
+
+def test_deepl_em_dash_becomes_comma_in_chat() -> None:
+    from translator_bot.providers.deepl import _chat_punctuation
+
+    assert _chat_punctuation("See you tomorrow—don't be late!", "明天见，别迟到哦！", "en") == \
+        "See you tomorrow, don't be late!"
+    assert _chat_punctuation("Wait — what?", "Attends — quoi ?", "en") == "Wait — what?"  # source had one
+    assert _chat_punctuation("3–5 people", "3-5 Leute", "en") == "3–5 people"  # en dash range kept
+    assert _chat_punctuation("明天见——别迟到", "See you tomorrow, don't be late", "zh") == "明天见——别迟到"
+
+
+async def test_improving_a_usable_result_does_not_wait_for_retries() -> None:
+    from tests.conftest import FakeProvider
+
+    deepl = FakeProvider("deepl")
+    deepl.overrides["Wir treffen uns um 19 Uhr am Bahnhof"] = "We meet at the station at 8"  # number drift
+    gemini = FakeProvider("gemini")
+    gemini.fail = [ErrorKind.TIMEOUT, ErrorKind.TIMEOUT]
+    o = Orchestrator({"deepl": deepl, "gemini": gemini}, Metrics())
+    det = Detection("de", 0.95, Verdict.OTHER)
+    res = await o.translate(TranslationJob("Wir treffen uns um 19 Uhr am Bahnhof", "en", source_hint="de"), det)
+    assert res is not None and res.provider == "deepl"  # minor drift beats silence
+    assert len(gemini.jobs) == 1  # the improvement attempt is not retried after a timeout
+
+
+@pytest.mark.parametrize("wordlist", ["best", "small"])
+def test_russian_is_not_labelled_belarusian(wordlist: str) -> None:
+    """Holdout h-ru-idiom (2026-11-22): lingua said "be" (0.81) for a plain Russian line, so readers saw
+    "Belarusian → English". Real Belarusian/Kazakh keep their labels."""
+    from translator_bot.detect import LanguageDetector
+
+    det = LanguageDetector(wordlist=wordlist)
+    assert det.detect("Да ладно, не вешай нос, прорвёмся", "en").lang == "ru"
+    assert det.detect("Прывітанне, што ты робіш сёння ўвечары?", "en").lang == "be"
+    assert det.detect("Добры дзень, як справы? Дзякуй, усё добра", "en").lang == "be"
+    assert det.detect("Сәлем, қалың қалай?", "en").lang == "kk"
+
+
+def test_bare_24h_hour_without_ampm() -> None:
+    from translator_bot.textutil import missing_entities
+
+    assert missing_entities("che figata ragazzi, ci vediamo stasera alle 21?",
+                            "That's so cool, guys. See you tonight at 9?") == []
+
+
+def test_accentless_vietnamese_never_falls_back_to_deepl() -> None:
+    from tests.conftest import FakeProvider
+    from translator_bot.detect import LanguageDetector
+
+    det = LanguageDetector(wordlist="small").detect("toi nay di an lau khong may ba", "en")
+    assert det.lang == "vi" and det.romanized
+    o = Orchestrator({"deepl": FakeProvider("deepl"), "gemini": FakeProvider("gemini")}, Metrics())
+    routes = o.route(TranslationJob("toi nay di an lau khong may ba", "en", source_hint="vi"), det, "group")
+    assert [r.provider for r in routes] == ["gemini"]
