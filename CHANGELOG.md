@@ -9,7 +9,7 @@ English → Burmese were already correct and fast (DeepL ~0.3 s).
 * **Burglish (romanized Burmese)** — "mingalarpar, nay kaung lar?" was detected as Tagalog and DeepL invented
   "Why are you staring at my feet?". New `burglish.txt` lexicon: romanized Burmese is detected as `my`, routed to
   Gemini only, and left alone for Burmese readers. No matches across the 202 benchmark texts (no false positives).
-* **Binary junk in model output** (live, gemini-3.5-flash-lite: `"Hola, …como estás?"`) passed
+* **Binary junk in model output** (live, gemini-3.5-flash-lite: `"\x10Hola, \x11\x01…como estás?"`) passed
   validation; outputs with control characters are rejected (text and media paths) and retried.
 
 ## 1.1.1 — 2026-11-22 (accuracy & speed)
