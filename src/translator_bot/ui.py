@@ -213,9 +213,34 @@ def settings_kb(user: User, default_lang: str) -> InlineKeyboardMarkup:
         [_btn("▶️ Resume translations" if user.paused else "⏸ Pause translations", "me:pause")],
         [_btn(("✅" if user.dm_fallback else "⬜") + " Private-chat backup if in-group delivery fails",
               "me:dm")],
+        [_btn("📚 I also read: " + (", ".join(flag(c) for c in sorted(user.also_reads_set)) or "—"), "also:menu")],
+        [_btn(("✅" if user.show_original else "⬜") + " Show the original above translations", "me:orig")],
         [_btn(f"✍️ Inline target: {lang_name(user.inline_lang or 'en')}", "ilang:menu")],
         [_btn("👥 My groups", "me:groups"), _btn("🔒 Privacy", "me:privacy")],
     ])
+
+
+ALSO_PROMPT = ("📚 <b>Languages you also read</b>\nAutomatic group translations skip messages confidently identified "
+               "as one of these languages. Mixed or uncertain messages may still be translated. "
+               "Tap to switch on/off. You can always request a translation with /tr.")
+
+
+def also_reads_kb(user: User, default_lang: str, page: int = 0) -> InlineKeyboardMarkup:
+    mine = user.effective_lang or default_lang
+    picked = user.also_reads_set
+    codes = [c for c in POPULAR if c in LANGUAGES and c != mine]
+    codes += sorted((c for c in LANGUAGES if c != mine and c not in codes), key=lambda c: LANGUAGES[c].name)
+    pages = max(1, (len(codes) + PAGE - 1) // PAGE)
+    page = max(0, min(page, pages - 1))
+    buttons = [_btn(("✅ " if c in picked else flag(c) + " ") + LANGUAGES[c].native, f"also:tog:{c}:{page}")
+               for c in codes[page * PAGE:(page + 1) * PAGE]]
+    nav = []
+    if page:
+        nav.append(_btn("‹ Back", f"also:page:{page - 1}"))
+    if page + 1 < pages:
+        nav.append(_btn("More languages ›", f"also:page:{page + 1}"))
+    return InlineKeyboardMarkup(inline_keyboard=[*_rows(buttons, 3), *([nav] if nav else []),
+                                                 [_btn("✔️ Done", "also:done")]])
 
 
 def settings_text(user: User, default_lang: str) -> str:
@@ -226,7 +251,9 @@ def settings_text(user: User, default_lang: str) -> str:
         f"Translations: {'⏸ paused' if user.paused else '▶️ active'}\n"
         f"Private-chat backup: {'on' if user.dm_fallback else 'off'} — if a private in-group translation can't "
         "be delivered, send it to this chat instead (never to the group).\n"
-        f"Inline translator target: {html.escape(lang_name(user.inline_lang or 'en'))}"
+        f"Inline translator target: {html.escape(lang_name(user.inline_lang or 'en'))}\n"
+        "I also read: " + (html.escape(", ".join(lang_name(c) for c in sorted(user.also_reads_set))) or "—")
+        + " · Show originals: " + ("on" if user.show_original else "off")
     )
 
 

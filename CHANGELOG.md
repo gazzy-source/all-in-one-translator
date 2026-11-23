@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+* Personal **I also read** picker covers all supported languages. Confidently identified single-language
+  group text is skipped before provider calls; mixed/uncertain text remains eligible. Captions and media
+  are filtered independently, and Chinese script variants stay distinct.
+* Personal **Show the original** setting adds an original-text quote to group translations.
+* Consecutive same-sender text extends a reader's last private bubble within 20 seconds when order,
+  language and display preferences match. Concurrent deliveries are serialized per reader; expired or
+  oversized bubbles start fresh, and corrections preserve other messages in a shared bubble.
+* Recheck recipients after translation so revocations, pauses and language changes during provider calls
+  take effect before delivery.
+* Preferences use a new migration 5, preserving upgrades from deployed schema 3 and committed schema 4.
+* Repair the provider smoke test for the current multi-target vision API; generate its synthetic image
+  with Pillow so it also runs inside the production container without the test fixtures.
+
 ## 1.4.0 — 2026-11-23
 
 ### Added

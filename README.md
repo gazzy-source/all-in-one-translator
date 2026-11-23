@@ -50,7 +50,8 @@ Maria: ¿Alguien sabe si mañana             Maria: ¿Alguien sabe si mañana   
   invisible to everyone else.
 
 ### Private, per-person translation
-- **Owner-approved recipients** (default: owners only). Approve with a hidden reply-command in the group, or by ID.
+- **Approved recipients:** bot owners, people approved by a bot owner, and people approved by this group's
+  admins. Group admins can use hidden `/approveall` for members seen in their group. Membership is checked.
 - **Approve and done:** each reader's language is picked automatically (the language they write in the group,
   else their Telegram app language); anyone can choose one of 79 languages with `/language`. Nobody has to
   message the bot first.
@@ -59,6 +60,11 @@ Maria: ¿Alguien sabe si mañana             Maria: ¿Alguien sabe si mañana   
 - Translated **once per language** and delivered separately to each person; one person's settings, pause or
   failure never affects another.
 - Your own messages are never translated back to you; messages already in your language are skipped.
+- **Personal reading preferences:** `/settings` → **I also read** skips confidently identified messages in
+  additional languages; mixed or uncertain messages remain eligible. **Show the original** adds a short quote
+  above your group translations.
+- Consecutive text from the same sender can extend your previous private translation for up to 20 seconds.
+  Replies, interruptions, changed language/display preferences, and long output start a fresh bubble.
 - Optional, consent-only **private-chat backup** if in-group delivery fails. Never a public fallback.
 
 ### Understands real chat
@@ -107,7 +113,7 @@ All numbers from real runs in `benchmarks/` (raw outputs in `benchmarks/results/
 |---|---|---|
 | **Language gate** (offline, 107 cases) | Unwanted translations / missed translations | **0% / 0%** · 98% source-language accuracy · ~25 ms/msg |
 | **Translation** (live, 47 cases, 14 languages) | Errors, silent misses, entity/number preservation | **0 errors · 0% silent misses · 0% entity violations · 100% source-language accuracy** · chrF 77.4 · p50 0.78 s |
-| **Language matrix** (live, 12 messages × 6 targets) | Output is in the recipient's language & native script | LANGUAGE_MATRIX_RESULT |
+| **Language matrix** (live, 12 messages × 6 targets) | Output is in the recipient's language & native script | 100% right language · 0 garbled outputs (PLAN.md L13) |
 | **Media** (live, 23 items) | Text/speech recall, false positives, right language | **100% recall · 0% false positives · 0 AI calls on textless media · 100% right language** |
 | **Live Telegram acceptance** (3 real accounts) | English reader, Hindi reader, unapproved member | ✅ each approved user got their own translation; unapproved member and group saw nothing |
 
@@ -178,12 +184,15 @@ published image on GHCR, health checks with self-healing restarts, online backup
 ### BotFather
 1. `/newbot` → token. 2. `/setinline` → enable inline mode. 3. Privacy mode can stay on (admin bots receive all messages).
 
-### Group setup (owner)
+### Group setup
 1. Add the bot and promote it to **admin with every right switched off** (admin status is what allows private
    in-group messages; no rights are needed or used).
-2. You get a **setup report** by private message. Groups added by non-owners start disabled.
-3. Approve people: reply `/approve` to their message in the group (only you see it), or `/approve <id>` in private.
-4. Each person opens the bot, sends `/start`, taps their language. Done.
+2. Whoever adds/promotes the bot gets setup steps privately. New groups are enabled by default
+   (`ENABLE_NEW_GROUPS=owner_added` restores owner-only setup).
+3. Group admins can reply `/approve` to members or use `/approveall` for people seen in that group.
+   A bot owner's approval applies across groups; a group admin's approval applies only there.
+4. Readers receive translations in their automatically detected language or Telegram app language.
+   They can choose another language with `/language` in private; `/start` is optional.
 
 ## 💬 Commands
 
@@ -202,8 +211,9 @@ published image on GHCR, health checks with self-healing restarts, online backup
 | | `/chats` | Per-group toggles: text, captions, images, stickers, animated, GIFs, videos, voice, context, sender name |
 | | `/status` | Health, delivery counters, provider quota, latency |
 | Owners (hidden, in group) | `/approve` · `/revoke` · `/approvefree` · `/revokefree` (as replies) · `/check` · `/glossary term = rendering` | Invisible to members |
+| Group admins (hidden, in their group) | `/approve` · `/revoke` · `/approveall` · `/revokeall` · `/glossary` | Manage this group's readers and glossary |
 
-Group translations always need approval; users who aren't approved see their ID to send to the owner (with
+Group translations need bot-owner approval, group-admin approval, or that group's `/approveall` (with
 `PRIVATE_ACCESS=approved` the whole private chat is limited to approved users).
 
 ## 🔒 Privacy & security

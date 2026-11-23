@@ -43,7 +43,7 @@ from translator_bot import billing, ui
 from translator_bot.app import App
 from translator_bot.detect import Verdict
 from translator_bot.eligibility import Eligible, Skip, classify
-from translator_bot.languages import lang_name, resolve_language, suggest_languages
+from translator_bot.languages import LANGUAGES, lang_name, resolve_language, suggest_languages
 from translator_bot.pipeline import PrivateResult, _media_file, html_escape_truncate
 from translator_bot.providers.base import TranslationJob
 from translator_bot.textutil import ContentKind, html_to_plain, normalize_for_key, profile_text, truncate
@@ -1099,7 +1099,7 @@ def _callback_router(app: App) -> Router:
         msg = cb.message
         if not await app.resolver.is_approved(uid) and (app.s.private_access != "everyone"
                                                          or data.partition(":")[0] not in ("lang", "ilang", "me",
-                                                                                            "pay")):
+                                                                                            "pay", "also")):
             await cb.answer("This translator is private.", show_alert=True)
             return
         user = await app.storage.get_user(uid) or await app.storage.upsert_user(uid)
@@ -1137,6 +1137,8 @@ def _callback_router(app: App) -> Router:
                 user = await app.storage.upsert_user(uid, paused=not user.paused)
             elif action == "dm":
                 user = await app.storage.upsert_user(uid, dm_fallback=not user.dm_fallback)
+            elif action == "orig":
+                user = await app.storage.upsert_user(uid, show_original=not user.show_original)
             elif action == "groups":
                 await _send_groups(app, msg, uid, edit=True)
                 await cb.answer()
@@ -1168,6 +1170,28 @@ def _callback_router(app: App) -> Router:
                 await msg.edit_text(ui.settings_text(user, app.s.default_target_lang),
                                     reply_markup=ui.settings_kb(user, app.s.default_target_lang))
             await cb.answer("Saved")
+            return
+        if prefix == "also":
+            action, _, val = rest.partition(":")
+            page = 0
+            if action == "tog":
+                val, _, raw_page = val.partition(":")
+                page = int(raw_page) if _INT_RE.fullmatch(raw_page) else 0
+            elif action == "page":
+                page = int(val) if _INT_RE.fullmatch(val) else 0
+            if action == "tog" and val in LANGUAGES:
+                picked = set(user.also_reads_set)
+                picked.symmetric_difference_update({val})
+                user = await app.storage.upsert_user(uid, also_reads=",".join(sorted(picked)))
+            with contextlib.suppress(TelegramAPIError):
+                if action == "menu":
+                    await msg.answer(ui.ALSO_PROMPT, reply_markup=ui.also_reads_kb(user, app.s.default_target_lang))
+                elif action == "done":
+                    await msg.edit_text(ui.settings_text(user, app.s.default_target_lang),
+                                        reply_markup=ui.settings_kb(user, app.s.default_target_lang))
+                else:
+                    await msg.edit_reply_markup(reply_markup=ui.also_reads_kb(user, app.s.default_target_lang, page))
+            await cb.answer()
             return
         if prefix == "pay":
             err = await _send_invoice(app, uid, rest)

@@ -19,7 +19,7 @@ from aiogram.types import Message
 
 from translator_bot.config import Settings
 from translator_bot.context import ContextStore
-from translator_bot.delivery import Deliverer, Delivery
+from translator_bot.delivery import BUBBLE_WINDOW_S, Deliverer, Delivery
 from translator_bot.detect import LanguageDetector, Verdict
 from translator_bot.eligibility import Eligible, Kind, Skip, classify, sender_id, sender_name
 from translator_bot.languages import LANGUAGES, same_language
@@ -57,6 +57,7 @@ class UnitMeta:
     reply_ctx: ContextLine | None
     settings: dict[str, Any]
     ctx_before: int | None = None  # ContextStore.mark when the (first) message arrived
+    append_after: int | None = None  # exact preceding original; never merge out-of-order translations
 
 
 @dataclass(slots=True)
@@ -96,6 +97,7 @@ class Pipeline:
         self._lang_votes: OrderedDict[int, deque[str]] = OrderedDict()  # approved sender -> recent languages
         self._participants: set[tuple[int, int]] = set()  # (chat, user) already stored as participant
         self._group_daily: dict[int, tuple[str, int]] = {}  # chat -> (UTC day, translated messages)
+        self._last_speaker: dict[tuple[int, int | None], tuple[int | None, float, int]] = {}
 
     def start(self) -> None:
         self.text_lane.start()
@@ -135,6 +137,15 @@ class Pipeline:
         sid = sender_id(msg)
         thread = topic_of(msg)  # one key for context, bursts, claims and delivery
         ctx_mark = self.context.mark  # context = what was said *before* this message
+        prev = self._last_speaker.get((msg.chat.id, thread))
+        now = time.monotonic()
+        append_after = (prev[2] if prev is not None and sid is not None and prev[0] == sid
+                        and now - prev[1] <= BUBBLE_WINDOW_S and not msg.reply_to_message else None)
+        self._last_speaker[(msg.chat.id, thread)] = (sid, now, msg.message_id)
+        if prev is not None and (prev[0] != sid or not msg.text or msg.reply_to_message):
+            await self.bursts.flush((msg.chat.id, thread, prev[0] or 0))
+        if len(self._last_speaker) > 20_000:
+            self._last_speaker.clear()
         if msg.text and sid is not None and not msg.text.startswith("/"):
             self.context.add(msg.chat.id, thread, sid, msg.text)
         elif msg.caption and sid is not None:
@@ -174,7 +185,7 @@ class Pipeline:
             return
         self.metrics.inc(f"eligible.{res.kind.value}")
         meta = UnitMeta(msg.chat.id, msg.chat.title, thread, sid, sender_name(msg), self._reply_ctx(msg, sid),
-                        chat.settings, ctx_mark)
+                        chat.settings, ctx_mark, append_after)
         if res.kind is Kind.TEXT:
             await self.bursts.add((msg.chat.id, thread, sid or 0),
                                   BurstItem(msg.message_id, res.text_html, res.plain), meta)
@@ -494,6 +505,25 @@ class Pipeline:
             by_lang[r.lang].append(r)
         return by_lang
 
+    async def _filter_readers(self, plain: str, target: str, rs: list[Recipient]) -> list[Recipient]:
+        # Only skip confidently single-language content. A provider's single source label cannot
+        # establish that every part of a code-switched message is understood by this reader.
+        if not plain or not any(r.also_reads for r in rs):
+            return rs
+        det = await asyncio.to_thread(self.detector.detect, plain, target)
+        if det.mixed or det.verdict is not Verdict.OTHER or not det.lang:
+            return rs
+        kept = [r for r in rs if not r.reads(det.lang)]
+        self.metrics.inc("skip.reader_reads_source", len(rs) - len(kept))
+        return kept
+
+    async def _current_readers(self, meta: UnitMeta, lang: str, rs: list[Recipient]) -> list[Recipient]:
+        # Provider calls may take seconds: revocation, pause, or a changed language during that wait
+        # must take effect before delivery. Never add readers who weren't in the original request.
+        ids = {r.user_id for r in rs}
+        return [r for r in await self.resolver.resolve(meta.chat_id, meta.sender_id)
+                if r.user_id in ids and r.lang == lang]
+
     async def _process_text(self, meta: UnitMeta, items: list[BurstItem], *, edited: bool = False) -> None:
         ids = [i.message_id for i in items]
         async with self._message_locks(meta.chat_id, ids):
@@ -516,13 +546,20 @@ class Pipeline:
         glossary = tuple(await self.storage.glossary(meta.chat_id))
 
         async def one(lang: str, rs: list[Recipient]) -> None:
+            rs = await self._filter_readers(plain, lang, rs)
+            if not rs:
+                return
             out = await self._translate_for(meta, text_html, plain, lang, glossary=glossary)
             if out is None:
                 return
             translation, src = out
+            rs = await self._filter_readers(plain, lang, await self._current_readers(meta, lang, rs))
+            if not rs:
+                return
             d = Delivery(meta.chat_id, meta.chat_title, meta.thread_id, [i.message_id for i in items],
                          meta.sender_name, src, lang, translation, "text", plain, edited,
-                         show_sender=bool(meta.settings.get("show_sender")))
+                         show_sender=bool(meta.settings.get("show_sender")), sender_id=meta.sender_id,
+                         append_after=meta.append_after if not edited else None)
             if edited and not fresh:
                 await self.deliverer.update(d, rs, show_original=bool(meta.settings.get("show_original")))
             else:  # new message, or an edit that must not overwrite a burst's shared ephemeral
@@ -617,16 +654,35 @@ class Pipeline:
                     parts.append((icon if el.plain else "") + tr)
             if not parts:
                 return
+            rs = await self._current_readers(meta, lang, rs)
+            caption_readers = await self._filter_readers(el.plain, lang, rs)
+            media_readers = await self._filter_readers(media_text.text if media_text else "", lang, rs)
             kind = {Kind.STICKER: "sticker", Kind.ANIMATED_STICKER: "sticker", Kind.VIDEO_STICKER: "sticker",
                     Kind.GIF: "gif", Kind.IMAGE: "image", Kind.VIDEO: "video", Kind.VOICE: "voice"}.get(el.kind,
                                                                                                        "caption")
-            d = Delivery(meta.chat_id, meta.chat_title, meta.thread_id, [msg.message_id], meta.sender_name, src, lang,
-                         "\n".join(parts), kind, el.plain or (media_text.text if media_text else None), edited,
-                         show_sender=bool(meta.settings.get("show_sender")))
-            if edited:
-                await self.deliverer.update(d, rs, show_original=bool(meta.settings.get("show_original")))
-            else:
-                await self.deliverer.deliver(d, rs, show_original=bool(meta.settings.get("show_original")))
+            async def deliver_reader(r: Recipient) -> None:
+                selected = list(parts)
+                originals: list[str] = []
+                if cap and r in caption_readers:
+                    originals.append(el.plain)
+                if len(parts) > int(bool(cap)) and r in media_readers and media_text:
+                    originals.append(media_text.text)
+                if cap and r not in caption_readers:
+                    selected = selected[1:]
+                if len(parts) > int(bool(cap)) and r not in media_readers:
+                    selected = selected[:-1]
+                if not selected:
+                    return
+                d = Delivery(meta.chat_id, meta.chat_title, meta.thread_id, [msg.message_id], meta.sender_name,
+                             src, lang, "\n".join(selected), kind,
+                             "\n".join(originals) or None, edited,
+                             show_sender=bool(meta.settings.get("show_sender")))
+                if edited:
+                    await self.deliverer.update(d, [r], show_original=bool(meta.settings.get("show_original")))
+                else:
+                    await self.deliverer.deliver(d, [r], show_original=bool(meta.settings.get("show_original")))
+
+            await asyncio.gather(*(deliver_reader(r) for r in rs))
 
         await asyncio.gather(*(one(lang, rs) for lang, rs in by_lang.items()))
         await self.storage.update_message(meta.chat_id, msg.message_id, status="done")

@@ -146,7 +146,9 @@ async def test_language_change_isolated_and_revocation(h: Harness) -> None:
     await h.send(group_message("Que locura jajaja 😂 otra vez", sender=SPANISH_SPEAKER))
     await h.idle()
     assert len(h.tg.ephemeral_to(HINDI)) == 1  # revoked: no more translations
-    assert len(h.tg.ephemeral_to(OWNER)) == 2
+    assert h.tg.ephemeral_edits_to(HINDI) == []
+    assert len(h.tg.ephemeral_to(OWNER)) == 1
+    assert len(h.tg.ephemeral_edits_to(OWNER)) == 1  # same sender extends owner's bubble
 
 
 async def test_pause_and_mute(h: Harness) -> None:
@@ -602,3 +604,131 @@ async def test_group_daily_limit_protects_the_shared_quota(tmp_path: Path, detec
         assert len(tg.ephemeral_to(OWNER)) == 1 and app.metrics.counters.get("skip.group_daily_limit") == 1
     finally:
         await app.stop()
+
+
+async def test_readers_skip_languages_they_also_read(h: Harness) -> None:
+    await h.app.storage.upsert_user(HINDI, also_reads="es")
+    await h.send(group_message("¿Alguien sabe si mañana estará abierto? 😂", sender=SPANISH_SPEAKER))
+    await h.idle()
+    assert h.tg.ephemeral_to(HINDI) == [] and len(h.tg.ephemeral_to(OWNER)) == 1
+
+
+async def test_all_readers_understand_source_spends_no_provider_quota(h: Harness) -> None:
+    for uid in (OWNER, HINDI):
+        await h.app.storage.upsert_user(uid, also_reads="es")
+    await h.send(group_message("¿Alguien sabe si mañana estará abierto? 😂", sender=SPANISH_SPEAKER))
+    await h.idle()
+    assert not h.gemini.jobs and not h.deepl.jobs
+    assert not h.tg.ephemeral_to(OWNER) and not h.tg.ephemeral_to(HINDI)
+
+
+async def test_additional_reading_does_not_hide_mixed_language_content(h: Harness) -> None:
+    await h.app.storage.upsert_user(HINDI, also_reads="es")
+    await h.send(group_message("Mañana voy, but I'm not sure about the time", sender=SPANISH_SPEAKER))
+    await h.idle()
+    assert len(h.tg.ephemeral_to(HINDI)) == 1
+    assert h.tg.public_group_output() == []
+
+
+async def test_revocation_during_provider_call_blocks_delivery(h: Harness, monkeypatch: pytest.MonkeyPatch) -> None:
+    pipeline = h.app.pipeline
+    assert pipeline is not None
+    translate = pipeline._translate_for
+
+    async def revoke(*args: Any, **kwargs: Any) -> Any:
+        result = await translate(*args, **kwargs)
+        await h.app.storage.set_approved(HINDI, False, by=OWNER)
+        return result
+
+    monkeypatch.setattr(pipeline, "_translate_for", revoke)
+    await h.send(group_message("¿Alguien sabe si mañana estará abierto? 😂", sender=SPANISH_SPEAKER))
+    await h.idle()
+    assert not h.tg.ephemeral_to(HINDI) and len(h.tg.ephemeral_to(OWNER)) == 1
+
+
+async def test_reading_picker_callback_saves_and_returns_to_settings(h: Harness) -> None:
+    from tests.test_billing import press
+
+    for data in ("also:menu", "also:page:2", "also:tog:ja:2", "me:orig", "also:done"):
+        await h.dp.feed_update(h.app.bot, Update.model_validate({"update_id": 987, **press(HINDI, data)}))
+    user = await h.app.storage.get_user(HINDI)
+    assert user and user.also_reads_set == {"ja"} and user.show_original
+    owner = await h.app.storage.get_user(OWNER)
+    assert owner is None or (not owner.also_reads_set and not owner.show_original)
+    assert h.tg.public_group_output() == []
+
+
+async def test_personal_show_original(h: Harness) -> None:
+    await h.app.storage.upsert_user(OWNER, show_original=True)
+    await h.send(group_message("¿Alguien sabe si mañana estará abierto? 😂", sender=SPANISH_SPEAKER))
+    await h.idle()
+    text = h.tg.ephemeral_to(OWNER)[0].params["text"]
+    assert text.startswith("<blockquote>¿Alguien sabe") and "Does anyone know" in text
+    assert "<blockquote>" not in h.tg.ephemeral_to(HINDI)[0].params["text"]  # only for who asked
+
+
+async def test_same_sender_run_grows_one_bubble(h: Harness) -> None:
+    """Less noise: consecutive messages of one sender extend the reader's last translation in place."""
+    await h.send(group_message("¿Alguien sabe si mañana estará abierto? 😂", sender=SPANISH_SPEAKER))
+    await h.idle()
+    await h.send(group_message("Que locura jajaja 😂", sender=SPANISH_SPEAKER))
+    await h.idle()
+    assert len(h.tg.ephemeral_to(OWNER)) == 1  # still one bubble
+    [edit] = h.tg.ephemeral_edits_to(OWNER)
+    assert "Does anyone know" in edit.params["text"] and "That's crazy hahaha" in edit.params["text"]
+    # someone else speaks: the next message starts a new bubble
+    await h.send(group_message("ok 👍 see you", sender=OUTSIDER))
+    await h.send(group_message("Que locura jajaja 😂", sender=SPANISH_SPEAKER))
+    await h.idle()
+    assert len(h.tg.ephemeral_to(OWNER)) == 2
+
+
+async def test_edit_of_appended_original_preserves_other_translation(h: Harness) -> None:
+    first = group_message("¿Alguien sabe si mañana estará abierto? 😂", sender=SPANISH_SPEAKER)
+    second = group_message("Que locura jajaja 😂", sender=SPANISH_SPEAKER)
+    await h.send(first)
+    await h.idle()
+    await h.send(second)
+    await h.idle()
+    assert len(h.tg.ephemeral_edits_to(OWNER)) == 1
+    first["text"] = "Que locura jajaja 😂 otra vez"
+    await h.send(first, edited=True)
+    await h.idle()
+    # The shared bubble still contains both originals; a marked correction is sent separately.
+    assert len(h.tg.ephemeral_edits_to(OWNER)) == 1
+    assert len(h.tg.ephemeral_to(OWNER)) == 2
+    assert "✏️" in h.tg.ephemeral_to(OWNER)[-1].params["text"]
+    assert "That's crazy hahaha" in h.tg.ephemeral_edits_to(OWNER)[0].params["text"]
+
+
+@pytest.mark.parametrize("also_reads,has_caption,has_media", [("es", False, True), ("en", True, False),
+                                                             ("es,en", False, False)])
+async def test_caption_and_media_reading_preferences_are_independent(
+    h: Harness, monkeypatch: pytest.MonkeyPatch, also_reads: str, has_caption: bool, has_media: bool,
+) -> None:
+    from types import SimpleNamespace
+
+    from translator_bot.media.processor import MediaText
+
+    pipeline = h.app.pipeline
+    assert pipeline is not None
+    monkeypatch.setattr(pipeline.s, "media_enabled", True)
+
+    async def extract(**kwargs: Any) -> MediaText:
+        return MediaText(True, "The meeting has been moved to Thursday.", "en", 1.0,
+                         {"hi": "MEDIA_ONLY", "en": ""}, "vision")
+
+    monkeypatch.setattr(pipeline, "media", SimpleNamespace(extract=extract))
+    await h.app.storage.upsert_user(HINDI, also_reads=also_reads, show_original=True)
+    await h.send(group_message(sender=SPANISH_SPEAKER, caption="¿Alguien sabe si mañana estará abierto? 😂",
+                               extra={"photo": [{"file_id": "p", "file_unique_id": "pu", "width": 100,
+                                                   "height": 100}]}))
+    await h.idle()
+    texts = [c.params["text"] for c in h.tg.ephemeral_to(HINDI)]
+    assert bool(texts) == (has_caption or has_media)
+    if texts:
+        assert ("क्या किसी को पता है" in texts[0]) == has_caption
+        assert ("MEDIA_ONLY" in texts[0]) == has_media
+        assert ("¿Alguien sabe" in texts[0]) == has_caption
+        assert ("The meeting has been moved" in texts[0]) == has_media
+    assert h.tg.public_group_output() == []

@@ -126,6 +126,11 @@ MIGRATIONS: list[str] = [
     ALTER TABLE user_chat ADD COLUMN approved_by INTEGER;
     ALTER TABLE user_chat ADD COLUMN seen INTEGER NOT NULL DEFAULT 0;
     """,
+    # 5: personal reading preferences (never amend an already released migration)
+    """
+    ALTER TABLE users ADD COLUMN also_reads TEXT NOT NULL DEFAULT '';
+    ALTER TABLE users ADD COLUMN show_original INTEGER NOT NULL DEFAULT 0;
+    """,
 ]
 
 DEFAULT_CHAT_SETTINGS: dict[str, Any] = {
@@ -162,6 +167,12 @@ class User:
     private_credit: int = 0  # purchased private-chat translations
     lifetime: bool = False  # bought unlimited
     free_pass: bool = False  # owner granted free lifetime use (/approvefree)
+    also_reads: str = ""  # comma-separated languages they read besides their own (never translated for them)
+    show_original: bool = False  # quote the original above each translation
+
+    @property
+    def also_reads_set(self) -> frozenset[str]:
+        return frozenset(c for c in self.also_reads.split(",") if c)
 
     @property
     def effective_lang(self) -> str | None:
@@ -235,6 +246,7 @@ class Storage:
             lang_guess=row["lang_guess"], tg_lang=row["tg_lang"],
             private_used=int(row["private_used"]), private_credit=int(row["private_credit"]),
             lifetime=bool(row["lifetime"]), free_pass=bool(row["free_pass"]),
+            also_reads=row["also_reads"] or "", show_original=bool(row["show_original"]),
         )
 
     async def get_user(self, user_id: int) -> User | None:
@@ -244,7 +256,7 @@ class Storage:
 
     async def upsert_user(self, user_id: int, **fields: Any) -> User:
         allowed = {"first_name", "lang", "onboarded", "approved", "approved_by", "approved_at", "paused", "started",
-                   "dm_fallback", "inline_lang", "default_notice_sent", "lang_guess", "tg_lang", "free_pass"}
+                   "dm_fallback", "inline_lang", "default_notice_sent", "lang_guess", "tg_lang", "free_pass", "also_reads", "show_original"}
         bad = set(fields) - allowed
         if bad:
             raise ValueError(f"unknown user fields: {bad}")

@@ -111,6 +111,8 @@ class FakeTelegram:
                     "file_path": f"files/{fid}"}
         if name in ("EditMessageText", "EditMessageReplyMarkup"):
             return True
+        if name == "EditEphemeralMessageText" and params["receiver_user_id"] in self.fail_ephemeral_for:
+            raise TelegramBadRequest(method=method, message="Bad Request: ephemeral message can't be edited")
         if name == "SendInvoice":
             return {"message_id": next(_ids), "date": int(time.time()),
                     "chat": {"id": params["chat_id"], "type": "private"},

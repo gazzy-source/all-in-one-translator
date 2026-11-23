@@ -18,6 +18,7 @@ import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
+from translator_bot.languages import same_language
 from translator_bot.storage import Storage, User
 
 log = logging.getLogger(__name__)
@@ -32,6 +33,12 @@ class Recipient:
     using_default: bool  # never chose a language -> English default (user informed once)
     dm_fallback: bool  # consented to private-chat fallback if ephemeral delivery fails
     notice_pending: bool
+    also_reads: frozenset[str] = frozenset()  # languages they read anyway: never translated for them
+    show_original: bool = False  # personal preference: quote the original above the translation
+
+    def reads(self, lang: str | None) -> bool:
+        """Explicit additional reading languages; Chinese script variants stay distinct."""
+        return any(same_language(lang, c) for c in self.also_reads)
 
 
 class MembershipCache:
@@ -143,5 +150,6 @@ class RecipientResolver:
             out.append(Recipient(
                 user_id=u.user_id, lang=u.effective_lang or self.default_lang, using_default=using_default,
                 dm_fallback=u.dm_fallback and u.started, notice_pending=using_default and not u.default_notice_sent,
+                also_reads=u.also_reads_set, show_original=u.show_original,
             ))
         return out

@@ -5,6 +5,37 @@ Legend: ✅ done & mock-tested · 🟢 live-verified · ⏳ pending live verific
 
 ## Phases
 
+### 2026-11-23 — completion of pending reader preferences and consecutive bubbles
+
+* Server inspection: `/opt/all-in-one-translator`, image/package **1.3.0**, commit `8e6d5bb`, schema **3**;
+  container healthy, zero restarts. This inspection did not deploy changes or send Telegram messages.
+* Measured defects in the unfinished changes: upgrading a committed schema-4 database left the two new
+  user columns missing (`IndexError` on user lookup); the existing revocation test expected two sends
+  while the new behavior correctly used one send plus one edit. Review also found that one source label
+  could hide unfamiliar content in mixed messages/captioned media, and cached bubbles lacked ordering,
+  language and display-preference checks.
+* Fixes: separate migration **5**, conservative additional-language filtering before text provider calls,
+  independent caption/media filtering, complete paginated language picker, matching original-text quotes,
+  exact predecessor-ID checks, per-reader delivery locks, bounded bubble memory and edit invalidation.
+  Recipients are resolved again after translation to honor revocation, pause and changed preferences.
+* Regression evidence: version-3/4 upgrades preserve approvals, preferences and purchased credit;
+  `/forgetme` clears new preferences; understood source text for all readers makes **zero provider calls**;
+  consecutive text uses **one send plus an edit**; expired/oversized/incompatible bubbles start fresh;
+  membership failures trigger no resend or DM; corrections preserve the other shared translations.
+* Offline detection benchmark: **107 cases, 0% false-translate, 0% missed, 98.25% source-language accuracy,
+  6.54% deferred**. Measured 118.75 ms/message while test processes ran concurrently; this timing is not
+  comparable to the earlier isolated latency runs. No detector thresholds, model defaults or routing changed.
+* Final pre-commit validation (Windows, Python 3.13): **472 passed in 312.11 seconds** in one complete
+  `pytest -q --tb=short` run, including native media tests. `ruff check src tests`, strict `mypy`,
+  `bandit -q -c pyproject.toml -r src`, the corrected provider-smoke script's lint, and `git diff --check`
+  pass. Bandit needed access to its plugin cache outside the sandbox; it reported no security findings.
+  The Telegram test double now applies its failure flag to edits as well as sends, covering membership
+  failures on the append path. No new dependency audit; live production probes are recorded in L21 below.
+* Production log review: no WARNING/ERROR/CRITICAL events in the checked 15-minute window. These are
+  bounded health/provider checks, not a guarantee of latency or every real-device behavior.
+* Live acceptance of the new bubble UI, offline/reconnect behavior, and deployment remain pending.
+  Existing live-provider benchmark results below are historical, not new verification of this change.
+
 | Phase | Status |
 |---|---|
 | 1 Research & audit (repo was empty; Telegram Bot API 10.4; competitors; Gemini/DeepL docs; OCR options) | ✅ |
@@ -55,12 +86,14 @@ Legend: ✅ done & mock-tested · 🟢 live-verified · ⏳ pending live verific
 | L19 | Burmese group check (live providers): Unicode my→en 0.3 s ✓, Zawgyi my→en ✓ (DeepL normalizes it), ၇→7 ✓, en→my native script ✓. Burglish was read as Tagalog → DeepL nonsense: fixed with a romanized-Burmese lexicon (Gemini only). Found control-character junk passing validation (fixed). Burglish meaning stays ambiguous for some lines ("sar", "pyaw"); fast vs quality model no clear difference on 6 lines | 🟢 (Burglish ⚠ ambiguous) |
 | L20 | Mixed languages, live: 7 code-switched texts × readers (en/my/es) and 2 two-script stickers. Found and fixed: foreign phrase inside target-language text dropped; English sentence lost for Burmese readers; mixed stickers dropped/half-translated a line via vision (now text path). After: all correct (e.g. "WHEN THE TEACHER SAYS / Exam tomorrow"); trivial English ("ok bro") still skipped for Burmese readers; bench_detection unchanged | 🟢 |
 | L10 | Offline recipient: are ephemeral translations shown after reconnecting? after app restart? | ⏳ product decision depends on result |
+| L21 | 2026-11-23 production pre-commit check (still **v1.3.0**, schema 3): container healthy, zero restarts; `/healthz` ok, 4/4 text workers and 1/1 media worker alive, both provider breakers closed, zero blocked public-output attempts. SQLite `quick_check` ok; Telegram authentication succeeds; bot is administrator in the enabled group. Synthetic provider probes: Gemini fast and quality both translated contextual “ni modo” as “oh well” using the 3.5-flash-lite fallback (11,849 ms / 5,618 ms); vision read “NO WAY BRO” and translated to Spanish (6,584 ms); DeepL preserved URL/mention and converted 18:30 correctly (533 ms). Configured Gemini models available; DeepL usage 22,674/1,000,000 chars before the 46-char probe. Corrected the smoke script's old single-target vision shape and removed its test-fixture dependency. No Telegram messages sent; no production deployment. Gemini latency remains variable. | 🟢 service/provider checks; new UI still pending live acceptance |
 
 ## Measured so far (offline)
 
 * Language gate, 103-case corpus authored for this project (not held-out): false-translate 0%, missed 0%,
   source-language accuracy 98% (ms↔id confusion), deferred-to-LLM 6.8%, ~21–34 ms/message on this laptop.
-* Test suite: 383 passed (CI: ubuntu, Python 3.12 + 3.13) (all mocked; media tests use real ffmpeg/rlottie/RapidOCR on synthetic images).
+* Earlier recorded CI suite: 383 passed (Ubuntu, Python 3.12 + 3.13). Current local validation is recorded above
+  (all providers/Telegram mocked; media tests use real ffmpeg/rlottie/RapidOCR on synthetic images).
 * ruff, mypy --strict, bandit: clean. pip-audit: no known vulnerabilities.
 
 ## Known gaps / next steps

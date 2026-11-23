@@ -172,6 +172,8 @@ class BurstCoalescer:
             # latest meta (sender name etc.), but context stays "what was said before the burst's first line"
             if getattr(first_meta, "ctx_before", None) is not None and hasattr(meta, "ctx_before"):
                 meta.ctx_before = first_meta.ctx_before  # type: ignore[attr-defined]
+            if hasattr(first_meta, "append_after") and hasattr(meta, "append_after"):
+                meta.append_after = first_meta.append_after
             self._pending[key] = (items, meta, handle)
         items = self._pending[key][0]
         if len(items) >= self.max_items or sum(len(i.plain) for i in items) >= self.max_chars:

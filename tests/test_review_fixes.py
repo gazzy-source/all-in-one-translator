@@ -137,13 +137,12 @@ class _EditTransport:
 
 
 def _deliverer(transport: Any) -> Deliverer:
-    d = Deliverer.__new__(Deliverer)
-    d.transport, d.metrics = transport, Metrics()
+    d = Deliverer(transport, Storage(":memory:"), Metrics())
 
     async def deliver_one(*a: Any, **kw: Any) -> None:
         transport.sends.append(a)
 
-    d._deliver_one = deliver_one  # type: ignore[method-assign]
+    d._deliver_one_locked = deliver_one  # type: ignore[method-assign]
     return d
 
 
@@ -170,6 +169,7 @@ async def test_edit_of_expired_ephemeral_sends_fresh() -> None:
 class _R:
     user_id = 42
     lang = "en"
+    show_original = False
 
 
 # --- storage / config ----------------------------------------------------------------------------

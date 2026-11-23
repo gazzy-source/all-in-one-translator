@@ -9,13 +9,13 @@ other people's messages. Supported version: `main` (latest); older tags best-eff
 
 # Security review
 
-Scope: `src/translator_bot` at v0.2.1. Tools: bandit 1.9.4 (clean after reviewed suppressions), pip-audit 2.10.1
+Original audit scope: `src/translator_bot` at v0.2.1; subsequent changes are noted below. Tools: bandit 1.9.4 (clean after reviewed suppressions), pip-audit 2.10.1
 (no known vulnerabilities in dependencies), ruff security rules (S), mypy --strict, and a manual review.
 
 | Area | Risk | Mitigation | Verified by |
 |---|---|---|---|
 | Public output / group interference | Bug or future change posts in a group | `PublicOutputGuard` request middleware rejects every group-visible method (send/forward/copy/react/pin/edit/delete/chat action) unless it is an ephemeral send/edit to a specific receiver; no group-scope command menu | `tests/test_guard.py` (incl. live request chain), e2e `public_group_output() == []` |
-| Unauthorized recipients | Non-approved user receives translations | Recipients = owners ∪ approved IDs, re-checked per message; membership verified via `getChatMember` (cached ≤10 min, fail-closed) and invalidated by `chat_member` updates; DM fallback re-checks membership uncached and never fires on `not_member` | `test_e2e_group`, `test_regressions` |
+| Unauthorized recipients | Non-approved user receives translations | Recipients = (owners ∪ globally approved ∪ group-approved ∪ participants under that group's `/approveall`) ∩ members, re-checked per message and after translation; membership verified via `getChatMember` (cached ≤10 min, fail-closed) and invalidated by `chat_member` updates; DM fallback re-checks membership uncached and never fires on `not_member` | `test_e2e_group`, `test_regressions` |
 | Private-chat quota abuse | Strangers DM the bot to use up the free-tier quota groups depend on | `PRIVATE_ACCESS` (everyone \| approved); per-user `PRIVATE_PER_MIN`; per-user and total per-day caps for users who aren't approved (`PRIVATE_DAILY_LIMIT`, `PRIVATE_GLOBAL_DAILY_LIMIT`; in memory, reset on restart); private jobs share the bounded lanes. Replies go only to the sender's own private chat; group delivery still requires approval | `test_e2e_group::test_private_daily_limit_for_unapproved`, `test_private_start_access_denied_when_private_access_approved` |
 | Payment abuse | Forged/replayed payments, price tampering, double credit | Stars only (XTR); invoice payload binds product, buyer and price; pre-checkout re-validates them against the current plan; `successful_payment` re-checked (currency, buyer, amount) and credited once per `telegram_payment_charge_id` (unique key); mismatches are not credited and reported to owners; refunds revert the grant once; purchases survive `/forgetme`; in-flight translations are reserved so bursts can't overshoot the allowance | `test_billing` |
 | Unauthorized approval | Members approve themselves or others | `/approve`·`/revoke`·`/approveall`·`/revokeall` in a group require a bot owner or that group's creator/administrator (live `getChatMember`, 60 s cache, errors deny); group-admin approval is stored per group and never grants other groups; all are hidden commands with ephemeral answers | `test_e2e_group::test_group_admin_approves_members_for_their_group`, `test_group_admin_approveall_translates_for_everyone_there` |
@@ -36,6 +36,14 @@ Scope: `src/translator_bot` at v0.2.1. Tools: bandit 1.9.4 (clean after reviewed
 | Permissions | Over-privileged bot | Works as admin with **all rights off**; never needs delete/pin/edit rights | setup report |
 
 ## Remaining concerns
+
+Current reading-preference changes add migration 5 without rewriting migration 4. Additional-language skips
+are conservative for mixed/uncertain text and apply independently to captions and extracted media text.
+Recipient resolution is repeated after provider calls, before delivery, so a mid-request revocation or pause
+blocks delivery. Membership still uses the existing bounded cache and member-update invalidation.
+Consecutive-bubble text is kept only in bounded process memory. Per-reader locks serialize ephemeral updates;
+membership/forbidden edit errors do not trigger resends or private-chat fallback. Regression coverage:
+`test_reading_preferences.py` and `test_e2e_group.py`.
 
 * Free-tier providers may use submitted text to improve their services. For sensitive
   groups use paid tiers with no-training terms.
