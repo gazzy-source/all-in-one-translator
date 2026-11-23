@@ -14,6 +14,13 @@
 * **Help:** your language with its flag and where it comes from (your choice / automatic / default), how many
   groups translate for you, your private-chat plan, a "Not getting a translation?" checklist, and buttons
   (change language, settings, my groups, privacy).
+* **Write and read in the group without leaving it** (only you see any of it):
+  * reply **`/tr`** to any message — text, caption, sticker, GIF, voice — for a private translation into your
+    language (also while your translations are paused);
+  * **`/tr your text`** → your message in the language the group's readers use, with **📋 Copy** and
+    **✍️ Send** (opens inline mode with your text) buttons;
+  * **inline mode** (`@bot text`) offers translations into the languages your groups actually read (up to 3,
+    flagged), instead of only English.
 * **Language picker:** flags on every language; the first page lists the most used languages on Telegram; the
   reader's own language is always on it; "More languages" lists the rest A–Z.
 

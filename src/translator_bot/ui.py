@@ -75,6 +75,8 @@ def _how_lines(*, uid: int, bot_username: str, approved: bool, private_ok: bool,
         lines.append(f"📩 <b>Here</b> — send or forward text, stickers, GIFs, photos or voice (≤ {max_seconds} s)")
     if approved:
         lines.append("💬 <b>Groups</b> — translations appear right in the chat, visible <b>only to you</b>")
+        lines.append("↩️ <b>Reply /tr</b> to any message to translate it · <b>/tr your text</b> → the group's "
+                     "language, ready to copy or send (only you see it)")
     else:
         lines.append(f"💬 <b>Groups</b> — ask the owner to approve you · your ID <code>{uid}</code>")
     if inline_ok:

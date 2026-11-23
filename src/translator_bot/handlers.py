@@ -10,6 +10,7 @@ import json
 import logging
 import re
 import time
+from collections import Counter
 from typing import Any
 
 from aiogram import Bot, F, Router
@@ -17,11 +18,15 @@ from aiogram.exceptions import TelegramAPIError, TelegramBadRequest, TelegramRet
 from aiogram.filters import Command, CommandObject
 from aiogram.types import (
     BotCommand,
+    BotCommandScopeAllGroupChats,
     BotCommandScopeAllPrivateChats,
     BotCommandScopeChatMember,
     CallbackQuery,
     ChatMemberUpdated,
+    CopyTextButton,
     EphemeralMessageParameters,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
     InlineQuery,
     InlineQueryResultArticle,
     InlineQueryResultsButton,
@@ -71,6 +76,14 @@ OWNER_GROUP_COMMANDS = [  # registered per owner per group; hidden from everyone
     BotCommand(command="mute", description="Stop my translations here", is_ephemeral=True),
     BotCommand(command="unmute", description="Resume my translations here", is_ephemeral=True),
 ]
+# Every member: hidden (ephemeral) commands - nobody else sees the command or the answer.
+MEMBER_GROUP_COMMANDS = [
+    BotCommand(command="tr", description="Reply: translate for me · /tr text: write in the group's language",
+               is_ephemeral=True),
+    BotCommand(command="mute", description="Stop my translations here", is_ephemeral=True),
+    BotCommand(command="unmute", description="Resume my translations here", is_ephemeral=True),
+]
+OWNER_GROUP_COMMANDS.insert(0, MEMBER_GROUP_COMMANDS[0])
 
 
 def build_routers(app: App) -> list[Router]:
@@ -79,6 +92,8 @@ def build_routers(app: App) -> list[Router]:
 
 async def register_commands(app: App) -> None:
     await app.bot.set_my_commands(PRIVATE_COMMANDS, scope=BotCommandScopeAllPrivateChats())
+    with contextlib.suppress(TelegramAPIError):
+        await app.bot.set_my_commands(MEMBER_GROUP_COMMANDS, scope=BotCommandScopeAllGroupChats())
 
 
 async def register_owner_group_commands(app: App, chat_id: int) -> None:
@@ -200,6 +215,8 @@ def _group_router(app: App) -> Router:
             await app.storage.set_muted(uid, msg.chat.id, cmd == "mute")
             await ephemeral_reply(bot, msg, "🔕 Translations muted in this group." if cmd == "mute"
                                   else "🔔 Translations resumed in this group.")
+        elif cmd == "tr":
+            await _tr_command(app, bot, msg, arg)
         elif cmd in ("start", "language", "settings", "help") and await app.resolver.is_approved(uid):
             await ephemeral_reply(bot, msg, f'Settings live in our private chat: <a href="https://t.me/'
                                             f'{app.bot_username}?start=settings">open</a>.')
@@ -215,6 +232,137 @@ def _group_router(app: App) -> Router:
             await app.pipeline.on_edit(msg)
 
     return r
+
+
+async def _reply_targets(app: App, uid: int, chat_id: int | None = None) -> list[str]:
+    """Languages to write *into* so the other people understand: the reader languages of the group (or of all
+    the user's groups, for inline mode, which doesn't say which chat it is), most common first, minus the user's
+    own language. An explicit inline target (/settings) comes first. Cached briefly per user/chat."""
+    key = (uid, chat_id)
+    hit = app.reply_targets.get(key)
+    if hit is not None and time.monotonic() - hit[0] < 300:
+        return hit[1]
+    user = await app.storage.get_user(uid)
+    own = ((user.effective_lang if user else None) or app.s.default_target_lang).split("-")[0]
+    counts: Counter[str] = Counter()
+    try:
+        chats = [c for c in await app.storage.active_chats() if c.enabled and (chat_id is None or c.chat_id == chat_id)]
+        for c in chats[:20]:
+            if chat_id is None and not await app.membership.is_member(c.chat_id, uid):
+                continue
+            for rcp in await app.resolver.resolve(c.chat_id, uid):
+                counts[rcp.lang] += 1
+    except Exception:
+        log.debug("reply targets failed", exc_info=True)
+    out: list[str] = []
+    if user is not None and user.inline_lang:
+        out.append(user.inline_lang)
+    out += [lg for lg, _n in counts.most_common() if lg.split("-")[0] != own]
+    if not out and own != "en":
+        out.append("en")  # nobody else known yet: English is the safest bridge
+    seen: list[str] = []
+    for lg in out:
+        if lg not in seen:
+            seen.append(lg)
+    result = seen[:3]
+    app.reply_targets[key] = (time.monotonic(), result)
+    if len(app.reply_targets) > 10_000:
+        app.reply_targets.clear()
+    return result
+
+
+async def _translate_text(app: App, text: str, target: str, *, purpose: str = "inline",
+                          deadline_s: float | None = None) -> tuple[str | None, str]:
+    """Plain text -> (translation or None, reason: "" | "same" | "failed")."""
+    assert app.detector is not None and app.orchestrator is not None
+    det = await asyncio.to_thread(app.detector.detect, text, target)
+    if det.verdict is Verdict.TARGET:
+        return None, "same"
+    job = TranslationJob(text=text, target=target, source_hint=det.lang if det.verdict is Verdict.OTHER else None,
+                         romanized=det.romanized, mixed=det.mixed, unsure=det.verdict is Verdict.UNSURE)
+    try:
+        res = await app.orchestrator.translate(job, det, purpose=purpose,  # type: ignore[arg-type]
+                                               deadline_s=deadline_s or app.s.inline_timeout_s)
+    except Exception:
+        log.warning("translation failed", exc_info=True)
+        return None, "failed"
+    if res is None:
+        return None, "failed"
+    if not res.needs_translation or not res.translation:
+        return None, "same"
+    return res.translation, ""
+
+
+async def _send_ephemeral(app: App, msg: Message, text: str, *, reply_to: int | None = None,
+                          markup: InlineKeyboardMarkup | None = None, plain: bool = False) -> None:
+    """Only the command's sender sees this (never the group)."""
+    if msg.from_user is None:
+        return
+    reply = (ReplyParameters(message_id=reply_to, allow_sending_without_reply=True) if reply_to
+             else ReplyParameters(ephemeral_message_id=msg.ephemeral_message_id) if msg.ephemeral_message_id else None)
+    with contextlib.suppress(TelegramAPIError):
+        await app.bot.send_message(chat_id=msg.chat.id, text=text, reply_parameters=reply, reply_markup=markup,
+                                   parse_mode=None if plain else "HTML",
+                                   message_thread_id=msg.message_thread_id if msg.is_topic_message else None,
+                                   link_preview_options=LinkPreviewOptions(is_disabled=True),
+                                   ephemeral_message_parameters=EphemeralMessageParameters(
+                                       receiver_user_id=msg.from_user.id))
+
+
+async def _tr_command(app: App, bot: Bot, msg: Message, arg: str) -> None:
+    """Hidden /tr in a group (only the sender sees the command and the answer):
+    * as a reply: translate that message (text, caption, sticker, GIF, voice...) into my language, for me only -
+      also when my translations are paused or muted here;
+    * with text: translate what I want to say into the group's language, with Copy and Send buttons, so I
+      never leave the chat."""
+    if msg.from_user is None or app.pipeline is None:
+        return
+    uid = msg.from_user.id
+    if not await app.resolver.is_approved(uid):
+        await _send_ephemeral(app, msg, "🔒 /tr is for members approved by the bot owner.")
+        return
+    if not app.private_limiter.try_acquire(uid):
+        await _send_ephemeral(app, msg, "⏳ That's a lot at once — give me a few seconds.")
+        return
+    user = await app.storage.get_user(uid)
+    mine = (user.effective_lang if user else None) or app.s.default_target_lang
+    text = arg.strip()
+    if text:
+        targets = await _reply_targets(app, uid, msg.chat.id) or ["en"]
+        target = targets[0]
+        out, why = await _translate_text(app, truncate(text, app.s.max_text_chars), target, purpose="group",
+                                         deadline_s=10.0)
+        if out is None:
+            await _send_ephemeral(app, msg, f"✅ That's already {html.escape(lang_name(target))}." if why == "same"
+                                  else "⚠️ Couldn't translate right now — try again in a moment.")
+            return
+        out = truncate(out, 3900)
+        kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="📋 Copy", copy_text=CopyTextButton(text=truncate(out, 256))),
+            InlineKeyboardButton(text="✍️ Send", switch_inline_query_current_chat=truncate(text, 200)),
+        ]])
+        await _send_ephemeral(app, msg, f"{ui.flag(target)} {out}", markup=kb, plain=True)
+        return
+    target_msg = msg.reply_to_message
+    if target_msg is None or (msg.is_topic_message and target_msg.message_id == msg.message_thread_id):
+        await _send_ephemeral(app, msg, "Reply <code>/tr</code> to a message to translate it for you, or write "
+                                        "<code>/tr your text</code> to get it in the group's language.")
+        return
+    el = classify(target_msg, bot_id=app.bot_id, settings={}, media_enabled=app.s.media_enabled)
+    if isinstance(el, Skip):
+        await _send_ephemeral(app, msg, "🤷 Nothing to translate in that message.", reply_to=target_msg.message_id)
+        return
+    if len(el.plain) > app.s.max_text_chars:
+        el = Eligible(el.kind, html_escape_truncate(el.plain, app.s.max_text_chars),
+                      truncate(el.plain, app.s.max_text_chars), el.has_media)
+    try:
+        res = await asyncio.wait_for(app.pipeline.translate_private(target_msg, el, mine), timeout=60)
+    except Exception:
+        log.warning("/tr failed", exc_info=True)
+        res = PrivateResult(None, None, "failed")
+    body = res.text or _PRIVATE_REASONS.get(res.reason, _PRIVATE_REASONS["no_text"]).format(
+        lang=html.escape(lang_name(mine)), secs=int(app.s.max_media_seconds))
+    await _send_ephemeral(app, msg, body, reply_to=target_msg.message_id)
 
 
 async def _glossary_cmd(app: App, chat_id: int, arg: str) -> str:
@@ -984,42 +1132,34 @@ def _inline_router(app: App) -> Router:
             await q.answer([], cache_time=5, is_personal=True, button=InlineQueryResultsButton(
                 text="Slow down a little — try again in a moment", start_parameter="inline"))
             return
-        user = await app.storage.get_user(uid)
-        target = (user.inline_lang if user else None) or "en"
-        assert app.detector is not None and app.orchestrator is not None
-        det = await asyncio.to_thread(app.detector.detect, query, target)
-        rid = hashlib.sha256(f"{target}:{query}".encode()).hexdigest()[:32]
-        if det.verdict is Verdict.TARGET:
-            await q.answer([InlineQueryResultArticle(
-                id=f"same{rid}", title=f"Already in {lang_name(target)}", description=truncate(query, 120),
-                input_message_content=InputTextMessageContent(message_text=query, parse_mode=None))],
-                cache_time=300, is_personal=True)
-            return
-        job = TranslationJob(text=query, target=target, source_hint=det.lang if det.verdict is Verdict.OTHER else None,
-                             romanized=det.romanized, mixed=det.mixed, unsure=det.verdict is Verdict.UNSURE)
-        try:
-            res = await app.orchestrator.translate(job, det, purpose="inline", deadline_s=app.s.inline_timeout_s)
-        except Exception:
-            log.exception("inline translation failed")
-            res = None
+        # write into the languages the user's groups read (explicit inline target first), up to 3, in parallel
+        targets = await _reply_targets(app, uid) or ["en"]
+        outs = await asyncio.gather(*(_translate_text(app, query, t) for t in targets))
         if latest.get(uid) != q.id:
             return  # superseded while translating
-        if res is None:
+        rid = hashlib.sha256(f"{','.join(targets)}:{query}".encode()).hexdigest()[:24]
+        results: list[Any] = []
+        for t, (out, _why) in zip(targets, outs, strict=True):
+            if out:
+                translation = truncate(out, 4096)
+                results.append(InlineQueryResultArticle(
+                    id=f"t{t}{rid}"[:64], title=f"{ui.flag(t)} {truncate(translation, 110)}",
+                    description=f"{lang_name(t)} · tap to send",
+                    input_message_content=InputTextMessageContent(message_text=translation, parse_mode=None)))
+        if results:
+            first = results[0].input_message_content.message_text
+            both = truncate(f"{first}\n\n— {query}", 4096)
+            results.append(InlineQueryResultArticle(
+                id=f"b{rid}", title="Translation + original", description=truncate(both.replace("\n", " "), 120),
+                input_message_content=InputTextMessageContent(message_text=both, parse_mode=None)))
+        elif all(why == "same" for _o, why in outs):
+            results.append(InlineQueryResultArticle(
+                id=f"same{rid}", title=f"Already in {lang_name(targets[0])}", description=truncate(query, 120),
+                input_message_content=InputTextMessageContent(message_text=query, parse_mode=None)))
+        else:
             await q.answer([], cache_time=5, is_personal=True, button=InlineQueryResultsButton(
                 text="Translation unavailable right now — try again", start_parameter="inline"))
             return
-        src = res.source_lang or det.lang
-        pair = f"{lang_name(src)} → {lang_name(target)}" if src else lang_name(target)
-        translation = truncate(res.translation, 4096)
-        both = truncate(f"{res.translation}\n\n— {query}", 4096)
-        results: list[Any] = [
-            InlineQueryResultArticle(
-                id=f"t{rid}", title=truncate(translation, 120), description=f"{pair} · tap to send",
-                input_message_content=InputTextMessageContent(message_text=translation, parse_mode=None)),
-            InlineQueryResultArticle(
-                id=f"b{rid}", title="Translation + original", description=truncate(both.replace("\n", " "), 120),
-                input_message_content=InputTextMessageContent(message_text=both, parse_mode=None)),
-        ]
         with contextlib.suppress(TelegramAPIError):
             await q.answer(results, cache_time=300, is_personal=True)
         app.metrics.inc("inline.answered")

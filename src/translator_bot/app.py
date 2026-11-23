@@ -99,7 +99,8 @@ class App:
                          pack_size=settings.stars_pack_size, pack_price=settings.stars_pack_price,
                          lifetime_price=settings.stars_lifetime_price)
         self.private_daily: dict[int, tuple[str, int]] = {}
-        self.private_pending: dict[int, int] = {}  # user id -> private translations in flight (plan reservation)  # user id -> (UTC day, count); unapproved users only
+        self.private_pending: dict[int, int] = {}
+        self.reply_targets: dict[tuple[int, int | None], tuple[float, list[str]]] = {}  # /tr + inline targets  # user id -> private translations in flight (plan reservation)  # user id -> (UTC day, count); unapproved users only
         self.bot_username = ""
         self.bot_id = settings.bot_id
         self._tasks: list[asyncio.Task[None]] = []

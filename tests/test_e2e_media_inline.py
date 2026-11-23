@@ -152,9 +152,9 @@ async def test_inline_translates_to_english(mh: Harness) -> None:
     await mh.dp.feed_update(mh.app.bot, inline_update(OWNER, "Que locura jajaja 😂"))
     [a] = answers(mh.tg)
     first = a["results"][0]
-    assert first["title"] == "That's crazy hahaha 😂"
+    assert first["title"] == "🇬🇧 That's crazy hahaha 😂"  # flag of the language it's written into
     assert first["input_message_content"]["message_text"] == "That's crazy hahaha 😂"  # sends the real text
-    assert "→ English" in first["description"] and a["is_personal"] is True
+    assert first["description"].startswith("English") and a["is_personal"] is True
     assert "parse_mode" not in first["input_message_content"]  # plain text: no markdown breakage
 
 
@@ -212,3 +212,52 @@ async def test_caption_edit_keeps_image_text_and_reuses_the_reading(mh: Harness)
     assert "funny sign" in text and "¡NI DE BROMA!" in text  # caption updated, image text kept
     assert len(mh.vision.calls) == calls_before  # type: ignore[attr-defined]  # no second vision call
     assert len(mh.tg.ephemeral_to(OWNER)) == 1  # edited in place, not a new message
+
+
+async def test_inline_offers_the_languages_the_group_reads(mh: Harness) -> None:
+    """A Spanish speaker typing "@bot ..." in a group with Hindi and English readers gets both, flagged."""
+    await mh.app.storage.set_approved(HINDI, True, by=OWNER)
+    await mh.app.storage.upsert_user(HINDI, lang="hi")
+    await mh.app.storage.set_approved(OUTSIDER, True, by=OWNER)
+    await mh.app.storage.upsert_user(OUTSIDER, lang="en")
+    await mh.dp.feed_update(mh.app.bot, inline_update(OWNER, "Que locura jajaja 😂", "multi"))
+    [a] = answers(mh.tg)
+    titles = [r["title"] for r in a["results"]]
+    assert any(t.startswith("🇮🇳") for t in titles) and any(t.startswith("🇬🇧") for t in titles)
+    assert titles[-1] == "Translation + original"
+
+
+async def test_tr_reply_translates_for_me_only(mh: Harness) -> None:
+    original = group_message("Que locura jajaja 😂", sender=SPANISH_SPEAKER)
+    await mh.send(original)
+    await mh.idle()
+    await mh.app.storage.upsert_user(OWNER, lang="en", paused=True)  # paused: /tr still works on demand
+    cmd = group_message("/tr", sender=OWNER, reply_to=original)
+    cmd["entities"] = [{"type": "bot_command", "offset": 0, "length": 3}]
+    await mh.send(cmd)
+    got = mh.tg.ephemeral_to(OWNER)
+    assert got and got[-1].params["text"] == "That's crazy hahaha 😂"
+    assert got[-1].params["reply_parameters"]["message_id"] == original["message_id"]
+    assert mh.tg.public_group_output() == []
+
+
+async def test_tr_text_gives_copy_and_send_in_the_groups_language(mh: Harness) -> None:
+    await mh.app.storage.set_approved(OUTSIDER, True, by=OWNER)
+    await mh.app.storage.upsert_user(OUTSIDER, lang="en")
+    cmd = group_message("/tr Que locura jajaja 😂", sender=OWNER)  # OWNER reads Spanish; the group reads English
+    cmd["entities"] = [{"type": "bot_command", "offset": 0, "length": 3}]
+    await mh.send(cmd)
+    [eph] = mh.tg.ephemeral_to(OWNER)
+    assert eph.params["text"] == "🇬🇧 That's crazy hahaha 😂"
+    [row] = eph.params["reply_markup"]["inline_keyboard"]
+    assert row[0]["copy_text"]["text"] == "That's crazy hahaha 😂"
+    assert row[1]["switch_inline_query_current_chat"] == "Que locura jajaja 😂"
+    assert mh.tg.public_group_output() == []
+
+
+async def test_tr_needs_approval(mh: Harness) -> None:
+    cmd = group_message("/tr hola", sender=OUTSIDER)
+    cmd["entities"] = [{"type": "bot_command", "offset": 0, "length": 3}]
+    await mh.send(cmd)
+    [eph] = mh.tg.ephemeral_to(OUTSIDER)
+    assert "approved" in eph.params["text"] and mh.gemini.jobs == []

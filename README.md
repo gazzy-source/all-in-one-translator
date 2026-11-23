@@ -88,8 +88,12 @@ Maria: ¿Alguien sabe si mañana             Maria: ¿Alguien sabe si mañana   
   translations aren't metered. Payments are validated before charging, credited exactly once, refundable
   (`/refund`), and `/paysupport` reaches the owner. All amounts are configurable (`.env.example`).
 
-### Inline translator everywhere
-- Type `@your_bot text` in any chat → tap the translated preview to send it. Debounced per keystroke, cached.
+### Reply in the group's language, without leaving the group
+- Reply **`/tr`** to any message for a translation only you see (works on stickers, GIFs and voice too).
+- **`/tr your text`** → your message in the group's language with **Copy** / **Send** buttons. `/tr` is a hidden
+  command: nobody else sees it or the answer.
+- Type `@your_bot text` in any chat → tap one of the translations (into the languages your groups read) to send
+  it. Debounced per keystroke, cached.
 
 ### Built to run for free
 - **Google Gemini (free tier)** for slang, context, Hinglish and vision/speech; **DeepL API Free** (1M chars/month)
