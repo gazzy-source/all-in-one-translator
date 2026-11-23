@@ -235,6 +235,7 @@ async def test_tr_reply_translates_for_me_only(mh: Harness) -> None:
     cmd = group_message("/tr", sender=OWNER, reply_to=original)
     cmd["entities"] = [{"type": "bot_command", "offset": 0, "length": 3}]
     await mh.send(cmd)
+    await mh.idle()
     got = mh.tg.ephemeral_to(OWNER)
     assert got and got[-1].params["text"] == "That's crazy hahaha 😂"
     assert got[-1].params["reply_parameters"]["message_id"] == original["message_id"]
@@ -247,6 +248,7 @@ async def test_tr_text_gives_copy_and_send_in_the_groups_language(mh: Harness) -
     cmd = group_message("/tr Que locura jajaja 😂", sender=OWNER)  # OWNER reads Spanish; the group reads English
     cmd["entities"] = [{"type": "bot_command", "offset": 0, "length": 3}]
     await mh.send(cmd)
+    await mh.idle()
     [eph] = mh.tg.ephemeral_to(OWNER)
     assert eph.params["text"] == "🇬🇧 That's crazy hahaha 😂"
     [row] = eph.params["reply_markup"]["inline_keyboard"]
@@ -261,3 +263,14 @@ async def test_tr_needs_approval(mh: Harness) -> None:
     await mh.send(cmd)
     [eph] = mh.tg.ephemeral_to(OUTSIDER)
     assert "approved" in eph.params["text"] and mh.gemini.jobs == []
+
+
+async def test_tr_respects_disabled_group(mh: Harness) -> None:
+    await mh.app.storage.upsert_chat(GROUP_ID, enabled=False)
+    mh.app.pipeline.invalidate_chat(GROUP_ID)  # type: ignore[union-attr]
+    cmd = group_message("/tr Que locura jajaja 😂", sender=OWNER)
+    cmd["entities"] = [{"type": "bot_command", "offset": 0, "length": 3}]
+    await mh.send(cmd)
+    await mh.idle()
+    [eph] = mh.tg.ephemeral_to(OWNER)
+    assert "switched off" in eph.params["text"] and mh.gemini.jobs == []

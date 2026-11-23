@@ -43,7 +43,7 @@ from translator_bot.app import App
 from translator_bot.detect import Verdict
 from translator_bot.eligibility import Eligible, Skip, classify
 from translator_bot.languages import lang_name, resolve_language, suggest_languages
-from translator_bot.pipeline import PrivateResult, html_escape_truncate
+from translator_bot.pipeline import PrivateResult, _media_file, html_escape_truncate
 from translator_bot.providers.base import TranslationJob
 from translator_bot.textutil import ContentKind, html_to_plain, normalize_for_key, profile_text, truncate
 
@@ -321,9 +321,27 @@ async def _tr_command(app: App, bot: Bot, msg: Message, arg: str) -> None:
     if not await app.resolver.is_approved(uid):
         await _send_ephemeral(app, msg, "🔒 /tr is for members approved by the bot owner.")
         return
+    # same gates as every group message: chat enabled + active, bot is admin, topic enabled, chat toggles
+    chat = await app.pipeline.chat(msg)
+    thread = msg.message_thread_id if msg.is_topic_message else None
+    if not (chat.enabled and chat.active and chat.bot_is_admin) or not await app.storage.topic_enabled(
+            msg.chat.id, thread):
+        await _send_ephemeral(app, msg, "⏸ Translation is switched off here.")
+        return
     if not app.private_limiter.try_acquire(uid):
         await _send_ephemeral(app, msg, "⏳ That's a lot at once — give me a few seconds.")
         return
+    reply = msg.reply_to_message
+    lane = app.pipeline.media_lane if (not arg.strip() and reply is not None and _media_file(reply)[0]) \
+        else app.pipeline.text_lane
+    if not await lane.submit(msg.chat.id, lambda: _tr_work(app, msg, arg, chat.settings),
+                             key=f"tr:{msg.chat.id}:{msg.message_id}"):
+        await _send_ephemeral(app, msg, "⏳ I'm busy right now — please try again in a moment.")
+
+
+async def _tr_work(app: App, msg: Message, arg: str, settings: dict[str, Any]) -> None:
+    assert msg.from_user is not None and app.pipeline is not None
+    uid = msg.from_user.id
     user = await app.storage.get_user(uid)
     mine = (user.effective_lang if user else None) or app.s.default_target_lang
     text = arg.strip()
@@ -348,7 +366,7 @@ async def _tr_command(app: App, bot: Bot, msg: Message, arg: str) -> None:
         await _send_ephemeral(app, msg, "Reply <code>/tr</code> to a message to translate it for you, or write "
                                         "<code>/tr your text</code> to get it in the group's language.")
         return
-    el = classify(target_msg, bot_id=app.bot_id, settings={}, media_enabled=app.s.media_enabled)
+    el = classify(target_msg, bot_id=app.bot_id, settings=settings, media_enabled=app.s.media_enabled)
     if isinstance(el, Skip):
         await _send_ephemeral(app, msg, "🤷 Nothing to translate in that message.", reply_to=target_msg.message_id)
         return
@@ -356,7 +374,7 @@ async def _tr_command(app: App, bot: Bot, msg: Message, arg: str) -> None:
         el = Eligible(el.kind, html_escape_truncate(el.plain, app.s.max_text_chars),
                       truncate(el.plain, app.s.max_text_chars), el.has_media)
     try:
-        res = await asyncio.wait_for(app.pipeline.translate_private(target_msg, el, mine), timeout=60)
+        res = await app.pipeline.translate_private(target_msg, el, mine)  # the lane bounds the time
     except Exception:
         log.warning("/tr failed", exc_info=True)
         res = PrivateResult(None, None, "failed")
