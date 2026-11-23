@@ -95,6 +95,7 @@ class Pipeline:
         self._chat_cache: dict[int, tuple[float, Chat]] = {}
         self._lang_votes: OrderedDict[int, deque[str]] = OrderedDict()  # approved sender -> recent languages
         self._participants: set[tuple[int, int]] = set()  # (chat, user) already stored as participant
+        self._group_daily: dict[int, tuple[str, int]] = {}  # chat -> (UTC day, translated messages)
 
     def start(self) -> None:
         self.text_lane.start()
@@ -164,6 +165,9 @@ class Pipeline:
             return
         if len(res.plain) > self.s.max_text_chars:
             res = Eligible(res.kind, html_escape_truncate(res.plain, self.s.max_text_chars), truncate(res.plain, self.s.max_text_chars), res.has_media)
+        if not self._group_quota_ok(msg.chat.id):
+            self.metrics.inc("skip.group_daily_limit")
+            return
         if not await self.storage.claim_message(msg.chat.id, msg.message_id, thread, sid,
                                                 content_hash(res.plain + str(res.kind.value) + (_media_file(msg)[1] or ""))):
             self.metrics.inc("skip.duplicate")
@@ -279,6 +283,22 @@ class Pipeline:
         task = asyncio.create_task(later())
         self._bg.add(task)
         task.add_done_callback(self._bg.discard)
+
+    def _group_quota_ok(self, chat_id: int) -> bool:
+        """GROUP_DAILY_LIMIT translated messages per group per UTC day (in memory; a restart resets it)."""
+        limit = self.s.group_daily_limit
+        if limit <= 0:
+            return True
+        today = time.strftime("%Y-%m-%d", time.gmtime())
+        day, n = self._group_daily.get(chat_id, (today, 0))
+        if day != today:
+            n = 0
+        if n >= limit:
+            return False
+        self._group_daily[chat_id] = (today, n + 1)
+        if len(self._group_daily) > 50_000:
+            self._group_daily = {k: v for k, v in self._group_daily.items() if v[0] == today}
+        return True
 
     def _spawn(self, coro: Awaitable[None]) -> None:
         task = asyncio.ensure_future(coro)

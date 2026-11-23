@@ -84,11 +84,17 @@ class RecipientResolver:
         return user_id in self.owner_ids
 
     async def is_approved(self, user_id: int) -> bool:
-        """Approved anywhere: by a bot owner (all groups) or by the admins of at least one group."""
+        """Globally approved: a bot owner, or approved by a bot owner. Gates private-chat caps, inline mode and
+        everything outside groups. Group-admin approval is NOT counted (anyone can admin their own group)."""
         if self.is_owner(user_id):
             return True
         u = await self.storage.get_user(user_id)
-        return bool(u and u.approved) or await self.storage.is_chat_approved(user_id)
+        return bool(u and u.approved)
+
+    async def has_group_access(self, user_id: int) -> bool:
+        """Reader somewhere: globally approved, or approved by the admins of at least one group (for the
+        group-related private commands only: /groups, /pause, help display)."""
+        return await self.is_approved(user_id) or await self.storage.is_chat_approved(user_id)
 
     async def everyone_mode(self, chat_id: int) -> bool:
         """The group's admins approved everyone here (/approveall)."""

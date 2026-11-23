@@ -92,6 +92,7 @@ ADMIN_GROUP_COMMANDS = [
     BotCommand(command="revoke", description="Reply to a member: stop their translations here", is_ephemeral=True),
     BotCommand(command="approveall", description="Translations for everyone in this group", is_ephemeral=True),
     BotCommand(command="revokeall", description="Back to approving members one by one", is_ephemeral=True),
+    BotCommand(command="glossary", description="term = rendering (names, in-jokes) | -term", is_ephemeral=True),
     *MEMBER_GROUP_COMMANDS,
 ]
 SETUP_GUIDE = (
@@ -215,7 +216,7 @@ def _group_router(app: App) -> Router:
             return
         uid = msg.from_user.id
         is_owner = app.resolver.is_owner(uid)
-        group_admin = (cmd in ("approve", "revoke", "approveall", "revokeall") and not is_owner
+        group_admin = (cmd in ("approve", "revoke", "approveall", "revokeall", "glossary") and not is_owner
                        and await app.is_chat_admin(msg.chat.id, uid))
         if cmd in ("approveall", "revokeall"):
             if not (is_owner or group_admin):
@@ -519,12 +520,14 @@ def _private_router(app: App) -> Router:
         return False, False
 
     async def gate(msg: Message) -> bool:
-        """Group-translation features (groups, pause): approved users only."""
+        """Group-translation features (groups, pause): readers of at least one group."""
         ok, approved = await access(msg)
-        if ok and not approved:
-            assert msg.from_user is not None
+        if not ok or msg.from_user is None:
+            return False
+        reader = approved or await app.resolver.has_group_access(msg.from_user.id)
+        if not reader:
             await msg.answer(ui.ACCESS_DENIED.format(uid=msg.from_user.id))
-        return approved
+        return reader
 
     def prompt_language(uid: int) -> None:
         awaiting_lang[uid] = time.monotonic()

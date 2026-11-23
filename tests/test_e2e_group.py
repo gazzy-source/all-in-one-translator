@@ -525,6 +525,9 @@ async def test_group_admin_approves_members_for_their_group(tmp_path: Path, dete
         assert not await app.resolver.is_approved_in(-100999, OUTSIDER)  # this group only
         u = await app.storage.get_user(OUTSIDER)
         assert u is not None and not u.approved  # not a global (bot-owner) approval
+        # group-admin approval never leaks outside the group (private caps, inline, billing stay global)
+        assert not await app.resolver.is_approved(OUTSIDER)
+        assert await app.resolver.has_group_access(OUTSIDER)
         assert any("for this group" in c.params["text"] for c in tg.ephemeral_to(ADMIN))
         await hh.send(group_message("¿Alguien sabe si mañana estará abierto? 😂", sender=SPANISH_SPEAKER))
         await hh.idle()
@@ -576,5 +579,26 @@ async def test_group_admin_approveall_translates_for_everyone_there(tmp_path: Pa
         assert tg.public_group_output() == []
         await hh.send(_cmd("/revokeall", ADMIN))
         assert not await app.resolver.everyone_mode(GROUP_ID)
+    finally:
+        await app.stop()
+
+
+
+async def test_group_daily_limit_protects_the_shared_quota(tmp_path: Path, detector: Any) -> None:
+    tg = FakeTelegram(members={GROUP_ID: {OWNER, SPANISH_SPEAKER, BOT_ID}}, admins={GROUP_ID})
+    gemini = FakeProvider("gemini")
+    app = App(make_settings(tmp_path, GROUP_DAILY_LIMIT=1), session=FakeSession(tg), providers={"gemini": gemini},
+              detector=detector)
+    await app.start()
+    try:
+        await app.storage.upsert_chat(GROUP_ID, title="G", type="supergroup", enabled=True, bot_is_admin=True)
+        dp = Dispatcher()
+        for r in build_routers(app):
+            dp.include_router(r)
+        hh = Harness(app, dp, tg, gemini, gemini)
+        await hh.send(group_message("¿Alguien sabe si mañana estará abierto? 😂", sender=SPANISH_SPEAKER))
+        await hh.send(group_message("Que locura jajaja 😂", sender=SPANISH_SPEAKER))
+        await hh.idle()
+        assert len(tg.ephemeral_to(OWNER)) == 1 and app.metrics.counters.get("skip.group_daily_limit") == 1
     finally:
         await app.stop()

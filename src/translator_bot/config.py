@@ -112,6 +112,8 @@ class Settings(BaseSettings):
     private_access: Literal["approved", "everyone"] = Field("everyone", alias="PRIVATE_ACCESS")
     # all = a group works as soon as anyone adds the bot (its admins run it; the bot owner isn't needed)
     enable_new_groups: Literal["owner_added", "all", "none"] = Field("all", alias="ENABLE_NEW_GROUPS")
+    # translated messages per group per day (0 = unlimited): one busy self-serve group can't drain the shared quota
+    group_daily_limit: int = Field(1500, alias="GROUP_DAILY_LIMIT", ge=0)
 
     # --- Storage / logging ----------------------------------------------------------------------
     database_path: Path = Field(Path("data/translator.sqlite3"), alias="DATABASE_PATH")

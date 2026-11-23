@@ -9,6 +9,14 @@
   **`/approveall`** — everyone in the group reads everyone in their own language, both ways (people are picked
   up as they write, join or use `/tr`); `/revokeall` goes back to one by one.
 
+* **Group admins** can also manage the group's **`/glossary`** (names, in-jokes kept as they are).
+* **`GROUP_DAILY_LIMIT`** (1,500 translated messages per group per day; 0 = unlimited): one busy self-serve group
+  can't drain the shared AI quota.
+
+### Security
+* Group-admin approval is scoped to that group only: it never counts as global approval (private-chat caps,
+  inline access and billing use bot-owner approval only) — anyone can be the admin of their own group.
+
 ### Changed
 * **`/tr your text`** translates into every language the group reads (one line and one Copy button each),
   skipping the ones the text is already in — live: "/tr kya horha hai" from an English reader only tried Hindi
