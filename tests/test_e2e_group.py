@@ -18,6 +18,7 @@ from typing import Any
 
 import pytest
 from aiogram import Dispatcher
+from aiogram.types import Update
 
 from tests.conftest import (
     BOT_ID,
@@ -277,7 +278,7 @@ async def test_private_start_access_denied_when_private_access_approved(tmp_path
         await hh.send(dm(OUTSIDER, "Hola amigos, ¿qué tal?", mid=6))
         await hh.idle()
         out = tg.dms_to(OUTSIDER)
-        assert len(out) == 2 and all("approved" in c.params["text"] for c in out)
+        assert len(out) == 2 and all("approve" in c.params["text"] for c in out)
         assert str(OUTSIDER) in out[0].params["text"] and gemini.jobs == []
     finally:
         await app.stop()
@@ -287,7 +288,7 @@ async def test_private_start_open_to_everyone_by_default(h: Harness) -> None:
     await h.send(dm(OUTSIDER, "/start"))
     out = h.tg.dms_to(OUTSIDER)
     assert len(out) == 2  # welcome + language picker
-    assert "send or forward" in out[0].params["text"] and str(OUTSIDER) in out[0].params["text"]  # approval hint
+    assert "send or forward" in out[0].params["text"] and "group admin" in out[0].params["text"]  # approval hint
     assert "@babel_test_bot" not in out[0].params["text"]  # inline is approved-only by default
 
 
@@ -341,7 +342,7 @@ async def test_help_is_short_and_role_aware(h: Harness) -> None:
     await h.send(dm(OUTSIDER, "/help"))
     await h.send(dm(OWNER, "/help", mid=6))
     outsider, owner = h.tg.dms_to(OUTSIDER)[0].params["text"], h.tg.dms_to(OWNER)[0].params["text"]
-    assert "<b>Here</b>" in outsider and str(OUTSIDER) in outsider and "/pause" not in outsider
+    assert "<b>Here</b>" in outsider and "group admin" in outsider and "/pause" not in outsider
     assert "only to you" in owner and "/pause" in owner and "@babel_test_bot" in owner and "/status" in owner
     assert "<blockquote expandable>" in owner and "Not getting a translation?" in owner and len(owner) < 1200
     assert owner.startswith("🇬🇧 <b>English</b>") and "(default)" in owner
@@ -487,3 +488,93 @@ async def test_explicit_language_choice_beats_automatic(h: Harness) -> None:
     await h.send(group_message("Are you guys coming to the party tonight?", sender=OWNER))
     await h.idle()
     assert h.tg.ephemeral_to(SPANISH_SPEAKER)[0].params["text"].startswith("[fr]")
+
+
+
+def _cmd(text: str, sender: int, reply_to: dict[str, Any] | None = None) -> dict[str, Any]:
+    m = group_message(text, sender=sender, reply_to=reply_to)
+    m["entities"] = [{"type": "bot_command", "offset": 0, "length": len(text.split()[0])}]
+    return m
+
+
+async def test_group_admin_approves_members_for_their_group(tmp_path: Path, detector: Any) -> None:
+    """The group's owner/admins approve members themselves (no bot owner involved); valid in that group only."""
+    ADMIN = 777
+    tg = FakeTelegram(members={GROUP_ID: {OWNER, ADMIN, SPANISH_SPEAKER, OUTSIDER, BOT_ID}}, admins={GROUP_ID})
+    real = tg.respond
+
+    def respond(method: Any) -> Any:  # ADMIN owns the group (creator)
+        if type(method).__name__ == "GetChatMember" and method.user_id == ADMIN:
+            return {"status": "creator", "user": {"id": ADMIN, "is_bot": False, "first_name": "Adm"},
+                    "is_anonymous": False}
+        return real(method)
+
+    tg.respond = respond  # type: ignore[method-assign]
+    gemini = FakeProvider("gemini")
+    app = App(make_settings(tmp_path), session=FakeSession(tg), providers={"gemini": gemini}, detector=detector)
+    await app.start()
+    try:
+        await app.storage.upsert_chat(GROUP_ID, title="G", type="supergroup", enabled=True, bot_is_admin=True)
+        dp = Dispatcher()
+        for r in build_routers(app):
+            dp.include_router(r)
+        hh = Harness(app, dp, tg, gemini, gemini)
+        target = group_message("hola", sender=OUTSIDER)
+        await hh.send(_cmd("/approve", ADMIN, reply_to=target))
+        assert await app.resolver.is_approved_in(GROUP_ID, OUTSIDER)
+        assert not await app.resolver.is_approved_in(-100999, OUTSIDER)  # this group only
+        u = await app.storage.get_user(OUTSIDER)
+        assert u is not None and not u.approved  # not a global (bot-owner) approval
+        assert any("for this group" in c.params["text"] for c in tg.ephemeral_to(ADMIN))
+        await hh.send(group_message("¿Alguien sabe si mañana estará abierto? 😂", sender=SPANISH_SPEAKER))
+        await hh.idle()
+        assert len(tg.ephemeral_to(OUTSIDER)) == 1  # they now get translations here
+        # an ordinary member can't approve anyone
+        await hh.send(_cmd("/approve", SPANISH_SPEAKER, reply_to=group_message("x", sender=OWNER)))
+        assert not await app.storage.is_chat_approved(OWNER, GROUP_ID)
+        assert tg.public_group_output() == []
+    finally:
+        await app.stop()
+
+
+async def test_group_admin_approveall_translates_for_everyone_there(tmp_path: Path, detector: Any) -> None:
+    """No bot owner involved: the group's own admin turns translations on for everyone in it."""
+    ADMIN, JOINER = 778, 779
+    tg = FakeTelegram(members={GROUP_ID: {OWNER, ADMIN, SPANISH_SPEAKER, OUTSIDER, JOINER, BOT_ID}},
+                      admins={GROUP_ID})
+    real = tg.respond
+
+    def respond(method: Any) -> Any:
+        if type(method).__name__ == "GetChatMember" and method.user_id == ADMIN:
+            return {"status": "creator", "user": {"id": ADMIN, "is_bot": False, "first_name": "Adm"},
+                    "is_anonymous": False}
+        return real(method)
+
+    tg.respond = respond  # type: ignore[method-assign]
+    gemini = FakeProvider("gemini")
+    app = App(make_settings(tmp_path), session=FakeSession(tg), providers={"gemini": gemini}, detector=detector)
+    await app.start()
+    try:
+        await app.storage.upsert_chat(GROUP_ID, title="G", type="supergroup", enabled=True, bot_is_admin=True)
+        dp = Dispatcher()
+        for r in build_routers(app):
+            dp.include_router(r)
+        hh = Harness(app, dp, tg, gemini, gemini)
+        await hh.send(group_message("Are you coming tonight?", sender=OUTSIDER))  # OUTSIDER has written here
+        await hh.idle()
+        await hh.send(_cmd("/approveall", ADMIN))
+        assert any("Everyone here" in c.params["text"] for c in tg.ephemeral_to(ADMIN))
+        await hh.dp.feed_update(app.bot, Update.model_validate({"update_id": 99_001, "chat_member": {
+            "chat": {"id": GROUP_ID, "type": "supergroup", "title": "G"},
+            "from": {"id": JOINER, "is_bot": False, "first_name": "J"}, "date": int(time.time()),
+            "old_chat_member": {"status": "left", "user": {"id": JOINER, "is_bot": False, "first_name": "J"}},
+            "new_chat_member": {"status": "member", "user": {"id": JOINER, "is_bot": False, "first_name": "J"}}}}))
+        await hh.send(group_message("¿Alguien sabe si mañana estará abierto? 😂", sender=SPANISH_SPEAKER))
+        await hh.idle()
+        assert len(tg.ephemeral_to(OUTSIDER)) == 1 and len(tg.ephemeral_to(JOINER)) == 1  # writer + joiner
+        assert await app.resolver.is_approved_in(GROUP_ID, SPANISH_SPEAKER)  # /tr works for everyone here
+        assert tg.public_group_output() == []
+        await hh.send(_cmd("/revokeall", ADMIN))
+        assert not await app.resolver.everyone_mode(GROUP_ID)
+    finally:
+        await app.stop()

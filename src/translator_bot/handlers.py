@@ -20,6 +20,7 @@ from aiogram.types import (
     BotCommand,
     BotCommandScopeAllGroupChats,
     BotCommandScopeAllPrivateChats,
+    BotCommandScopeChatAdministrators,
     BotCommandScopeChatMember,
     CallbackQuery,
     ChatMemberUpdated,
@@ -84,6 +85,23 @@ MEMBER_GROUP_COMMANDS = [
     BotCommand(command="unmute", description="Resume my translations here", is_ephemeral=True),
 ]
 OWNER_GROUP_COMMANDS.insert(0, MEMBER_GROUP_COMMANDS[0])
+# The group's owner/admins: approve members for this group (hidden), plus the member commands.
+ADMIN_GROUP_COMMANDS = [
+    BotCommand(command="approve", description="Reply to a member: translations for them in this group",
+               is_ephemeral=True),
+    BotCommand(command="revoke", description="Reply to a member: stop their translations here", is_ephemeral=True),
+    BotCommand(command="approveall", description="Translations for everyone in this group", is_ephemeral=True),
+    BotCommand(command="revokeall", description="Back to approving members one by one", is_ephemeral=True),
+    *MEMBER_GROUP_COMMANDS,
+]
+SETUP_GUIDE = (
+    "👋 <b>Thanks for adding me!</b> Two steps, then everyone reads everyone:\n"
+    "1. Make me an <b>admin</b> (all rights can stay off) — that's how translations show up only for each reader.\n"
+    "2. Reply <code>/approve</code> to a member's message — or send <code>/approveall</code> for everyone here.\n\n"
+    "Then messages, stickers, GIFs and voice notes are translated into each reader's language, visible only to "
+    "them. Members can reply <code>/tr</code> to any message, or write <code>/tr text</code> to answer in the "
+    "group's languages. Only you see this message."
+)
 
 
 def build_routers(app: App) -> list[Router]:
@@ -94,13 +112,32 @@ async def register_commands(app: App) -> None:
     await app.bot.set_my_commands(PRIVATE_COMMANDS, scope=BotCommandScopeAllPrivateChats())
     with contextlib.suppress(TelegramAPIError):
         await app.bot.set_my_commands(MEMBER_GROUP_COMMANDS, scope=BotCommandScopeAllGroupChats())
+    # existing groups: hidden /approve for their owner/admins (new groups get it when the bot is added)
+    for chat in (await app.storage.active_chats())[:200]:
+        await register_owner_group_commands(app, chat.chat_id)
 
 
 async def register_owner_group_commands(app: App, chat_id: int) -> None:
+    with contextlib.suppress(TelegramAPIError):
+        await app.bot.set_my_commands(ADMIN_GROUP_COMMANDS, scope=BotCommandScopeChatAdministrators(chat_id=chat_id))
     for oid in app.s.owner_ids:
         with contextlib.suppress(TelegramAPIError):
             await app.bot.set_my_commands(OWNER_GROUP_COMMANDS,
                                           scope=BotCommandScopeChatMember(chat_id=chat_id, user_id=oid))
+
+
+async def _guide_adder(app: App, chat_id: int, user_id: int, *, ready: bool) -> None:
+    """Whoever added/promoted the bot gets the setup steps - privately, in the group (DM fallback)."""
+    text = ("✅ <b>I'm ready.</b> Reply <code>/approve</code> to a member's message, or send "
+            "<code>/approveall</code> for everyone here. Only you see this message." if ready else SETUP_GUIDE)
+    try:
+        await app.bot.send_message(chat_id=chat_id, text=text,
+                                   ephemeral_message_parameters=EphemeralMessageParameters(receiver_user_id=user_id))
+        return
+    except TelegramAPIError:
+        pass  # not an admin yet: ephemeral messages need it
+    with contextlib.suppress(TelegramAPIError):
+        await app.bot.send_message(user_id, text)  # works if they've opened the bot before
 
 
 async def ephemeral_reply(bot: Bot, msg: Message, text: str) -> None:
@@ -150,6 +187,8 @@ def _group_router(app: App) -> Router:
         state = "enabled" if chat and chat.enabled else "added by a non-owner — DISABLED until you enable it in /chats"
         who = html.escape(ev.from_user.full_name) if ev.from_user else "someone"
         await app.notify_owners(f"{report.render()}\n\nAdded/updated by {who}. Translation: {state}.")
+        if ev.from_user is not None and not ev.from_user.is_bot and chat is not None and chat.enabled:
+            await _guide_adder(app, chat_id, ev.from_user.id, ready=status == "administrator")
 
     @r.chat_member(GROUP)
     async def member_changed(ev: ChatMemberUpdated) -> None:
@@ -157,6 +196,8 @@ def _group_router(app: App) -> Router:
         is_member = st in ("creator", "administrator", "member") or (
             st == "restricted" and bool(getattr(ev.new_chat_member, "is_member", False)))
         app.membership.set(ev.chat.id, ev.new_chat_member.user.id, is_member)
+        if is_member and not ev.new_chat_member.user.is_bot:
+            await app.storage.mark_participant(ev.new_chat_member.user.id, ev.chat.id)  # joiners read from day one
 
     @r.message(GROUP, F.migrate_to_chat_id)
     async def migrated(msg: Message) -> None:
@@ -174,7 +215,24 @@ def _group_router(app: App) -> Router:
             return
         uid = msg.from_user.id
         is_owner = app.resolver.is_owner(uid)
-        if cmd in ("approve", "revoke", "approvefree", "revokefree", "check", "glossary") and not is_owner:
+        group_admin = (cmd in ("approve", "revoke", "approveall", "revokeall") and not is_owner
+                       and await app.is_chat_admin(msg.chat.id, uid))
+        if cmd in ("approveall", "revokeall"):
+            if not (is_owner or group_admin):
+                return
+            chat = await app.storage.get_chat(msg.chat.id)
+            settings = dict(chat.settings) if chat else {}
+            settings["everyone"] = cmd == "approveall"
+            await app.storage.upsert_chat(msg.chat.id, settings=settings)
+            if app.pipeline:
+                app.pipeline.invalidate_chat(msg.chat.id)
+            app.reply_targets.clear()
+            await ephemeral_reply(bot, msg, "✅ Everyone here now gets translations (people are picked up as they "
+                                            "write, join or use /tr)." if cmd == "approveall"
+                                  else "Back to approving members one by one (/approve as a reply).")
+            return
+        if cmd in ("approve", "revoke", "approvefree", "revokefree", "check", "glossary") and not (is_owner or
+                                                                                                group_admin):
             return
         if cmd in ("approvefree", "revokefree"):
             r_msg = msg.reply_to_message
@@ -200,9 +258,16 @@ def _group_router(app: App) -> Router:
                 return
             member = r_msg.from_user
             await app.storage.upsert_user(member.id, first_name=member.first_name)
-            await app.storage.set_approved(member.id, cmd == "approve", by=uid)
+            if is_owner:  # bot owner: every group
+                await app.storage.set_approved(member.id, cmd == "approve", by=uid)
+            await app.storage.set_chat_approved(member.id, msg.chat.id, cmd == "approve", by=uid)  # this group
             app.membership.set(msg.chat.id, member.id, True)
-            verb = "approved ✅ — they now receive private translations" if cmd == "approve" else "revoked ❌"
+            app.reply_targets.clear()
+            if cmd == "approve":
+                verb = ("approved ✅ — they now get translations, only they see them" if is_owner
+                        else "approved ✅ for this group — they now get translations, only they see them")
+            else:
+                verb = "revoked ❌" if is_owner else "revoked ❌ for this group"
             await ephemeral_reply(bot, msg, f"{html.escape(member.full_name)} ({member.id}) {verb}.")
         elif cmd == "check":
             report = await app.verify_setup(msg.chat.id)
@@ -210,14 +275,14 @@ def _group_router(app: App) -> Router:
         elif cmd == "glossary":
             await ephemeral_reply(bot, msg, await _glossary_cmd(app, msg.chat.id, arg))
         elif cmd in ("mute", "unmute"):
-            if not await app.resolver.is_approved(uid):
+            if not await app.resolver.is_approved_in(msg.chat.id, uid):
                 return
             await app.storage.set_muted(uid, msg.chat.id, cmd == "mute")
             await ephemeral_reply(bot, msg, "🔕 Translations muted in this group." if cmd == "mute"
                                   else "🔔 Translations resumed in this group.")
         elif cmd == "tr":
             await _tr_command(app, bot, msg, arg)
-        elif cmd in ("start", "language", "settings", "help") and await app.resolver.is_approved(uid):
+        elif cmd in ("start", "language", "settings", "help") and await app.resolver.is_approved_in(msg.chat.id, uid):
             await ephemeral_reply(bot, msg, f'Settings live in our private chat: <a href="https://t.me/'
                                             f'{app.bot_username}?start=settings">open</a>.')
 
@@ -236,8 +301,9 @@ def _group_router(app: App) -> Router:
 
 async def _reply_targets(app: App, uid: int, chat_id: int | None = None) -> list[str]:
     """Languages to write *into* so the other people understand: the reader languages of the group (or of all
-    the user's groups, for inline mode, which doesn't say which chat it is), most common first, minus the user's
-    own language. An explicit inline target (/settings) comes first. Cached briefly per user/chat."""
+    the user's groups, for inline mode, which doesn't say which chat it is), most common first. The sender's own
+    language is not excluded (live: "/tr kya horha hai" from an English reader skipped the English reader); the
+    languages the text is already in are skipped by the caller. An explicit inline target comes first."""
     key = (uid, chat_id)
     hit = app.reply_targets.get(key)
     if hit is not None and time.monotonic() - hit[0] < 300:
@@ -257,9 +323,9 @@ async def _reply_targets(app: App, uid: int, chat_id: int | None = None) -> list
     out: list[str] = []
     if user is not None and user.inline_lang:
         out.append(user.inline_lang)
-    out += [lg for lg, _n in counts.most_common() if lg.split("-")[0] != own]
-    if not out and own != "en":
-        out.append("en")  # nobody else known yet: English is the safest bridge
+    out += [lg for lg, _n in counts.most_common()]
+    if not out:
+        out.append("en" if own != "en" else own)  # nobody else known yet: English is the safest bridge
     seen: list[str] = []
     for lg in out:
         if lg not in seen:
@@ -294,19 +360,37 @@ async def _translate_text(app: App, text: str, target: str, *, purpose: str = "i
 
 
 async def _send_ephemeral(app: App, msg: Message, text: str, *, reply_to: int | None = None,
-                          markup: InlineKeyboardMarkup | None = None, plain: bool = False) -> None:
-    """Only the command's sender sees this (never the group)."""
+                          markup: InlineKeyboardMarkup | None = None, plain: bool = False) -> int | None:
+    """Only the command's sender sees this (never the group). Returns its ephemeral id (for editing)."""
     if msg.from_user is None:
-        return
+        return None
     reply = (ReplyParameters(message_id=reply_to, allow_sending_without_reply=True) if reply_to
              else ReplyParameters(ephemeral_message_id=msg.ephemeral_message_id) if msg.ephemeral_message_id else None)
-    with contextlib.suppress(TelegramAPIError):
-        await app.bot.send_message(chat_id=msg.chat.id, text=text, reply_parameters=reply, reply_markup=markup,
-                                   parse_mode=None if plain else "HTML",
-                                   message_thread_id=msg.message_thread_id if msg.is_topic_message else None,
-                                   link_preview_options=LinkPreviewOptions(is_disabled=True),
-                                   ephemeral_message_parameters=EphemeralMessageParameters(
-                                       receiver_user_id=msg.from_user.id))
+    try:
+        sent = await app.bot.send_message(chat_id=msg.chat.id, text=text, reply_parameters=reply, reply_markup=markup,
+                                          parse_mode=None if plain else "HTML",
+                                          message_thread_id=msg.message_thread_id if msg.is_topic_message else None,
+                                          link_preview_options=LinkPreviewOptions(is_disabled=True),
+                                          ephemeral_message_parameters=EphemeralMessageParameters(
+                                              receiver_user_id=msg.from_user.id))
+    except TelegramAPIError:
+        return None
+    return sent.ephemeral_message_id or None
+
+
+async def _show(app: App, msg: Message, placeholder: int | None, text: str, *, reply_to: int | None = None,
+                markup: InlineKeyboardMarkup | None = None, plain: bool = False) -> None:
+    """Replace the "⏳ Translating…" placeholder with the result (fresh ephemeral if editing isn't possible)."""
+    if placeholder and msg.from_user is not None:
+        try:
+            await app.bot.edit_ephemeral_message_text(
+                chat_id=msg.chat.id, receiver_user_id=msg.from_user.id, ephemeral_message_id=placeholder, text=text,
+                parse_mode=None if plain else "HTML", reply_markup=markup,
+                link_preview_options=LinkPreviewOptions(is_disabled=True))
+            return
+        except TelegramAPIError:
+            pass
+    await _send_ephemeral(app, msg, text, reply_to=reply_to, markup=markup, plain=plain)
 
 
 async def _tr_command(app: App, bot: Bot, msg: Message, arg: str) -> None:
@@ -318,9 +402,11 @@ async def _tr_command(app: App, bot: Bot, msg: Message, arg: str) -> None:
     if msg.from_user is None or app.pipeline is None:
         return
     uid = msg.from_user.id
-    if not await app.resolver.is_approved(uid):
-        await _send_ephemeral(app, msg, "🔒 /tr is for members approved by the bot owner.")
+    if not await app.resolver.is_approved_in(msg.chat.id, uid):
+        await _send_ephemeral(app, msg, "🔒 Ask a group admin to approve you: they reply /approve to one of your "
+                                        "messages (only they see it).")
         return
+    await app.storage.mark_participant(uid, msg.chat.id)
     # same gates as every group message: chat enabled + active, bot is admin, topic enabled, chat toggles
     chat = await app.pipeline.chat(msg)
     thread = msg.message_thread_id if msg.is_topic_message else None
@@ -328,18 +414,25 @@ async def _tr_command(app: App, bot: Bot, msg: Message, arg: str) -> None:
             msg.chat.id, thread):
         await _send_ephemeral(app, msg, "⏸ Translation is switched off here.")
         return
-    if not app.private_limiter.try_acquire(uid):
+    if not app.tr_limiter.try_acquire(uid):  # generous: approved members shouldn't feel it
         await _send_ephemeral(app, msg, "⏳ That's a lot at once — give me a few seconds.")
         return
     reply = msg.reply_to_message
+    if not arg.strip() and (reply is None or (msg.is_topic_message and reply.message_id == msg.message_thread_id)):
+        await _send_ephemeral(app, msg, "Reply <code>/tr</code> to a message to translate it for you, or write "
+                                        "<code>/tr your text</code> to get it in the group's languages.")
+        return
+    # instant feedback (only you see it); the result replaces it in place
+    placeholder = await _send_ephemeral(app, msg, "⏳ Translating…",
+                                        reply_to=None if arg.strip() or reply is None else reply.message_id)
     lane = app.pipeline.media_lane if (not arg.strip() and reply is not None and _media_file(reply)[0]) \
         else app.pipeline.text_lane
-    if not await lane.submit(msg.chat.id, lambda: _tr_work(app, msg, arg, chat.settings),
+    if not await lane.submit(msg.chat.id, lambda: _tr_work(app, msg, arg, chat.settings, placeholder),
                              key=f"tr:{msg.chat.id}:{msg.message_id}"):
-        await _send_ephemeral(app, msg, "⏳ I'm busy right now — please try again in a moment.")
+        await _show(app, msg, placeholder, "⏳ I'm busy right now — please try again in a moment.")
 
 
-async def _tr_work(app: App, msg: Message, arg: str, settings: dict[str, Any]) -> None:
+async def _tr_work(app: App, msg: Message, arg: str, settings: dict[str, Any], placeholder: int | None) -> None:
     assert msg.from_user is not None and app.pipeline is not None
     uid = msg.from_user.id
     user = await app.storage.get_user(uid)
@@ -347,28 +440,30 @@ async def _tr_work(app: App, msg: Message, arg: str, settings: dict[str, Any]) -
     text = arg.strip()
     if text:
         targets = await _reply_targets(app, uid, msg.chat.id) or ["en"]
-        target = targets[0]
-        out, why = await _translate_text(app, truncate(text, app.s.max_text_chars), target, purpose="group",
-                                         deadline_s=10.0)
-        if out is None:
-            await _send_ephemeral(app, msg, f"✅ That's already {html.escape(lang_name(target))}." if why == "same"
-                                  else "⚠️ Couldn't translate right now — try again in a moment.")
+        src = truncate(text, app.s.max_text_chars)
+        outs = await asyncio.gather(*(_translate_text(app, src, t, deadline_s=8.0) for t in targets))
+        lines: list[str] = []
+        copies: list[InlineKeyboardButton] = []
+        for t, (out, _why) in zip(targets, outs, strict=True):
+            if out:
+                lines.append(f"{ui.flag(t)} {truncate(out, 1200)}")
+                copies.append(InlineKeyboardButton(text=f"📋 {ui.flag(t)}" if len(targets) > 1 else "📋 Copy",
+                                                   copy_text=CopyTextButton(text=truncate(out, 256))))
+        if not lines:
+            names = ", ".join(lang_name(t) for t in targets)
+            await _show(app, msg, placeholder, f"✅ Already readable for everyone here ({names})."
+                        if all(why == "same" for _o, why in outs)
+                        else "⚠️ Couldn't translate right now — try again in a moment.", plain=True)
             return
-        out = truncate(out, 3900)
-        kb = InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="📋 Copy", copy_text=CopyTextButton(text=truncate(out, 256))),
-            InlineKeyboardButton(text="✍️ Send", switch_inline_query_current_chat=truncate(text, 200)),
-        ]])
-        await _send_ephemeral(app, msg, f"{ui.flag(target)} {out}", markup=kb, plain=True)
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            copies, [InlineKeyboardButton(text="✍️ Send", switch_inline_query_current_chat=truncate(text, 200))]])
+        await _show(app, msg, placeholder, "\n".join(lines), markup=kb, plain=True)
         return
     target_msg = msg.reply_to_message
-    if target_msg is None or (msg.is_topic_message and target_msg.message_id == msg.message_thread_id):
-        await _send_ephemeral(app, msg, "Reply <code>/tr</code> to a message to translate it for you, or write "
-                                        "<code>/tr your text</code> to get it in the group's language.")
-        return
+    assert target_msg is not None  # checked before queueing
     el = classify(target_msg, bot_id=app.bot_id, settings=settings, media_enabled=app.s.media_enabled)
     if isinstance(el, Skip):
-        await _send_ephemeral(app, msg, "🤷 Nothing to translate in that message.", reply_to=target_msg.message_id)
+        await _show(app, msg, placeholder, "🤷 Nothing to translate in that message.", reply_to=target_msg.message_id)
         return
     if len(el.plain) > app.s.max_text_chars:
         el = Eligible(el.kind, html_escape_truncate(el.plain, app.s.max_text_chars),
@@ -380,7 +475,7 @@ async def _tr_work(app: App, msg: Message, arg: str, settings: dict[str, Any]) -
         res = PrivateResult(None, None, "failed")
     body = res.text or _PRIVATE_REASONS.get(res.reason, _PRIVATE_REASONS["no_text"]).format(
         lang=html.escape(lang_name(mine)), secs=int(app.s.max_media_seconds))
-    await _send_ephemeral(app, msg, body, reply_to=target_msg.message_id)
+    await _show(app, msg, placeholder, body, reply_to=target_msg.message_id)
 
 
 async def _glossary_cmd(app: App, chat_id: int, arg: str) -> str:

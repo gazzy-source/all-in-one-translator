@@ -236,9 +236,10 @@ async def test_tr_reply_translates_for_me_only(mh: Harness) -> None:
     cmd["entities"] = [{"type": "bot_command", "offset": 0, "length": 3}]
     await mh.send(cmd)
     await mh.idle()
-    got = mh.tg.ephemeral_to(OWNER)
-    assert got and got[-1].params["text"] == "That's crazy hahaha 😂"
-    assert got[-1].params["reply_parameters"]["message_id"] == original["message_id"]
+    [placeholder] = mh.tg.ephemeral_to(OWNER)  # instant "⏳ Translating…", replied to the original
+    assert placeholder.params["text"].startswith("⏳")
+    assert placeholder.params["reply_parameters"]["message_id"] == original["message_id"]
+    assert mh.tg.ephemeral_edits_to(OWNER)[-1].params["text"] == "That's crazy hahaha 😂"  # filled in place
     assert mh.tg.public_group_output() == []
 
 
@@ -249,11 +250,28 @@ async def test_tr_text_gives_copy_and_send_in_the_groups_language(mh: Harness) -
     cmd["entities"] = [{"type": "bot_command", "offset": 0, "length": 3}]
     await mh.send(cmd)
     await mh.idle()
-    [eph] = mh.tg.ephemeral_to(OWNER)
-    assert eph.params["text"] == "🇬🇧 That's crazy hahaha 😂"
-    [row] = eph.params["reply_markup"]["inline_keyboard"]
-    assert row[0]["copy_text"]["text"] == "That's crazy hahaha 😂"
-    assert row[1]["switch_inline_query_current_chat"] == "Que locura jajaja 😂"
+    edit = mh.tg.ephemeral_edits_to(OWNER)[-1]
+    assert edit.params["text"] == "🇬🇧 That's crazy hahaha 😂"
+    copies, send = edit.params["reply_markup"]["inline_keyboard"]
+    assert copies[0]["copy_text"]["text"] == "That's crazy hahaha 😂"
+    assert send[0]["switch_inline_query_current_chat"] == "Que locura jajaja 😂"
+    assert mh.tg.public_group_output() == []
+
+
+async def test_tr_text_translates_into_every_group_language_it_isnt_already_in(mh: Harness) -> None:
+    """Live 2026-11-23: an English reader wrote "/tr kya horha hai" in a group with a Hindi and an English
+    reader; the bot only tried Hindi and said "already Hindi". The English reader must get it."""
+    await mh.app.storage.upsert_user(OWNER, lang="en")
+    await mh.app.storage.set_approved(HINDI, True, by=OWNER)
+    await mh.app.storage.upsert_user(HINDI, lang="hi")
+    await mh.app.storage.set_approved(OUTSIDER, True, by=OWNER)
+    await mh.app.storage.upsert_user(OUTSIDER, lang="en")
+    cmd = group_message("/tr yaar kya scene hai", sender=OWNER)
+    cmd["entities"] = [{"type": "bot_command", "offset": 0, "length": 3}]
+    await mh.send(cmd)
+    await mh.idle()
+    edit = mh.tg.ephemeral_edits_to(OWNER)[-1]
+    assert edit.params["text"] == "🇬🇧 dude, what's the plan?"  # Hindi reader skipped: it's already Hindi
     assert mh.tg.public_group_output() == []
 
 
@@ -262,7 +280,7 @@ async def test_tr_needs_approval(mh: Harness) -> None:
     cmd["entities"] = [{"type": "bot_command", "offset": 0, "length": 3}]
     await mh.send(cmd)
     [eph] = mh.tg.ephemeral_to(OUTSIDER)
-    assert "approved" in eph.params["text"] and mh.gemini.jobs == []
+    assert "approve" in eph.params["text"] and mh.gemini.jobs == []
 
 
 async def test_tr_respects_disabled_group(mh: Harness) -> None:

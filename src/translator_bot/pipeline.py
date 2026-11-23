@@ -94,6 +94,7 @@ class Pipeline:
         self._bg: set[asyncio.Task[None]] = set()
         self._chat_cache: dict[int, tuple[float, Chat]] = {}
         self._lang_votes: OrderedDict[int, deque[str]] = OrderedDict()  # approved sender -> recent languages
+        self._participants: set[tuple[int, int]] = set()  # (chat, user) already stored as participant
 
     def start(self) -> None:
         self.text_lane.start()
@@ -150,8 +151,13 @@ class Pipeline:
             return
         if sid is not None and sid > 0 and msg.from_user is not None and not msg.from_user.is_bot:
             raw = msg.text or msg.caption or ""
+            if (msg.chat.id, sid) not in self._participants:
+                self._participants.add((msg.chat.id, sid))
+                if len(self._participants) > 100_000:
+                    self._participants.clear()
+                self._spawn(self.storage.mark_participant(sid, msg.chat.id))
             self._spawn(self._learn_language(sid, msg.from_user.language_code,
-                                             "" if raw.startswith("/") else raw[:500]))
+                                             "" if raw.startswith("/") else raw[:500], msg.chat.id))
         res = classify(msg, bot_id=self.bot_id, settings=chat.settings, media_enabled=self.s.media_enabled)
         if isinstance(res, Skip):
             self.metrics.inc(f"skip.{res.value}")
@@ -279,11 +285,14 @@ class Pipeline:
         self._bg.add(task)
         task.add_done_callback(self._bg.discard)
 
-    async def _learn_language(self, uid: int, telegram_lang: str | None, plain: str) -> None:
+    async def _learn_language(self, uid: int, telegram_lang: str | None, plain: str,
+                              chat_id: int | None = None) -> None:
         """Automatic reader language for approved members who never chose one: the language they write in the
         group (majority of their last 5 messages), else their Telegram app language. Codes only, never text."""
         try:
-            if not await self.resolver.is_approved(uid):
+            approved = (await self.resolver.is_approved_in(chat_id, uid) if chat_id is not None
+                        else await self.resolver.is_approved(uid))
+            if not approved:
                 return
             user = await self.storage.get_user(uid)
             if user is not None and user.lang:

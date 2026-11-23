@@ -1,6 +1,6 @@
 """Who receives translations of a given group message, and in which language.
 
-Recipients = (owners ∪ owner-approved users) who are
+Recipients = (owners ∪ users approved by a bot owner ∪ users approved by this group's owner/admins) who are
   * current members of the group (verified with getChatMember, short-lived cache),
   * not paused globally and not muted for this group,
   * not the author of the message (you never get your own message translated back to you),
@@ -84,13 +84,33 @@ class RecipientResolver:
         return user_id in self.owner_ids
 
     async def is_approved(self, user_id: int) -> bool:
+        """Approved anywhere: by a bot owner (all groups) or by the admins of at least one group."""
         if self.is_owner(user_id):
             return True
         u = await self.storage.get_user(user_id)
-        return bool(u and u.approved)
+        return bool(u and u.approved) or await self.storage.is_chat_approved(user_id)
 
-    async def candidates(self) -> list[User]:
+    async def everyone_mode(self, chat_id: int) -> bool:
+        """The group's admins approved everyone here (/approveall)."""
+        chat = await self.storage.get_chat(chat_id)
+        return bool(chat and chat.settings.get("everyone"))
+
+    async def is_approved_in(self, chat_id: int, user_id: int) -> bool:
+        """Approved for this group: owner, approved by a bot owner, approved by this group's owner/admins, or the
+        group's admins approved everyone."""
+        if self.is_owner(user_id) or await self.everyone_mode(chat_id):
+            return True
+        u = await self.storage.get_user(user_id)
+        return bool(u and u.approved) or await self.storage.is_chat_approved(user_id, chat_id)
+
+    async def candidates(self, chat_id: int | None = None) -> list[User]:
         users = {u.user_id: u for u in await self.storage.approved_users()}
+        if chat_id is not None:
+            for u in await self.storage.chat_approved_users(chat_id):
+                users.setdefault(u.user_id, u)
+            if await self.everyone_mode(chat_id):
+                for u in await self.storage.participants(chat_id):
+                    users.setdefault(u.user_id, u)
         for oid in self.owner_ids:
             if oid not in users:
                 users[oid] = await self.storage.get_user(oid) or User(user_id=oid, approved=True)
@@ -98,7 +118,7 @@ class RecipientResolver:
 
     async def resolve(self, chat_id: int, sender_id: int | None) -> list[Recipient]:
         muted = await self.storage.muted_users(chat_id)
-        users = [u for u in await self.candidates()
+        users = [u for u in await self.candidates(chat_id)
                  if u.user_id != sender_id and not u.paused and u.user_id not in muted
                  and not (self.onboarding_required and not u.onboarded)]
         # membership checks in parallel (each uncached one is a getChatMember round trip, ~0.1-0.3 s), bounded

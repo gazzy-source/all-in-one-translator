@@ -120,6 +120,12 @@ MIGRATIONS: list[str] = [
         refunded INTEGER NOT NULL DEFAULT 0
     );
     """,
+    # 4: approval by a group's own owner/admins - valid in that group only
+    """
+    ALTER TABLE user_chat ADD COLUMN approved INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE user_chat ADD COLUMN approved_by INTEGER;
+    ALTER TABLE user_chat ADD COLUMN seen INTEGER NOT NULL DEFAULT 0;
+    """,
 ]
 
 DEFAULT_CHAT_SETTINGS: dict[str, Any] = {
@@ -406,6 +412,41 @@ class Storage:
     async def muted_users(self, chat_id: int) -> set[int]:
         cur = await self.db.execute("SELECT user_id FROM user_chat WHERE chat_id=? AND muted=1", (chat_id,))
         return {r["user_id"] for r in await cur.fetchall()}
+
+    async def set_chat_approved(self, user_id: int, chat_id: int, approved: bool, by: int) -> None:
+        """Approval by a group's owner/admin: translations (and /tr) in that group only."""
+        await self.db.execute("INSERT OR IGNORE INTO users(user_id, updated_at) VALUES (?, ?)", (user_id, _now()))
+        await self.db.execute(
+            "INSERT INTO user_chat(user_id, chat_id, approved, approved_by) VALUES (?,?,?,?) "
+            "ON CONFLICT(user_id, chat_id) DO UPDATE SET approved=excluded.approved, approved_by=excluded.approved_by",
+            (user_id, chat_id, int(approved), by if approved else None))
+        await self.db.commit()
+
+    async def mark_participant(self, user_id: int, chat_id: int) -> None:
+        """Seen in this group (wrote, joined, used /tr): a reader when the group's admins approved everyone."""
+        await self.db.execute("INSERT OR IGNORE INTO users(user_id, updated_at) VALUES (?, ?)", (user_id, _now()))
+        await self.db.execute("INSERT INTO user_chat(user_id, chat_id, seen) VALUES (?,?,1) "
+                              "ON CONFLICT(user_id, chat_id) DO UPDATE SET seen=1", (user_id, chat_id))
+        await self.db.commit()
+
+    async def participants(self, chat_id: int) -> list[User]:
+        cur = await self.db.execute("SELECT u.* FROM users u JOIN user_chat c ON u.user_id = c.user_id "
+                                    "WHERE c.chat_id=? AND c.seen=1", (chat_id,))
+        return [self._user(r) for r in await cur.fetchall()]
+
+    async def chat_approved_users(self, chat_id: int) -> list[User]:
+        cur = await self.db.execute("SELECT u.* FROM users u JOIN user_chat c ON u.user_id = c.user_id "
+                                    "WHERE c.chat_id=? AND c.approved=1", (chat_id,))
+        return [self._user(r) for r in await cur.fetchall()]
+
+    async def is_chat_approved(self, user_id: int, chat_id: int | None = None) -> bool:
+        """Approved by the admins of `chat_id` (or of any group, when chat_id is None)."""
+        if chat_id is None:
+            cur = await self.db.execute("SELECT 1 FROM user_chat WHERE user_id=? AND approved=1 LIMIT 1", (user_id,))
+        else:
+            cur = await self.db.execute("SELECT 1 FROM user_chat WHERE user_id=? AND chat_id=? AND approved=1",
+                                        (user_id, chat_id))
+        return await cur.fetchone() is not None
 
     async def set_muted(self, user_id: int, chat_id: int, muted: bool) -> None:
         await self.db.execute(

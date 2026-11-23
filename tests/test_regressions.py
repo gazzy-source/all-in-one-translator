@@ -79,9 +79,22 @@ async def test_chat_member_update_revokes_immediately(tmp_path: Path, detector: 
         await h.app.stop()
 
 
-async def test_unknown_chat_starts_disabled(tmp_path: Path, detector: Any) -> None:
+async def test_unknown_chat_starts_enabled_by_default(tmp_path: Path, detector: Any) -> None:
+    """ENABLE_NEW_GROUPS=all (default): a group works as soon as anyone adds the bot."""
     tg = FakeTelegram(members={GROUP_ID: {OWNER, SPANISH_SPEAKER, BOT_ID}}, admins={GROUP_ID})
     h = await build(tmp_path, detector, tg)
+    try:
+        await h.send(group_message("Que locura jajaja 😂", sender=SPANISH_SPEAKER))
+        await h.idle()
+        chat = await h.app.storage.get_chat(GROUP_ID)
+        assert chat is not None and chat.enabled  # (delivery waits until the bot's admin status is verified)
+    finally:
+        await h.app.stop()
+
+
+async def test_unknown_chat_starts_disabled_when_owner_added_only(tmp_path: Path, detector: Any) -> None:
+    tg = FakeTelegram(members={GROUP_ID: {OWNER, SPANISH_SPEAKER, BOT_ID}}, admins={GROUP_ID})
+    h = await build(tmp_path, detector, tg, ENABLE_NEW_GROUPS="owner_added")
     try:
         await h.send(group_message("Que locura jajaja 😂", sender=SPANISH_SPEAKER))
         await h.idle()

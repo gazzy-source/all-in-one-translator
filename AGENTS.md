@@ -11,7 +11,9 @@ code/configuration wins and the docs should be corrected as part of the work.
 - **Zero public group output.** The bot only sends ephemeral messages to specific receivers (Bot API 10.2+).
   `PublicOutputGuard` (`src/translator_bot/guard.py`) must keep rejecting every group-visible method. Never add a
   group-scope command menu, reactions, pins, edits or deletes of members' messages.
-- **Recipients are owners ∪ approved users ∩ current members**, re-checked per message, fail-closed.
+- **Recipients are (bot owners ∪ users approved by a bot owner ∪ users approved by this group's owner/admins
+  ∪, when the group's admins chose `/approveall`, the people seen in that group) ∩ current members**, re-checked
+  per message, fail-closed. Group-admin approval is valid only in that group.
 - **Message text is never written to disk or logged.** Only IDs/hashes, and OCR text of shared stickers/GIFs.
 - **Provider output is untrusted.** Plain-text sources are HTML-escaped; HTML sources keep only links present in
   the original (`restrict_links`). Validation (`orchestrator.validate`) rejects wrong-script and garbled output.

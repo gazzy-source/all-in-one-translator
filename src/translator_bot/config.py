@@ -110,7 +110,8 @@ class Settings(BaseSettings):
     inline_access: Literal["approved", "everyone"] = Field("approved", alias="INLINE_ACCESS")
     # who may use the 1:1 translator in a private chat with the bot (group translations always need approval)
     private_access: Literal["approved", "everyone"] = Field("everyone", alias="PRIVATE_ACCESS")
-    enable_new_groups: Literal["owner_added", "all", "none"] = Field("owner_added", alias="ENABLE_NEW_GROUPS")
+    # all = a group works as soon as anyone adds the bot (its admins run it; the bot owner isn't needed)
+    enable_new_groups: Literal["owner_added", "all", "none"] = Field("all", alias="ENABLE_NEW_GROUPS")
 
     # --- Storage / logging ----------------------------------------------------------------------
     database_path: Path = Field(Path("data/translator.sqlite3"), alias="DATABASE_PATH")

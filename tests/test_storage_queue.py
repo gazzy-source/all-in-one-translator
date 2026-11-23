@@ -23,11 +23,11 @@ async def st(tmp_path: Path) -> Storage:
 async def test_migrations_idempotent(tmp_path: Path) -> None:
     s = Storage(tmp_path / "x.sqlite3")
     await s.open()
-    assert await s.migrate() == 3
+    assert await s.migrate() == 4
     await s.close()
     s2 = Storage(tmp_path / "x.sqlite3")
     await s2.open()
-    assert await s2.migrate() == 3
+    assert await s2.migrate() == 4
     await s2.close()
 
 

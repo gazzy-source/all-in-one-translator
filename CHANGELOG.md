@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.4.0 — 2026-11-23
+
+### Added
+* **Groups run themselves — no bot owner needed.** A group works as soon as anyone adds the bot
+  (`ENABLE_NEW_GROUPS=all` is the new default); whoever adds/promotes it gets the setup steps privately.
+* **Group admins approve their members** (hidden reply `/approve` / `/revoke`, valid in that group only), or
+  **`/approveall`** — everyone in the group reads everyone in their own language, both ways (people are picked
+  up as they write, join or use `/tr`); `/revokeall` goes back to one by one.
+
+### Changed
+* **`/tr your text`** translates into every language the group reads (one line and one Copy button each),
+  skipping the ones the text is already in — live: "/tr kya horha hai" from an English reader only tried Hindi
+  and said "already Hindi" while the English reader got nothing.
+* **`/tr` answers instantly** ("⏳ Translating…") and the result replaces it in place; a generous per-user limit
+  so approved members never feel it.
+
 ## 1.3.0 — 2026-11-23
 
 ### Added

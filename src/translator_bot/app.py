@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import html
 import logging
+import time
 from dataclasses import dataclass
 
 from aiogram import Bot
@@ -100,7 +101,9 @@ class App:
                          lifetime_price=settings.stars_lifetime_price)
         self.private_daily: dict[int, tuple[str, int]] = {}
         self.private_pending: dict[int, int] = {}
-        self.plan_locks: dict[int, asyncio.Lock] = {}  # per-user: usage check/reserve vs count/release
+        self.plan_locks: dict[int, asyncio.Lock] = {}
+        self._admin_cache: dict[tuple[int, int], tuple[float, bool]] = {}
+        self.tr_limiter = KeyedLimiter(60, 60.0)  # /tr for approved members: generous, never in the way  # per-user: usage check/reserve vs count/release
         self.reply_targets: dict[tuple[int, int | None], tuple[float, list[str]]] = {}  # /tr + inline targets  # user id -> private translations in flight (plan reservation)  # user id -> (UTC day, count); unapproved users only
         self.bot_username = ""
         self.bot_id = settings.bot_id
@@ -250,6 +253,23 @@ class App:
                 await self.bot.send_message(oid, text)  # private chat only (positive id)
 
     # -- membership & setup ----------------------------------------------------------------------
+    async def is_chat_admin(self, chat_id: int, user_id: int) -> bool:
+        """The group's owner or an administrator (live getChatMember, cached 60 s; any error -> False)."""
+        key = (chat_id, user_id)
+        hit = self._admin_cache.get(key)
+        now = time.monotonic()
+        if hit is not None and now - hit[0] < 60:
+            return hit[1]
+        try:
+            m = await self.bot.get_chat_member(chat_id, user_id)
+            ok = m.status in ("creator", "administrator")
+        except TelegramAPIError:
+            ok = False
+        if len(self._admin_cache) > 10_000:
+            self._admin_cache.clear()
+        self._admin_cache[key] = (now, ok)
+        return ok
+
     async def _is_member(self, chat_id: int, user_id: int) -> bool:
         m = await self.bot.get_chat_member(chat_id, user_id)
         if m.status in ("left", "kicked"):

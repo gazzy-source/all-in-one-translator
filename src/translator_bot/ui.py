@@ -78,7 +78,7 @@ def _how_lines(*, uid: int, bot_username: str, approved: bool, private_ok: bool,
         lines.append("↩️ <b>Reply /tr</b> to any message to translate it · <b>/tr your text</b> → the group's "
                      "language, ready to copy or send (only you see it)")
     else:
-        lines.append(f"💬 <b>Groups</b> — ask the owner to approve you · your ID <code>{uid}</code>")
+        lines.append("💬 <b>Groups</b> — ask a group admin to approve you (they reply /approve to your message)")
     if inline_ok:
         lines.append(f"✍️ <b>Anywhere</b> — type <code>@{html.escape(bot_username)} hello</code>, tap to send")
     return lines
@@ -102,8 +102,8 @@ def welcome(user: User, *, default_lang: str, is_owner: bool, bot_username: str 
 
 
 ACCESS_DENIED = (
-    "🔒 This translator only works for people approved by its owner.\n"
-    "Send the owner your Telegram ID: <code>{uid}</code>"
+    "🔒 Ask a group admin to approve you — they reply /approve to one of your messages in the group "
+    "(only they see it). Your Telegram ID: <code>{uid}</code>"
 )
 
 
@@ -144,7 +144,7 @@ def help_text(*, uid: int, lang: str, bot_username: str, approved: bool, private
     tips = ["Your own messages and ones already in your language are skipped.",
             "The bot must be an admin in the group (no rights needed)."]
     tips.append("Check you haven't muted that group: /groups" if approved
-                else f"Ask the owner to approve you · your ID <code>{uid}</code>")
+                else "Ask a group admin to approve you: they reply /approve to one of your messages")
     tips.append("Stickers/GIFs need readable text; voice and video up to " + str(max_seconds) + " s.")
     cmds = ["/language — change your language", "/settings — preferences"]
     if approved:
