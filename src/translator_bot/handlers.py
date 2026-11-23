@@ -873,7 +873,10 @@ def _plan_lock(app: App, uid: int) -> asyncio.Lock:
     lk = app.plan_locks.get(uid)
     if lk is None:
         if len(app.plan_locks) > 10_000:
-            for k in [k for k, v in app.plan_locks.items() if not v.locked()][:5000]:
+            # only idle users: a lock still referenced by an in-flight job (reservation outstanding) must stay,
+            # or the next message would get a fresh lock that doesn't exclude that job
+            idle = [k for k, v in app.plan_locks.items() if not v.locked() and k not in app.private_pending]
+            for k in idle[:5000]:
                 del app.plan_locks[k]
         lk = app.plan_locks[uid] = asyncio.Lock()
     return lk

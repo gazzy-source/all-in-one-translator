@@ -228,3 +228,17 @@ def test_plan_math() -> None:
     assert billing.parse_payload("pack:5:100") == ("pack", 5, 100)
     for bad in ("pack:x:100", "gift:5:100", "pack:5", "pack:-5:100", "pack:5:0"):
         assert billing.parse_payload(bad) is None
+
+
+def test_plan_lock_eviction_keeps_users_with_reservations() -> None:
+    from types import SimpleNamespace
+
+    from translator_bot.handlers import _plan_lock
+
+    app: Any = SimpleNamespace(plan_locks={}, private_pending={})
+    busy = _plan_lock(app, 1)
+    app.private_pending[1] = 1  # a job of user 1 is in flight (its lock is captured by that job)
+    for uid in range(2, 10_003):
+        _plan_lock(app, uid)
+    assert app.plan_locks[1] is busy and _plan_lock(app, 1) is busy  # never evicted while reserved
+    assert len(app.plan_locks) < 10_003  # idle ones were evicted
