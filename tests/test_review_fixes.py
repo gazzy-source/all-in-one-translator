@@ -583,3 +583,16 @@ def test_mixed_script_media_is_left_to_the_text_path() -> None:
 
     assert _mixed_scripts("WHEN THE TEACHER SAYS\nစာမေးပွဲ မနက်ဖြန်")
     assert not _mixed_scripts("NO WAY BRO") and not _mixed_scripts("စာမေးပွဲ မနက်ဖြန် OK")
+
+
+def test_language_picker_shows_flags_and_keeps_current_language_first() -> None:
+    from translator_bot import ui
+
+    rows = ui.language_menu("ca").inline_keyboard
+    assert rows[0][0].text.startswith("✅") and rows[0][0].callback_data == "lang:set:ca"  # own language first
+    first = [b.callback_data for r in ui.language_menu("en").inline_keyboard[:-1] for b in r]
+    assert first[:4] == ["lang:set:en", "lang:set:ru", "lang:set:hi", "lang:set:id"] and "lang:set:my" in first
+    assert any(b.text == "🇪🇸 Español" for r in rows for b in r)
+    assert ui.flag("ca") == "🌐" and ui.flag("cy").startswith("🏴") and len(ui.flag("cy")) == 7
+    page = [b.text for r in ui.language_page(0, "en").inline_keyboard for b in r]
+    assert any(t.endswith("Afrikaans") and t.startswith("🇿🇦") for t in page)

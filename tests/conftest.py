@@ -111,6 +111,10 @@ class FakeTelegram:
                     "file_path": f"files/{fid}"}
         if name in ("EditMessageText", "EditMessageReplyMarkup"):
             return True
+        if name == "SendInvoice":
+            return {"message_id": next(_ids), "date": int(time.time()),
+                    "chat": {"id": params["chat_id"], "type": "private"},
+                    "from": {"id": BOT_ID, "is_bot": True, "first_name": "Babel"}}
         return True  # SetMyCommands, AnswerCallbackQuery, AnswerInlineQuery, EditEphemeralMessageText, ...
 
     # convenience views

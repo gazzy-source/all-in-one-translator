@@ -343,9 +343,12 @@ async def test_help_is_short_and_role_aware(h: Harness) -> None:
     outsider, owner = h.tg.dms_to(OUTSIDER)[0].params["text"], h.tg.dms_to(OWNER)[0].params["text"]
     assert "<b>Here</b>" in outsider and str(OUTSIDER) in outsider and "/pause" not in outsider
     assert "only to you" in owner and "/pause" in owner and "@babel_test_bot" in owner and "/status" in owner
-    assert "<blockquote expandable>" in owner and len(owner) < 700
+    assert "<blockquote expandable>" in owner and "Not getting a translation?" in owner and len(owner) < 1200
+    assert owner.startswith("🇬🇧 <b>English</b>") and "(default)" in owner
     kb = h.tg.dms_to(OWNER)[0].params["reply_markup"]["inline_keyboard"]
-    assert {b["callback_data"] for row in kb for b in row} == {"lang:menu", "me:show", "me:privacy"}
+    assert {b["callback_data"] for row in kb for b in row} == {"lang:menu", "me:show", "me:mygroups", "me:privacy"}
+    okb = h.tg.dms_to(OUTSIDER)[0].params["reply_markup"]["inline_keyboard"]
+    assert "me:mygroups" not in {b["callback_data"] for row in okb for b in row}  # not approved: no groups
 
 
 async def test_private_start_onboarding_for_approved(h: Harness) -> None:

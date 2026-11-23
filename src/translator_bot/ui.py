@@ -6,6 +6,7 @@ import html
 
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
+from translator_bot.billing import Plan
 from translator_bot.languages import LANGUAGES, POPULAR, Language, lang_name
 from translator_bot.storage import DEFAULT_CHAT_SETTINGS, Chat, User
 
@@ -21,23 +22,28 @@ def _rows(buttons: list[InlineKeyboardButton], per_row: int) -> list[list[Inline
 
 
 def lang_button(lang: Language, current: str | None, prefix: str) -> InlineKeyboardButton:
-    mark = "✅ " if lang.code == current else ""
+    mark = "✅ " if lang.code == current else flag(lang.code) + " "
     return _btn(f"{mark}{lang.native}", f"{prefix}:set:{lang.code}")
 
 
 def language_menu(current: str | None, prefix: str = "lang") -> InlineKeyboardMarkup:
-    pop = [lang_button(LANGUAGES[c], current, prefix) for c in POPULAR if c in LANGUAGES]
+    codes = [c for c in POPULAR if c in LANGUAGES]
+    if current in LANGUAGES and current not in codes:
+        codes.insert(0, current)  # e.g. Burmese: the reader's own language is always on the first page
+    pop = [lang_button(LANGUAGES[c], current, prefix) for c in codes]
     rows = _rows(pop, 3)
-    rows.append([_btn("🌍 All languages A–Z", f"{prefix}:page:0")])
+    rows.append([_btn("🌍 More languages A–Z ›", f"{prefix}:page:0")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def language_page(page: int, current: str | None, prefix: str = "lang") -> InlineKeyboardMarkup:
-    langs = sorted(LANGUAGES.values(), key=lambda lang: lang.name)
+    # the languages not on the first page, A–Z (the first page lists the most used ones)
+    langs = sorted((lg for lg in LANGUAGES.values() if lg.code not in POPULAR), key=lambda lang: lang.name)
     pages = max(1, (len(langs) + PAGE - 1) // PAGE)
     page = max(0, min(page, pages - 1))
     chunk = langs[page * PAGE:(page + 1) * PAGE]
-    rows = _rows([_btn(("✅ " if lg.code == current else "") + lg.name, f"{prefix}:set:{lg.code}") for lg in chunk], 3)
+    rows = _rows([_btn(("✅ " if lg.code == current else flag(lg.code) + " ") + lg.name, f"{prefix}:set:{lg.code}")
+                  for lg in chunk], 3)
     nav = []
     if page > 0:
         nav.append(_btn("‹ Prev", f"{prefix}:page:{page - 1}"))
@@ -69,6 +75,8 @@ def _how_lines(*, uid: int, bot_username: str, approved: bool, private_ok: bool,
         lines.append(f"📩 <b>Here</b> — send or forward text, stickers, GIFs, photos or voice (≤ {max_seconds} s)")
     if approved:
         lines.append("💬 <b>Groups</b> — translations appear right in the chat, visible <b>only to you</b>")
+        lines.append("↩️ <b>Reply /tr</b> to any message to translate it · <b>/tr your text</b> → the group's "
+                     "language, ready to copy or send (only you see it)")
     else:
         lines.append(f"💬 <b>Groups</b> — ask the owner to approve you · your ID <code>{uid}</code>")
     if inline_ok:
@@ -99,27 +107,86 @@ ACCESS_DENIED = (
 )
 
 
+def flag(code: str | None) -> str:
+    """Emoji flag of a language (decorative; 🌐 where no flag exists, e.g. Catalan, Esperanto)."""
+    lg = LANGUAGES.get(code or "")
+    return (lg.flag if lg and lg.flag else "🌐") if code else "🌐"
+
+
+def lang_source(user: User | None) -> str:
+    """Where the reader's language comes from, in a few words."""
+    if user is None or user.lang:
+        return "your choice" if user is not None and user.lang else "default"
+    if user.lang_guess:
+        return "auto · from how you write"
+    if user.tg_lang:
+        return "auto · from your Telegram app"
+    return "default"
+
+
 def help_text(*, uid: int, lang: str, bot_username: str, approved: bool, private_ok: bool, inline_ok: bool,
-              max_seconds: int = 60, is_owner: bool = False, paused: bool = False) -> str:
-    status = " · ⏸ paused" if paused and approved else ""
-    lines = [f"🌐 <b>Translating into {html.escape(lang_name(lang))}</b>{status}", ""]
+              max_seconds: int = 60, is_owner: bool = False, paused: bool = False, user: User | None = None,
+              groups: int | None = None, plan_line: str | None = None) -> str:
+    """/help: who I am for you right now, the three ways to use me, then collapsible help and commands."""
+    status = f"{flag(lang)} <b>{html.escape(lang_name(lang))}</b> <i>({lang_source(user)})</i>"
+    if paused and approved:
+        status += " · ⏸ paused"
+    lines = [status]
+    if approved and groups is not None:
+        lines.append(f"💬 Translating for you in <b>{groups}</b> group{'' if groups == 1 else 's'}" if groups
+                     else "💬 Not in a translated group yet")
+    if plan_line:
+        unlimited = user is not None and (user.lifetime or user.free_pass)
+        lines.append(plan_line + ("" if unlimited else " · /buy"))
+    lines.append("")
     lines += _how_lines(uid=uid, bot_username=bot_username, approved=approved, private_ok=private_ok,
                         inline_ok=inline_ok, max_seconds=max_seconds)
+    tips = ["Your own messages and ones already in your language are skipped.",
+            "The bot must be an admin in the group (no rights needed)."]
+    tips.append("Check you haven't muted that group: /groups" if approved
+                else f"Ask the owner to approve you · your ID <code>{uid}</code>")
+    tips.append("Stickers/GIFs need readable text; voice and video up to " + str(max_seconds) + " s.")
     cmds = ["/language — change your language", "/settings — preferences"]
     if approved:
         cmds += ["/groups — mute me in one group", "/pause · /resume — group translations"]
+    if plan_line:
+        cmds.append("/buy — more private translations · /paysupport — payment help · /terms")
     cmds.append("/privacy · /forgetme — your data")
     if is_owner:
-        cmds.append("👑 /recipients · /chats · /status")
-    lines += ["", "<blockquote expandable><b>All commands</b>\n" + "\n".join(cmds) + "</blockquote>"]
-    return "\n".join(lines)
+        cmds.append("👑 /recipients · /chats · /status · /approvefree · /refund")
+    nl = chr(10)
+    lines += ["", "<blockquote expandable>❓ <b>Not getting a translation?</b>" + nl
+              + nl.join("• " + t for t in tips) + "</blockquote>",
+              "<blockquote expandable>⌨️ <b>All commands</b>" + nl + nl.join(cmds) + "</blockquote>"]
+    return nl.join(lines)
 
 
-def help_kb() -> InlineKeyboardMarkup:
+def help_kb(lang: str | None = None, *, approved: bool = True) -> InlineKeyboardMarkup:
+    rows = [[_btn(f"{flag(lang)} Change language", "lang:menu"), _btn("⚙️ Settings", "me:show")]]
+    rows.append([_btn("👥 My groups", "me:mygroups"), _btn("🔒 Privacy", "me:privacy")] if approved
+                else [_btn("🔒 Privacy", "me:privacy")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def paywall_kb(plan: Plan) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [_btn("🌐 Change language", "lang:menu"), _btn("⚙️ Settings", "me:show")],
-        [_btn("🔒 Privacy", "me:privacy")],
+        [_btn(f"⭐ {plan.pack_price:,} · {plan.pack_size:,} more translations", "pay:pack")],
+        [_btn(f"♾ {plan.lifetime_price:,} · Unlimited forever", "pay:life")],
     ])
+
+
+def terms_text(plan: Plan) -> str:
+    return (
+        "<b>Terms of purchase</b>\n"
+        f"• Everyone gets {plan.free:,} free private-chat translations. After that: {plan.pack_size:,} more for "
+        f"{plan.pack_price:,} ⭐, or unlimited for life for {plan.lifetime_price:,} ⭐ (Telegram Stars).\n"
+        "• A translation counts only when it's delivered to you. Purchases are digital, tied to your Telegram "
+        "account, and take effect immediately.\n"
+        "• \"Lifetime\" means for as long as this bot is operated. Translations are made by AI services and may "
+        "contain mistakes; delivery speed depends on Telegram and those services.\n"
+        "• Problems or refund requests: /paysupport. Refunds are made in Stars to the same account.\n"
+        "• Group translations aren't sold; they're for members approved by the owner."
+    )
 
 
 PRIVACY = (
@@ -134,7 +201,9 @@ PRIVACY = (
     "IDs (no content) for up to 48 h to handle edits and avoid duplicates.\n"
     "• Translations are shown only to you via Telegram ephemeral messages. Telegram may not deliver them when "
     "you're offline and may remove them later; this is not end-to-end encryption.\n"
-    "/forgetme deletes your preferences and delivery records."
+    "• Purchases: Telegram processes Stars payments; the bot keeps the payment ID, amount and what it unlocked "
+    "(needed for refunds) and a count of your private-chat translations.\n"
+    "/forgetme deletes your preferences and delivery records (purchases and usage counts are kept)."
 )
 
 

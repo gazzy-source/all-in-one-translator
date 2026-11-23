@@ -10,6 +10,7 @@ import json
 import logging
 import re
 import time
+from collections import Counter
 from typing import Any
 
 from aiogram import Bot, F, Router
@@ -17,26 +18,32 @@ from aiogram.exceptions import TelegramAPIError, TelegramBadRequest, TelegramRet
 from aiogram.filters import Command, CommandObject
 from aiogram.types import (
     BotCommand,
+    BotCommandScopeAllGroupChats,
     BotCommandScopeAllPrivateChats,
     BotCommandScopeChatMember,
     CallbackQuery,
     ChatMemberUpdated,
+    CopyTextButton,
     EphemeralMessageParameters,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
     InlineQuery,
     InlineQueryResultArticle,
     InlineQueryResultsButton,
     InputTextMessageContent,
+    LabeledPrice,
     LinkPreviewOptions,
     Message,
+    PreCheckoutQuery,
     ReplyParameters,
 )
 
-from translator_bot import ui
+from translator_bot import billing, ui
 from translator_bot.app import App
 from translator_bot.detect import Verdict
 from translator_bot.eligibility import Eligible, Skip, classify
 from translator_bot.languages import lang_name, resolve_language, suggest_languages
-from translator_bot.pipeline import PrivateResult, html_escape_truncate
+from translator_bot.pipeline import PrivateResult, _media_file, html_escape_truncate
 from translator_bot.providers.base import TranslationJob
 from translator_bot.textutil import ContentKind, html_to_plain, normalize_for_key, profile_text, truncate
 
@@ -55,15 +62,28 @@ PRIVATE_COMMANDS = [
     BotCommand(command="resume", description="Resume your translations"),
     BotCommand(command="help", description="How it works"),
     BotCommand(command="privacy", description="What is processed and stored"),
+    BotCommand(command="buy", description="More private translations (Telegram Stars)"),
+    BotCommand(command="paysupport", description="Help with a payment"),
+    BotCommand(command="terms", description="Terms of purchase"),
 ]
 OWNER_GROUP_COMMANDS = [  # registered per owner per group; hidden from everyone else
     BotCommand(command="approve", description="Reply to a member: approve as recipient", is_ephemeral=True),
     BotCommand(command="revoke", description="Reply to a member: revoke recipient", is_ephemeral=True),
+    BotCommand(command="approvefree", description="Reply to a member: free private chat for life", is_ephemeral=True),
+    BotCommand(command="revokefree", description="Reply to a member: remove free pass", is_ephemeral=True),
     BotCommand(command="check", description="Verify translator setup", is_ephemeral=True),
     BotCommand(command="glossary", description="term = rendering  |  -term", is_ephemeral=True),
     BotCommand(command="mute", description="Stop my translations here", is_ephemeral=True),
     BotCommand(command="unmute", description="Resume my translations here", is_ephemeral=True),
 ]
+# Every member: hidden (ephemeral) commands - nobody else sees the command or the answer.
+MEMBER_GROUP_COMMANDS = [
+    BotCommand(command="tr", description="Reply: translate for me · /tr text: write in the group's language",
+               is_ephemeral=True),
+    BotCommand(command="mute", description="Stop my translations here", is_ephemeral=True),
+    BotCommand(command="unmute", description="Resume my translations here", is_ephemeral=True),
+]
+OWNER_GROUP_COMMANDS.insert(0, MEMBER_GROUP_COMMANDS[0])
 
 
 def build_routers(app: App) -> list[Router]:
@@ -72,6 +92,8 @@ def build_routers(app: App) -> list[Router]:
 
 async def register_commands(app: App) -> None:
     await app.bot.set_my_commands(PRIVATE_COMMANDS, scope=BotCommandScopeAllPrivateChats())
+    with contextlib.suppress(TelegramAPIError):
+        await app.bot.set_my_commands(MEMBER_GROUP_COMMANDS, scope=BotCommandScopeAllGroupChats())
 
 
 async def register_owner_group_commands(app: App, chat_id: int) -> None:
@@ -152,7 +174,20 @@ def _group_router(app: App) -> Router:
             return
         uid = msg.from_user.id
         is_owner = app.resolver.is_owner(uid)
-        if cmd in ("approve", "revoke", "check", "glossary") and not is_owner:
+        if cmd in ("approve", "revoke", "approvefree", "revokefree", "check", "glossary") and not is_owner:
+            return
+        if cmd in ("approvefree", "revokefree"):
+            r_msg = msg.reply_to_message
+            if (r_msg is None or r_msg.from_user is None or r_msg.from_user.is_bot or r_msg.sender_chat is not None
+                    or r_msg.forum_topic_created is not None
+                    or (msg.is_topic_message and r_msg.message_id == msg.message_thread_id)):
+                await ephemeral_reply(bot, msg, f"Reply to a member's message with /{cmd}.")
+                return
+            member = r_msg.from_user
+            await app.storage.upsert_user(member.id, first_name=member.first_name, free_pass=cmd == "approvefree")
+            verb = ("🎁 free for life in private chat (not counted, never charged)" if cmd == "approvefree"
+                    else "free pass removed")
+            await ephemeral_reply(bot, msg, f"{html.escape(member.full_name)} ({member.id}): {verb}.")
             return
         if cmd in ("approve", "revoke"):
             r_msg = msg.reply_to_message
@@ -180,6 +215,8 @@ def _group_router(app: App) -> Router:
             await app.storage.set_muted(uid, msg.chat.id, cmd == "mute")
             await ephemeral_reply(bot, msg, "🔕 Translations muted in this group." if cmd == "mute"
                                   else "🔔 Translations resumed in this group.")
+        elif cmd == "tr":
+            await _tr_command(app, bot, msg, arg)
         elif cmd in ("start", "language", "settings", "help") and await app.resolver.is_approved(uid):
             await ephemeral_reply(bot, msg, f'Settings live in our private chat: <a href="https://t.me/'
                                             f'{app.bot_username}?start=settings">open</a>.')
@@ -195,6 +232,155 @@ def _group_router(app: App) -> Router:
             await app.pipeline.on_edit(msg)
 
     return r
+
+
+async def _reply_targets(app: App, uid: int, chat_id: int | None = None) -> list[str]:
+    """Languages to write *into* so the other people understand: the reader languages of the group (or of all
+    the user's groups, for inline mode, which doesn't say which chat it is), most common first, minus the user's
+    own language. An explicit inline target (/settings) comes first. Cached briefly per user/chat."""
+    key = (uid, chat_id)
+    hit = app.reply_targets.get(key)
+    if hit is not None and time.monotonic() - hit[0] < 300:
+        return hit[1]
+    user = await app.storage.get_user(uid)
+    own = ((user.effective_lang if user else None) or app.s.default_target_lang).split("-")[0]
+    counts: Counter[str] = Counter()
+    try:
+        chats = [c for c in await app.storage.active_chats() if c.enabled and (chat_id is None or c.chat_id == chat_id)]
+        for c in chats[:20]:
+            if chat_id is None and not await app.membership.is_member(c.chat_id, uid):
+                continue
+            for rcp in await app.resolver.resolve(c.chat_id, uid):
+                counts[rcp.lang] += 1
+    except Exception:
+        log.debug("reply targets failed", exc_info=True)
+    out: list[str] = []
+    if user is not None and user.inline_lang:
+        out.append(user.inline_lang)
+    out += [lg for lg, _n in counts.most_common() if lg.split("-")[0] != own]
+    if not out and own != "en":
+        out.append("en")  # nobody else known yet: English is the safest bridge
+    seen: list[str] = []
+    for lg in out:
+        if lg not in seen:
+            seen.append(lg)
+    result = seen[:3]
+    app.reply_targets[key] = (time.monotonic(), result)
+    if len(app.reply_targets) > 10_000:
+        app.reply_targets.clear()
+    return result
+
+
+async def _translate_text(app: App, text: str, target: str, *, purpose: str = "inline",
+                          deadline_s: float | None = None) -> tuple[str | None, str]:
+    """Plain text -> (translation or None, reason: "" | "same" | "failed")."""
+    assert app.detector is not None and app.orchestrator is not None
+    det = await asyncio.to_thread(app.detector.detect, text, target)
+    if det.verdict is Verdict.TARGET:
+        return None, "same"
+    job = TranslationJob(text=text, target=target, source_hint=det.lang if det.verdict is Verdict.OTHER else None,
+                         romanized=det.romanized, mixed=det.mixed, unsure=det.verdict is Verdict.UNSURE)
+    try:
+        res = await app.orchestrator.translate(job, det, purpose=purpose,  # type: ignore[arg-type]
+                                               deadline_s=deadline_s or app.s.inline_timeout_s)
+    except Exception:
+        log.warning("translation failed", exc_info=True)
+        return None, "failed"
+    if res is None:
+        return None, "failed"
+    if not res.needs_translation or not res.translation:
+        return None, "same"
+    return res.translation, ""
+
+
+async def _send_ephemeral(app: App, msg: Message, text: str, *, reply_to: int | None = None,
+                          markup: InlineKeyboardMarkup | None = None, plain: bool = False) -> None:
+    """Only the command's sender sees this (never the group)."""
+    if msg.from_user is None:
+        return
+    reply = (ReplyParameters(message_id=reply_to, allow_sending_without_reply=True) if reply_to
+             else ReplyParameters(ephemeral_message_id=msg.ephemeral_message_id) if msg.ephemeral_message_id else None)
+    with contextlib.suppress(TelegramAPIError):
+        await app.bot.send_message(chat_id=msg.chat.id, text=text, reply_parameters=reply, reply_markup=markup,
+                                   parse_mode=None if plain else "HTML",
+                                   message_thread_id=msg.message_thread_id if msg.is_topic_message else None,
+                                   link_preview_options=LinkPreviewOptions(is_disabled=True),
+                                   ephemeral_message_parameters=EphemeralMessageParameters(
+                                       receiver_user_id=msg.from_user.id))
+
+
+async def _tr_command(app: App, bot: Bot, msg: Message, arg: str) -> None:
+    """Hidden /tr in a group (only the sender sees the command and the answer):
+    * as a reply: translate that message (text, caption, sticker, GIF, voice...) into my language, for me only -
+      also when my translations are paused or muted here;
+    * with text: translate what I want to say into the group's language, with Copy and Send buttons, so I
+      never leave the chat."""
+    if msg.from_user is None or app.pipeline is None:
+        return
+    uid = msg.from_user.id
+    if not await app.resolver.is_approved(uid):
+        await _send_ephemeral(app, msg, "🔒 /tr is for members approved by the bot owner.")
+        return
+    # same gates as every group message: chat enabled + active, bot is admin, topic enabled, chat toggles
+    chat = await app.pipeline.chat(msg)
+    thread = msg.message_thread_id if msg.is_topic_message else None
+    if not (chat.enabled and chat.active and chat.bot_is_admin) or not await app.storage.topic_enabled(
+            msg.chat.id, thread):
+        await _send_ephemeral(app, msg, "⏸ Translation is switched off here.")
+        return
+    if not app.private_limiter.try_acquire(uid):
+        await _send_ephemeral(app, msg, "⏳ That's a lot at once — give me a few seconds.")
+        return
+    reply = msg.reply_to_message
+    lane = app.pipeline.media_lane if (not arg.strip() and reply is not None and _media_file(reply)[0]) \
+        else app.pipeline.text_lane
+    if not await lane.submit(msg.chat.id, lambda: _tr_work(app, msg, arg, chat.settings),
+                             key=f"tr:{msg.chat.id}:{msg.message_id}"):
+        await _send_ephemeral(app, msg, "⏳ I'm busy right now — please try again in a moment.")
+
+
+async def _tr_work(app: App, msg: Message, arg: str, settings: dict[str, Any]) -> None:
+    assert msg.from_user is not None and app.pipeline is not None
+    uid = msg.from_user.id
+    user = await app.storage.get_user(uid)
+    mine = (user.effective_lang if user else None) or app.s.default_target_lang
+    text = arg.strip()
+    if text:
+        targets = await _reply_targets(app, uid, msg.chat.id) or ["en"]
+        target = targets[0]
+        out, why = await _translate_text(app, truncate(text, app.s.max_text_chars), target, purpose="group",
+                                         deadline_s=10.0)
+        if out is None:
+            await _send_ephemeral(app, msg, f"✅ That's already {html.escape(lang_name(target))}." if why == "same"
+                                  else "⚠️ Couldn't translate right now — try again in a moment.")
+            return
+        out = truncate(out, 3900)
+        kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="📋 Copy", copy_text=CopyTextButton(text=truncate(out, 256))),
+            InlineKeyboardButton(text="✍️ Send", switch_inline_query_current_chat=truncate(text, 200)),
+        ]])
+        await _send_ephemeral(app, msg, f"{ui.flag(target)} {out}", markup=kb, plain=True)
+        return
+    target_msg = msg.reply_to_message
+    if target_msg is None or (msg.is_topic_message and target_msg.message_id == msg.message_thread_id):
+        await _send_ephemeral(app, msg, "Reply <code>/tr</code> to a message to translate it for you, or write "
+                                        "<code>/tr your text</code> to get it in the group's language.")
+        return
+    el = classify(target_msg, bot_id=app.bot_id, settings=settings, media_enabled=app.s.media_enabled)
+    if isinstance(el, Skip):
+        await _send_ephemeral(app, msg, "🤷 Nothing to translate in that message.", reply_to=target_msg.message_id)
+        return
+    if len(el.plain) > app.s.max_text_chars:
+        el = Eligible(el.kind, html_escape_truncate(el.plain, app.s.max_text_chars),
+                      truncate(el.plain, app.s.max_text_chars), el.has_media)
+    try:
+        res = await app.pipeline.translate_private(target_msg, el, mine)  # the lane bounds the time
+    except Exception:
+        log.warning("/tr failed", exc_info=True)
+        res = PrivateResult(None, None, "failed")
+    body = res.text or _PRIVATE_REASONS.get(res.reason, _PRIVATE_REASONS["no_text"]).format(
+        lang=html.escape(lang_name(mine)), secs=int(app.s.max_media_seconds))
+    await _send_ephemeral(app, msg, body, reply_to=target_msg.message_id)
 
 
 async def _glossary_cmd(app: App, chat_id: int, arg: str) -> str:
@@ -249,6 +435,107 @@ def _private_router(app: App) -> Router:
         awaiting_lang[uid] = time.monotonic()
         if len(awaiting_lang) > 10_000:
             awaiting_lang.pop(next(iter(awaiting_lang)))
+
+    # -- Telegram Stars: payment results arrive as service messages in the private chat --------------
+    @r.message(F.successful_payment)
+    async def paid(msg: Message) -> None:
+        sp = msg.successful_payment
+        if sp is None or msg.from_user is None:
+            return
+        uid = msg.from_user.id
+        parsed = billing.parse_payload(sp.invoice_payload)
+        charge = html.escape(sp.telegram_payment_charge_id)
+        if sp.currency != "XTR" or parsed is None or parsed[1] != uid or parsed[2] != sp.total_amount:
+            log.error("unexpected payment", extra={"user_id": uid, "amount": sp.total_amount})
+            # recorded with nothing granted, so the owner's /refund can find and refund it
+            await app.storage.record_payment(sp.telegram_payment_charge_id, uid, "invalid", sp.total_amount, 0)
+            await app.notify_owners(f"⚠️ Unexpected Stars payment from <code>{uid}</code> ({sp.total_amount} ⭐). "
+                                    f"Check it, or refund: <code>/refund {charge}</code>")
+            await _say(msg, "Payment received — the owner will check it and get back to you.")
+            return
+        product = parsed[0]
+        new = await app.storage.record_payment(sp.telegram_payment_charge_id, uid, product, sp.total_amount,
+                                               app.plan.grant(product))
+        user = await app.storage.get_user(uid)
+        if not new:
+            await _say(msg, "✅ This payment is already on your account.\n" + billing.status_line(app.plan, user))
+            return
+        app.metrics.inc(f"payments.{product}")
+        thanks = ("♾ <b>Lifetime unlocked</b> — thank you!" if product == billing.LIFETIME
+                  else f"✅ <b>+{billing.fmt(app.plan.grant(product))} translations</b> — thank you!")
+        await _say(msg, thanks + "\n" + billing.status_line(app.plan, user))
+        who = html.escape(msg.from_user.full_name)
+        await app.notify_owners(f"💰 {who} (<code>{uid}</code>) paid {sp.total_amount} ⭐ · {product}\n"
+                                f"Refund: <code>/refund {charge}</code>")
+
+    @r.message(F.refunded_payment)
+    async def refunded(msg: Message) -> None:
+        rp = msg.refunded_payment
+        if rp is None:
+            return
+        await app.storage.mark_refunded(rp.telegram_payment_charge_id)
+        user = await app.storage.get_user(msg.from_user.id) if msg.from_user else None
+        await _say(msg, "↩️ Your payment was refunded.\n" + billing.status_line(app.plan, user))
+
+    @r.message(Command("buy"))
+    async def buy(msg: Message) -> None:
+        ok, _approved = await access(msg)
+        if not ok:
+            return
+        assert msg.from_user is not None
+        uid = msg.from_user.id
+        user = await app.storage.get_user(uid)
+        if billing.is_exempt(app.plan, is_owner=app.resolver.is_owner(uid), user=user):
+            await msg.answer("🎁 Private translations are free for you — nothing to buy.")
+            return
+        if user is not None and user.lifetime:
+            await msg.answer(billing.status_line(app.plan, user))
+            return
+        await msg.answer(billing.status_line(app.plan, user) + "\n\n" + billing.offer_text(app.plan),
+                         reply_markup=ui.paywall_kb(app.plan))
+
+    @r.message(Command("terms"))
+    async def terms(msg: Message) -> None:
+        await msg.answer(ui.terms_text(app.plan))
+
+    @r.message(Command("paysupport"))
+    async def paysupport(msg: Message, command: CommandObject) -> None:
+        """Required by Telegram for bots selling digital goods."""
+        if msg.from_user is None:
+            return
+        text = (command.args or "").strip()
+        if not text:
+            await msg.answer("🆘 <b>Payment help</b>\nDescribe the problem after the command, e.g.\n"
+                             "<code>/paysupport I paid but didn't get the translations</code>\n"
+                             "The owner gets your message and your Telegram ID, and can refund you.")
+            return
+        u = msg.from_user
+        contact = f"@{html.escape(u.username)}" if u.username else "no username"
+        await app.notify_owners(f"🆘 Payment support from {html.escape(u.full_name)} ({contact}, "
+                                f"<code>{u.id}</code>):\n{html.escape(truncate(text, 1000))}")
+        await msg.answer("📨 Sent to the owner — they'll get back to you.")
+
+    @r.message(Command("refund"))
+    async def refund(msg: Message, command: CommandObject) -> None:
+        """Owner: /refund <telegram_payment_charge_id> - refunds the Stars and removes what was bought."""
+        if msg.from_user is None or not app.resolver.is_owner(msg.from_user.id):
+            return
+        charge = (command.args or "").strip()
+        pay = await app.storage.payment(charge) if charge else None
+        if pay is None:
+            await msg.answer("Usage: <code>/refund &lt;payment id&gt;</code> (the id is in the payment notification).")
+            return
+        if pay["refunded"]:
+            await msg.answer("Already refunded.")
+            return
+        try:
+            await app.bot.refund_star_payment(user_id=int(pay["user_id"]), telegram_payment_charge_id=charge)
+        except TelegramAPIError as exc:
+            await msg.answer(f"Refund failed: {html.escape(str(exc))[:200]}")
+            return
+        await app.storage.mark_refunded(charge)
+        await msg.answer(f"↩️ Refunded {pay['stars']} ⭐ to <code>{pay['user_id']}</code>; their "
+                         f"{html.escape(str(pay['product']))} was removed.")
 
     @r.message(Command("start"))
     async def start(msg: Message) -> None:
@@ -311,15 +598,19 @@ def _private_router(app: App) -> Router:
         if not ok:
             return
         assert msg.from_user is not None
-        user = await app.storage.get_user(msg.from_user.id)
-        await msg.answer(ui.help_text(uid=msg.from_user.id, lang=(user.effective_lang if user else None)
-                                      or app.s.default_target_lang, bot_username=app.bot_username,
+        uid = msg.from_user.id
+        user = await app.storage.get_user(uid)
+        lang = (user.effective_lang if user else None) or app.s.default_target_lang
+        groups = await _group_count(app, uid) if approved else None
+        await msg.answer(ui.help_text(uid=uid, lang=lang, bot_username=app.bot_username,
                                       approved=approved, private_ok=True,
                                       inline_ok=approved or app.s.inline_access == "everyone",
                                       max_seconds=int(app.s.max_media_seconds),
-                                      is_owner=app.resolver.is_owner(msg.from_user.id),
-                                      paused=bool(user and user.paused)),
-                         reply_markup=ui.help_kb())
+                                      is_owner=app.resolver.is_owner(uid),
+                                      paused=bool(user and user.paused), user=user, groups=groups,
+                                      plan_line=None if app.resolver.is_owner(uid) or not app.plan.enabled
+                                      else billing.status_line(app.plan, user)),
+                         reply_markup=ui.help_kb(lang, approved=approved))
 
     @r.message(Command("privacy"))
     async def privacy(msg: Message) -> None:
@@ -347,6 +638,25 @@ def _private_router(app: App) -> Router:
         for i in ids:
             await app.storage.set_approved(i, command.command == "approve", by=msg.from_user.id)
         await msg.answer(f"{'Approved' if command.command == 'approve' else 'Revoked'}: "
+                         + ", ".join(f"<code>{i}</code>" for i in ids))
+
+    @r.message(Command("approvefree", "revokefree"))
+    async def approve_free(msg: Message, command: CommandObject) -> None:
+        """Owner: free lifetime private-chat use (never counted, never charged). Separate from /approve."""
+        if msg.from_user is None or not app.resolver.is_owner(msg.from_user.id):
+            return
+        ids = [int(x) for x in (command.args or "").replace(",", " ").split() if _INT_RE.fullmatch(x)]
+        if not ids or any(i <= 0 for i in ids):
+            users = await app.storage.free_pass_users()
+            listing = ", ".join(f"{html.escape(u.first_name or '')} <code>{u.user_id}</code>" for u in users) or "none"
+            await msg.answer(f"Usage: <code>/{command.command} 123456789</code> — or reply "
+                             f"<code>/{command.command}</code> to someone's message in a group.\n"
+                             f"🎁 Free for life: {listing}")
+            return
+        grant = command.command == "approvefree"
+        for i in ids:
+            await app.storage.upsert_user(i, free_pass=grant)
+        await msg.answer(("🎁 Free for life: " if grant else "Free pass removed: ")
                          + ", ".join(f"<code>{i}</code>" for i in ids))
 
     @r.message(Command("recipients"))
@@ -447,15 +757,16 @@ async def _say(msg: Message, text: str) -> None:
         await msg.answer(text)
 
 
-async def _reply_safe(msg: Message, body_html: str) -> None:
-    """Reply in the private chat; never silently lose the answer to length or markup problems."""
+async def _reply_safe(msg: Message, body_html: str) -> bool:
+    """Reply in the private chat; never silently lose the answer to length or markup problems.
+    Returns True when the reply was delivered."""
     if len(body_html) > 4096:
         body_html = html.escape(truncate(html_to_plain(body_html), 4000), quote=False)
     preview = LinkPreviewOptions(is_disabled=True)
     for attempt in range(2):
         try:
             await msg.reply(body_html, link_preview_options=preview)
-            return
+            return True
         except TelegramRetryAfter as exc:
             if attempt or exc.retry_after > 10:
                 break
@@ -466,11 +777,12 @@ async def _reply_safe(msg: Message, body_html: str) -> None:
             with contextlib.suppress(TelegramAPIError):  # broken markup: send it as plain text
                 await msg.reply(truncate(html_to_plain(body_html), 4096), parse_mode=None,
                                 link_preview_options=preview)
-                return
+                return True
             break
         except TelegramAPIError:
             break
     log.warning("private reply failed")
+    return False
 
 
 async def _private_translate(app: App, msg: Message, target: str, approved: bool) -> None:
@@ -488,7 +800,23 @@ async def _private_translate(app: App, msg: Message, target: str, approved: bool
     if not app.private_limiter.try_acquire(uid):
         await _say(msg, "⏳ That's a lot at once — give me a few seconds.")
         return
-    if not approved and not app.resolver.is_owner(uid) and not _daily_ok(app, uid):
+    is_owner = app.resolver.is_owner(uid)
+    lock = _plan_lock(app, uid)
+    async with lock:  # read usage + reserve atomically against finishing jobs (count + release)
+        user = await app.storage.get_user(uid)
+        metered = not billing.is_exempt(app.plan, is_owner=is_owner, user=user)
+        left = billing.remaining(app.plan, user) if metered else None
+        # translations still in flight are reserved, so a burst can't overshoot the allowance
+        paywall = left is not None and left - app.private_pending.get(uid, 0) <= 0
+        if metered and not paywall:
+            app.private_pending[uid] = app.private_pending.get(uid, 0) + 1  # reservation
+    if paywall:
+        await _send_paywall(app, msg)
+        return
+    reserved = metered
+    if not approved and not is_owner and not billing.has_paid(user) and not _daily_ok(app, uid):
+        if reserved:
+            _release(app, uid)
         await _say(msg, "📅 Today's limit of private translations is reached. It resets at 00:00 UTC.")
         return
     if len(el.plain) > app.s.max_text_chars:
@@ -497,26 +825,108 @@ async def _private_translate(app: App, msg: Message, target: str, approved: bool
     lane = pipeline.media_lane if el.has_media else pipeline.text_lane
 
     async def job() -> None:
-        t0 = time.perf_counter()
-        with contextlib.suppress(TelegramAPIError):
-            await app.bot.send_chat_action(uid, "typing")
+        released = False
+
+        def release_once() -> None:  # this job's own reservation, exactly once, however the job ends
+            nonlocal released
+            if reserved and not released:
+                released = True
+                _release(app, uid)
+
         try:
-            res = await asyncio.wait_for(pipeline.translate_private(msg, el, target),
-                                         timeout=max(3.0, lane.job_timeout - 2))
-        except Exception:
-            log.warning("private translation failed", exc_info=True)
-            res = PrivateResult(None, None, "failed")
-        lang = html.escape(lang_name(target))
-        if res.text:
-            body = res.text  # only the translation
-        else:
-            body = _PRIVATE_REASONS.get(res.reason, _PRIVATE_REASONS["no_text"]).format(
-                lang=lang, secs=int(app.s.max_media_seconds))
-        await _reply_safe(msg, body)
-        pipeline.metrics.observe(f"private_ms.{el.kind.value}", (time.perf_counter() - t0) * 1000)
+            t0 = time.perf_counter()
+            with contextlib.suppress(TelegramAPIError):
+                await app.bot.send_chat_action(uid, "typing")
+            try:
+                res = await asyncio.wait_for(pipeline.translate_private(msg, el, target),
+                                             timeout=max(3.0, lane.job_timeout - 2))
+            except Exception:
+                log.warning("private translation failed", exc_info=True)
+                res = PrivateResult(None, None, "failed")
+            lang = html.escape(lang_name(target))
+            if res.text:
+                body = res.text  # only the translation
+            else:
+                body = _PRIVATE_REASONS.get(res.reason, _PRIVATE_REASONS["no_text"]).format(
+                    lang=lang, secs=int(app.s.max_media_seconds))
+            delivered = await _reply_safe(msg, body)
+            pipeline.metrics.observe(f"private_ms.{el.kind.value}", (time.perf_counter() - t0) * 1000)
+            after: int | None = None
+            if reserved:
+                async with lock:  # count + release together, so a concurrent check never counts this twice
+                    if res.text and delivered:  # only delivered translations count
+                        await app.storage.add_private_use(uid)
+                        after = billing.remaining(app.plan, await app.storage.get_user(uid))
+                    release_once()
+            if after in (100, 10):
+                await _say(msg, f"🎟 {billing.fmt(after)} private translations left · /buy")
+        finally:
+            release_once()
 
     if not await lane.submit(uid, job, key=f"p:{uid}:{msg.message_id}"):
+        if reserved:
+            _release(app, uid)
         await _say(msg, "⏳ I'm busy right now — please try again in a moment.")
+
+
+def _plan_lock(app: App, uid: int) -> asyncio.Lock:
+    lk = app.plan_locks.get(uid)
+    if lk is None:
+        if len(app.plan_locks) > 10_000:
+            # only idle users: a lock still referenced by an in-flight job (reservation outstanding) must stay,
+            # or the next message would get a fresh lock that doesn't exclude that job
+            idle = [k for k, v in app.plan_locks.items() if not v.locked() and k not in app.private_pending]
+            for k in idle[:5000]:
+                del app.plan_locks[k]
+        lk = app.plan_locks[uid] = asyncio.Lock()
+    return lk
+
+
+def _release(app: App, uid: int) -> None:
+    n = app.private_pending.get(uid, 0) - 1
+    if n > 0:
+        app.private_pending[uid] = n
+    else:
+        app.private_pending.pop(uid, None)
+
+
+async def _send_paywall(app: App, msg: Message) -> None:
+    with contextlib.suppress(TelegramAPIError):
+        await msg.answer(billing.paywall_text(app.plan), reply_markup=ui.paywall_kb(app.plan))
+
+
+async def _send_invoice(app: App, uid: int, product: str) -> str | None:
+    """Telegram Stars invoice (currency XTR, no provider token). Returns an error text, or None when sent."""
+    price = app.plan.price(product)
+    if price is None or not app.plan.enabled:
+        return "This purchase isn't available."
+    if product == billing.LIFETIME:
+        user = await app.storage.get_user(uid)
+        if user is not None and user.lifetime:
+            return "You already have lifetime access ♾"
+    title, description = billing.product_title(app.plan, product)
+    try:
+        await app.bot.send_invoice(chat_id=uid, title=title, description=description,
+                                   payload=billing.payload(product, uid, price), currency="XTR",
+                                   prices=[LabeledPrice(label=title, amount=price)])
+    except TelegramAPIError:
+        log.warning("send_invoice failed", exc_info=True)
+        return "Couldn't create the invoice — please try again."
+    return None
+
+
+async def _group_count(app: App, user_id: int) -> int | None:
+    """Enabled groups where this user is a member and hasn't muted the bot (None if it can't be checked)."""
+    try:
+        chats = [c for c in await app.storage.active_chats() if c.enabled][:50]
+        flags = await asyncio.gather(*(app.membership.is_member(c.chat_id, user_id) for c in chats))
+        n = 0
+        for c, is_member in zip(chats, flags, strict=True):
+            if is_member and user_id not in await app.storage.muted_users(c.chat_id):
+                n += 1
+        return n
+    except Exception:  # help must always render
+        return None
 
 
 async def _send_groups(app: App, msg: Message, user_id: int, edit: bool = False) -> None:
@@ -569,6 +979,9 @@ def _status_text(app: App) -> str:
         lines.append(f"deepl chars: {app.deepl.char_count}/{app.deepl.char_limit}")
     if app.pipeline:
         lines.append(f"queues: text {app.pipeline.text_lane.size} · media {app.pipeline.media_lane.size}")
+    sold = {k: v for k, v in c.items() if k.startswith("payments.")}
+    if sold:
+        lines.append("stars sales since start: " + ", ".join(f"{k[9:]} × {v}" for k, v in sorted(sold.items())))
     return "\n".join(lines)
 
 
@@ -587,7 +1000,8 @@ def _callback_router(app: App) -> Router:
         data = cb.data or ""
         msg = cb.message
         if not await app.resolver.is_approved(uid) and (app.s.private_access != "everyone"
-                                                         or data.partition(":")[0] not in ("lang", "ilang", "me")):
+                                                         or data.partition(":")[0] not in ("lang", "ilang", "me",
+                                                                                            "pay")):
             await cb.answer("This translator is private.", show_alert=True)
             return
         user = await app.storage.get_user(uid) or await app.storage.upsert_user(uid)
@@ -643,6 +1057,10 @@ def _callback_router(app: App) -> Router:
                 await msg.answer(ui.PRIVACY)
                 await cb.answer()
                 return
+            elif action == "mygroups":  # from /help: list below, keep the help message
+                await _send_groups(app, msg, uid)
+                await cb.answer()
+                return
             elif action == "show":  # from /help: open settings below, keep the help message
                 await msg.answer(ui.settings_text(user, app.s.default_target_lang),
                                  reply_markup=ui.settings_kb(user, app.s.default_target_lang))
@@ -653,6 +1071,10 @@ def _callback_router(app: App) -> Router:
                                     reply_markup=ui.settings_kb(user, app.s.default_target_lang))
             await cb.answer("Saved")
             return
+        if prefix == "pay":
+            err = await _send_invoice(app, uid, rest)
+            await cb.answer(err or "", show_alert=bool(err))
+            return
         if prefix == "own":
             if not app.resolver.is_owner(uid):
                 await cb.answer("Owners only.", show_alert=True)
@@ -660,6 +1082,24 @@ def _callback_router(app: App) -> Router:
             await _owner_cb(app, cb, msg, rest)
             return
         await cb.answer()
+
+    @r.pre_checkout_query()
+    async def pre_checkout(q: PreCheckoutQuery) -> None:
+        """Telegram asks before charging: re-validate product, buyer and price (10 s deadline)."""
+        parsed = billing.parse_payload(q.invoice_payload)
+        error: str | None = None
+        if not app.plan.enabled or parsed is None or q.currency != "XTR":
+            error = "This purchase is no longer available."
+        else:
+            product, buyer, price = parsed
+            if buyer != q.from_user.id or q.total_amount != price or app.plan.price(product) != price:
+                error = "The price has changed — please tap /buy again."
+            elif product == billing.LIFETIME:
+                user = await app.storage.get_user(buyer)
+                if user is not None and user.lifetime:
+                    error = "You already have lifetime access."
+        with contextlib.suppress(TelegramAPIError):
+            await q.answer(ok=error is None, error_message=error)
 
     return r
 
@@ -740,42 +1180,34 @@ def _inline_router(app: App) -> Router:
             await q.answer([], cache_time=5, is_personal=True, button=InlineQueryResultsButton(
                 text="Slow down a little — try again in a moment", start_parameter="inline"))
             return
-        user = await app.storage.get_user(uid)
-        target = (user.inline_lang if user else None) or "en"
-        assert app.detector is not None and app.orchestrator is not None
-        det = await asyncio.to_thread(app.detector.detect, query, target)
-        rid = hashlib.sha256(f"{target}:{query}".encode()).hexdigest()[:32]
-        if det.verdict is Verdict.TARGET:
-            await q.answer([InlineQueryResultArticle(
-                id=f"same{rid}", title=f"Already in {lang_name(target)}", description=truncate(query, 120),
-                input_message_content=InputTextMessageContent(message_text=query, parse_mode=None))],
-                cache_time=300, is_personal=True)
-            return
-        job = TranslationJob(text=query, target=target, source_hint=det.lang if det.verdict is Verdict.OTHER else None,
-                             romanized=det.romanized, mixed=det.mixed, unsure=det.verdict is Verdict.UNSURE)
-        try:
-            res = await app.orchestrator.translate(job, det, purpose="inline", deadline_s=app.s.inline_timeout_s)
-        except Exception:
-            log.exception("inline translation failed")
-            res = None
+        # write into the languages the user's groups read (explicit inline target first), up to 3, in parallel
+        targets = await _reply_targets(app, uid) or ["en"]
+        outs = await asyncio.gather(*(_translate_text(app, query, t) for t in targets))
         if latest.get(uid) != q.id:
             return  # superseded while translating
-        if res is None:
+        rid = hashlib.sha256(f"{','.join(targets)}:{query}".encode()).hexdigest()[:24]
+        results: list[Any] = []
+        for t, (out, _why) in zip(targets, outs, strict=True):
+            if out:
+                translation = truncate(out, 4096)
+                results.append(InlineQueryResultArticle(
+                    id=f"t{t}{rid}"[:64], title=f"{ui.flag(t)} {truncate(translation, 110)}",
+                    description=f"{lang_name(t)} · tap to send",
+                    input_message_content=InputTextMessageContent(message_text=translation, parse_mode=None)))
+        if results:
+            first = results[0].input_message_content.message_text
+            both = truncate(f"{first}\n\n— {query}", 4096)
+            results.append(InlineQueryResultArticle(
+                id=f"b{rid}", title="Translation + original", description=truncate(both.replace("\n", " "), 120),
+                input_message_content=InputTextMessageContent(message_text=both, parse_mode=None)))
+        elif all(why == "same" for _o, why in outs):
+            results.append(InlineQueryResultArticle(
+                id=f"same{rid}", title=f"Already in {lang_name(targets[0])}", description=truncate(query, 120),
+                input_message_content=InputTextMessageContent(message_text=query, parse_mode=None)))
+        else:
             await q.answer([], cache_time=5, is_personal=True, button=InlineQueryResultsButton(
                 text="Translation unavailable right now — try again", start_parameter="inline"))
             return
-        src = res.source_lang or det.lang
-        pair = f"{lang_name(src)} → {lang_name(target)}" if src else lang_name(target)
-        translation = truncate(res.translation, 4096)
-        both = truncate(f"{res.translation}\n\n— {query}", 4096)
-        results: list[Any] = [
-            InlineQueryResultArticle(
-                id=f"t{rid}", title=truncate(translation, 120), description=f"{pair} · tap to send",
-                input_message_content=InputTextMessageContent(message_text=translation, parse_mode=None)),
-            InlineQueryResultArticle(
-                id=f"b{rid}", title="Translation + original", description=truncate(both.replace("\n", " "), 120),
-                input_message_content=InputTextMessageContent(message_text=both, parse_mode=None)),
-        ]
         with contextlib.suppress(TelegramAPIError):
             await q.answer(results, cache_time=300, is_personal=True)
         app.metrics.inc("inline.answered")

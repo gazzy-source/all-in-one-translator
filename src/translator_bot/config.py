@@ -95,6 +95,13 @@ class Settings(BaseSettings):
     private_daily_limit: int = Field(200, alias="PRIVATE_DAILY_LIMIT", ge=0)
     # ... and in total across all of them (0 = unlimited). In memory: a restart resets both counters.
     private_global_daily_limit: int = Field(500, alias="PRIVATE_GLOBAL_DAILY_LIMIT", ge=0)
+    # --- Private-chat plan (Telegram Stars) ---
+    paywall_enabled: bool = Field(True, alias="PAYWALL_ENABLED")
+    free_private_messages: int = Field(1000, alias="FREE_PRIVATE_MESSAGES", ge=0)
+    stars_pack_size: int = Field(1000, alias="STARS_PACK_SIZE", ge=1)
+    stars_pack_price: int = Field(100, alias="STARS_PACK_PRICE", ge=1, le=100_000)
+    stars_lifetime_price: int = Field(10000, alias="STARS_LIFETIME_PRICE", ge=1, le=100_000)
+
     burst_window_ms: int = Field(700, alias="BURST_WINDOW_MS", ge=0, le=5000)
     failure_digest_minutes: int = Field(30, alias="FAILURE_DIGEST_MINUTES", ge=1)
 

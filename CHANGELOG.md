@@ -1,5 +1,29 @@
 # Changelog
 
+## 1.3.0 — 2026-11-23
+
+### Added
+* **Private-chat plan with Telegram Stars:** 1,000 free private translations per user, then 100 ⭐ for 1,000 more
+  or 10,000 ⭐ for unlimited forever. Only delivered translations count; translations in flight are reserved so
+  bursts can't overshoot. `/buy`, `/paysupport` (Telegram requirement), owner `/refund <payment id>`;
+  pre-checkout validation; payments credited exactly once; refunds (owner or Telegram) revert the grant;
+  owners are notified of each sale. Settings: `PAYWALL_ENABLED`, `FREE_PRIVATE_MESSAGES`, `STARS_PACK_SIZE`,
+  `STARS_PACK_PRICE`, `STARS_LIFETIME_PRICE`.
+* **`/approvefree`** (owner; private `/approvefree <id>` or as a hidden reply in a group): free private chat for
+  life, never counted. Separate from `/approve` (group translations). `/revokefree` undoes it.
+* **Help:** your language with its flag and where it comes from (your choice / automatic / default), how many
+  groups translate for you, your private-chat plan, a "Not getting a translation?" checklist, and buttons
+  (change language, settings, my groups, privacy).
+* **Write and read in the group without leaving it** (only you see any of it):
+  * reply **`/tr`** to any message — text, caption, sticker, GIF, voice — for a private translation into your
+    language (also while your translations are paused);
+  * **`/tr your text`** → your message in the language the group's readers use, with **📋 Copy** and
+    **✍️ Send** (opens inline mode with your text) buttons;
+  * **inline mode** (`@bot text`) offers translations into the languages your groups actually read (up to 3,
+    flagged), instead of only English.
+* **Language picker:** flags on every language; the first page lists the most used languages on Telegram; the
+  reader's own language is always on it; "More languages" lists the rest A–Z.
+
 ## 1.2.0 — 2026-11-23
 
 ### Changed

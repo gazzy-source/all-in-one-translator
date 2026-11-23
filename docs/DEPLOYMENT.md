@@ -113,6 +113,15 @@ a translation back (`PRIVATE_ACCESS=everyone`, the default). Users who aren't ap
 (`PRIVATE_DAILY_LIMIT`, `PRIVATE_GLOBAL_DAILY_LIMIT`), so strangers can't use up the Gemini quota your groups need.
 Set `PRIVATE_ACCESS=approved` to keep the bot entirely private.
 
+## 4b. Private-chat plan (Telegram Stars)
+
+Defaults: 1,000 free private-chat translations per user, then 100 ⭐ per 1,000 or 10,000 ⭐ lifetime
+(`FREE_PRIVATE_MESSAGES`, `STARS_PACK_SIZE`, `STARS_PACK_PRICE`, `STARS_LIFETIME_PRICE`; `PAYWALL_ENABLED=false`
+turns it off). Nothing to configure in BotFather: Stars need no payment provider. Owners are never charged;
+`/approvefree <id>` (or reply `/approvefree` in a group) gives someone free lifetime use. Each payment is reported
+to you with its refund command (`/refund <payment id>`); `/paysupport` messages from buyers come to you too. Stars
+collect in the bot's balance - withdraw or use them via @BotFather → your bot → Balance (Telegram's rules apply).
+
 ## 5. Backups
 
 The database holds settings, approvals, language choices and IDs/hashes — never message text. Back it up with

@@ -104,6 +104,22 @@ MIGRATIONS: list[str] = [
     ALTER TABLE users ADD COLUMN lang_guess TEXT;
     ALTER TABLE users ADD COLUMN tg_lang TEXT;
     """,
+    # 3: private-chat plan (Telegram Stars). Payments are kept for refunds and are never deleted.
+    """
+    ALTER TABLE users ADD COLUMN private_used INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE users ADD COLUMN private_credit INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE users ADD COLUMN lifetime INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE users ADD COLUMN free_pass INTEGER NOT NULL DEFAULT 0;
+    CREATE TABLE payments (
+        charge_id TEXT PRIMARY KEY,
+        user_id INTEGER NOT NULL,
+        product TEXT NOT NULL,
+        stars INTEGER NOT NULL,
+        granted INTEGER NOT NULL,
+        created_at INTEGER NOT NULL,
+        refunded INTEGER NOT NULL DEFAULT 0
+    );
+    """,
 ]
 
 DEFAULT_CHAT_SETTINGS: dict[str, Any] = {
@@ -136,6 +152,10 @@ class User:
     default_notice_sent: bool = False
     lang_guess: str | None = None  # language they write in (majority of recent messages)
     tg_lang: str | None = None  # their Telegram app language
+    private_used: int = 0  # private-chat translations delivered
+    private_credit: int = 0  # purchased private-chat translations
+    lifetime: bool = False  # bought unlimited
+    free_pass: bool = False  # owner granted free lifetime use (/approvefree)
 
     @property
     def effective_lang(self) -> str | None:
@@ -207,6 +227,8 @@ class Storage:
             dm_fallback=bool(row["dm_fallback"]), inline_lang=row["inline_lang"],
             default_notice_sent=bool(row["default_notice_sent"]),
             lang_guess=row["lang_guess"], tg_lang=row["tg_lang"],
+            private_used=int(row["private_used"]), private_credit=int(row["private_credit"]),
+            lifetime=bool(row["lifetime"]), free_pass=bool(row["free_pass"]),
         )
 
     async def get_user(self, user_id: int) -> User | None:
@@ -216,7 +238,7 @@ class Storage:
 
     async def upsert_user(self, user_id: int, **fields: Any) -> User:
         allowed = {"first_name", "lang", "onboarded", "approved", "approved_by", "approved_at", "paused", "started",
-                   "dm_fallback", "inline_lang", "default_notice_sent", "lang_guess", "tg_lang"}
+                   "dm_fallback", "inline_lang", "default_notice_sent", "lang_guess", "tg_lang", "free_pass"}
         bad = set(fields) - allowed
         if bad:
             raise ValueError(f"unknown user fields: {bad}")
@@ -240,18 +262,78 @@ class Storage:
         return [self._user(r) for r in await cur.fetchall()]
 
     async def delete_user_data(self, user_id: int) -> None:
-        """/forgetme: removes preferences and delivery records. Approval (owner decision) is kept only as a flag."""
-        cur = await self.db.execute("SELECT approved FROM users WHERE user_id=?", (user_id,))
+        """/forgetme: removes preferences and delivery records. Kept: approval (owner decision) and the private-chat
+        plan counters (purchases and usage - deleting them would void what the user paid for, or reset the free
+        allowance). Payment records stay in `payments` for refunds."""
+        cur = await self.db.execute("SELECT approved, private_used, private_credit, lifetime, free_pass FROM users "
+                                    "WHERE user_id=?", (user_id,))
         row = await cur.fetchone()
         approved = bool(row["approved"]) if row else False
+        plan = (int(row["private_used"]), int(row["private_credit"]), int(row["lifetime"]),
+                int(row["free_pass"])) if row else (0, 0, 0, 0)
         await self.db.execute("DELETE FROM users WHERE user_id=?", (user_id,))
         await self.db.execute("DELETE FROM user_chat WHERE user_id=?", (user_id,))
         await self.db.execute("DELETE FROM deliveries WHERE recipient_id=?", (user_id,))
         await self.db.execute("UPDATE messages SET sender_id=NULL WHERE sender_id=?", (user_id,))
-        if approved:
-            await self.db.execute("INSERT INTO users(user_id, approved, updated_at) VALUES (?, 1, ?)",
-                                  (user_id, _now()))
+        if approved or any(plan):
+            await self.db.execute("INSERT INTO users(user_id, approved, private_used, private_credit, lifetime, "
+                                  "free_pass, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                                  (user_id, int(approved), *plan, _now()))
         await self.db.commit()
+
+    # -- private-chat plan (Telegram Stars) ------------------------------------------------------
+    async def add_private_use(self, user_id: int) -> None:
+        await self.db.execute("INSERT OR IGNORE INTO users(user_id, updated_at) VALUES (?, ?)", (user_id, _now()))
+        await self.db.execute("UPDATE users SET private_used = private_used + 1 WHERE user_id=?", (user_id,))
+        await self.db.commit()
+
+    async def record_payment(self, charge_id: str, user_id: int, product: str, stars: int, granted: int) -> bool:
+        """Credit a Stars payment exactly once. Returns False if this charge was already recorded."""
+        await self.db.execute("INSERT OR IGNORE INTO users(user_id, updated_at) VALUES (?, ?)", (user_id, _now()))
+        cur = await self.db.execute(
+            "INSERT OR IGNORE INTO payments(charge_id, user_id, product, stars, granted, created_at) "
+            "VALUES (?,?,?,?,?,?)", (charge_id, user_id, product, stars, granted, _now()))
+        if cur.rowcount == 0:
+            await self.db.commit()
+            return False
+        if product == "life":
+            await self.db.execute("UPDATE users SET lifetime=1, updated_at=? WHERE user_id=?", (_now(), user_id))
+        else:
+            await self.db.execute("UPDATE users SET private_credit = private_credit + ?, updated_at=? WHERE user_id=?",
+                                  (granted, _now(), user_id))
+        await self.db.commit()
+        return True
+
+    async def payment(self, charge_id: str) -> dict[str, Any] | None:
+        cur = await self.db.execute("SELECT * FROM payments WHERE charge_id=?", (charge_id,))
+        row = await cur.fetchone()
+        return dict(row) if row else None
+
+    async def mark_refunded(self, charge_id: str) -> dict[str, Any] | None:
+        """Revert a payment's grant once (owner refund or Telegram refund). Returns the payment, or None."""
+        cur = await self.db.execute("UPDATE payments SET refunded=1 WHERE charge_id=? AND refunded=0", (charge_id,))
+        if cur.rowcount == 0:
+            await self.db.commit()
+            return None
+        pay = await self.payment(charge_id)
+        assert pay is not None
+        if pay["product"] == "life":
+            await self.db.execute("UPDATE users SET lifetime=0, updated_at=? WHERE user_id=?",
+                                  (_now(), pay["user_id"]))
+        else:
+            await self.db.execute("UPDATE users SET private_credit = MAX(0, private_credit - ?), updated_at=? "
+                                  "WHERE user_id=?", (pay["granted"], _now(), pay["user_id"]))
+        await self.db.commit()
+        return pay
+
+    async def free_pass_users(self) -> list[User]:
+        cur = await self.db.execute("SELECT * FROM users WHERE free_pass=1 ORDER BY user_id")
+        return [self._user(r) for r in await cur.fetchall()]
+
+    async def payments_summary(self) -> tuple[int, int]:
+        cur = await self.db.execute("SELECT COUNT(*), COALESCE(SUM(stars), 0) FROM payments WHERE refunded=0")
+        row = await cur.fetchone()
+        return (int(row[0]), int(row[1])) if row else (0, 0)
 
     # -- chats -----------------------------------------------------------------------------------
     @staticmethod
