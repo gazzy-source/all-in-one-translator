@@ -64,6 +64,18 @@ def test_entities() -> None:
     assert any("1,299.50" in n for n in e.numbers) and "7:30" in e.numbers
 
 
+@pytest.mark.parametrize(("source", "translation", "missing"), [
+    ("Meeting at 10:00", "မနက် ၁၀ နာရီ", []),
+    ("Meeting at 10:30", "၁၀ နာရီ ၃၀ မိနစ်", []),
+    ("Meeting at 10:30", "၁၀ နာရီ ၃၁ မိနစ်", ["10:30"]),
+    ("Meeting at 10:00", "၁၁ နာရီ", ["10:00"]),
+    ("Meeting at 10:30", "၁၀ နာရီ", ["10:30"]),
+    ("Price is 1000", "၁၀ နာရီ", ["1000"]),
+])
+def test_burmese_clock_entities(source: str, translation: str, missing: list[str]) -> None:
+    assert missing_entities(source, translation) == missing
+
+
 def test_missing_entities_tolerates_locale_number_format() -> None:
     src = "Costs 1,000 euros at 7:30 https://ex.com @ann"
     assert missing_entities(src, "Cuesta 1.000 euros a las 7:30 https://ex.com @ann") == []

@@ -113,6 +113,30 @@ not latency guarantees. No real group message was observed during this check; cl
 pending. The pre-cutover backup is `data/predeploy-575db6a/translator-20261123-112716.sqlite3`; the first verified
 schema-5 backup is `data/backups/translator-20261123-113123.sqlite3`.
 
+### L23 — Multi-account group simulation, 2026-11-23
+
+Added `tests/test_group_matrix.py`: 13 synthetic users, eight languages (en/es/hi/my/ar/ru/ja/zh),
+two groups and separate topics. The 13 tests exercise recipient/language isolation, shared translations,
+group-local administrator approvals, access/preference changes during translation, expired bubbles,
+topic isolation and 24 concurrent multilingual messages (189 expected recipient records).
+Existing regressions cover mixed-language text, edits, media, approval-all, provider failures and output guards.
+
+`python -m benchmarks.bench_group_simulation --live` uses real providers with the real handlers/queues,
+but **simulates Telegram and all accounts** in an isolated temporary database. It cannot verify actual
+Telegram rate limits, client rendering or offline delivery. Reports contain validation results and hashes,
+not message/translation text. Transport limits are raised only in this harness; provider limits remain active.
+
+Initial run (`group-simulation-20261123-222400.json`): 63/63 expected deliveries, zero unauthorized/public
+output, five entity-validation flags. Synthetic inspection identified a false positive: DeepL renders
+`10:00` as Burmese `၁၀ နာရီ`. Added only recognition of Burmese clock units/native minute digits, with six
+regression cases including changed hours/minutes and ordinary numbers. Re-run
+(`group-simulation-20261123-222907.json`): **63/63 deliveries, 72/72 recipient checks, zero validation flags,
+zero unauthorized/public output**, across 56 language pairs. Successful provider calls: 50 DeepL, six Gemini.
+Gemini still reported transient/time-out/rate-limit errors (4/6/6); eight fallback hops recovered delivery.
+This validates routing, script/entity checks and isolation, not exhaustive semantic translation quality.
+Final local checks: **491 pytest cases passed**; ruff (`src`, `tests`, new benchmark), strict mypy and bandit
+passed. No routing/model changes or new runtime dependencies were introduced.
+
 ## Measured so far (offline)
 
 * Language gate, 103-case corpus authored for this project (not held-out): false-translate 0%, missed 0%,
