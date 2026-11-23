@@ -137,6 +137,16 @@ This validates routing, script/entity checks and isolation, not exhaustive seman
 Final local checks: **491 pytest cases passed**; ruff (`src`, `tests`, new benchmark), strict mypy and bandit
 passed. No routing/model changes or new runtime dependencies were introduced.
 
+Deployed application commit `62cac9a` as `all-in-one-translator:1.4.0-62cac9a`; installed `textutil.py` hash
+matches the committed source. Container healthy, zero restarts; 4/4 text and 1/1 media workers alive,
+empty queues, provider circuits closed, guard-blocked count zero. A synthetic en-to-my provider probe
+inside the deployed image passed validation (DeepL 1,001 ms). Startup took several minutes on the small VPS;
+ONNX warned that its telemetry identifier could not be persisted on the read-only filesystem and used memory.
+Pre-update backup: `data/backups/translator-20261123-170610.sqlite3`. Previous image and private environment
+snapshot retained under `/home/ubuntu/translator-deployments/20261123-170456-62cac9a`.
+CI for `62cac9a` passed on Python 3.12 and 3.13, including Docker/native-media smoke and vulnerability checks:
+https://github.com/gazzy-source/all-in-one-translator/actions/runs/45223611798.
+
 ## Measured so far (offline)
 
 * Language gate, 103-case corpus authored for this project (not held-out): false-translate 0%, missed 0%,
