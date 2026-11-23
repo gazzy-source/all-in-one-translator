@@ -134,7 +134,8 @@ def help_text(*, uid: int, lang: str, bot_username: str, approved: bool, private
         lines.append(f"💬 Translating for you in <b>{groups}</b> group{'' if groups == 1 else 's'}" if groups
                      else "💬 Not in a translated group yet")
     if plan_line:
-        lines.append(plan_line + " · /buy")
+        unlimited = user is not None and (user.lifetime or user.free_pass)
+        lines.append(plan_line + ("" if unlimited else " · /buy"))
     lines.append("")
     lines += _how_lines(uid=uid, bot_username=bot_username, approved=approved, private_ok=private_ok,
                         inline_ok=inline_ok, max_seconds=max_seconds)
@@ -147,7 +148,7 @@ def help_text(*, uid: int, lang: str, bot_username: str, approved: bool, private
     if approved:
         cmds += ["/groups — mute me in one group", "/pause · /resume — group translations"]
     if plan_line:
-        cmds.append("/buy — more private translations · /paysupport — payment help")
+        cmds.append("/buy — more private translations · /paysupport — payment help · /terms")
     cmds.append("/privacy · /forgetme — your data")
     if is_owner:
         cmds.append("👑 /recipients · /chats · /status · /approvefree · /refund")
@@ -170,6 +171,20 @@ def paywall_kb(plan: Plan) -> InlineKeyboardMarkup:
         [_btn(f"⭐ {plan.pack_price:,} · {plan.pack_size:,} more translations", "pay:pack")],
         [_btn(f"♾ {plan.lifetime_price:,} · Unlimited forever", "pay:life")],
     ])
+
+
+def terms_text(plan: Plan) -> str:
+    return (
+        "<b>Terms of purchase</b>\n"
+        f"• Everyone gets {plan.free:,} free private-chat translations. After that: {plan.pack_size:,} more for "
+        f"{plan.pack_price:,} ⭐, or unlimited for life for {plan.lifetime_price:,} ⭐ (Telegram Stars).\n"
+        "• A translation counts only when it's delivered to you. Purchases are digital, tied to your Telegram "
+        "account, and take effect immediately.\n"
+        "• \"Lifetime\" means for as long as this bot is operated. Translations are made by AI services and may "
+        "contain mistakes; delivery speed depends on Telegram and those services.\n"
+        "• Problems or refund requests: /paysupport. Refunds are made in Stars to the same account.\n"
+        "• Group translations aren't sold; they're for members approved by the owner."
+    )
 
 
 PRIVACY = (

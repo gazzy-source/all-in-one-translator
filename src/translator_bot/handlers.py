@@ -59,6 +59,7 @@ PRIVATE_COMMANDS = [
     BotCommand(command="privacy", description="What is processed and stored"),
     BotCommand(command="buy", description="More private translations (Telegram Stars)"),
     BotCommand(command="paysupport", description="Help with a payment"),
+    BotCommand(command="terms", description="Terms of purchase"),
 ]
 OWNER_GROUP_COMMANDS = [  # registered per owner per group; hidden from everyone else
     BotCommand(command="approve", description="Reply to a member: approve as recipient", is_ephemeral=True),
@@ -280,6 +281,8 @@ def _private_router(app: App) -> Router:
         charge = html.escape(sp.telegram_payment_charge_id)
         if sp.currency != "XTR" or parsed is None or parsed[1] != uid or parsed[2] != sp.total_amount:
             log.error("unexpected payment", extra={"user_id": uid, "amount": sp.total_amount})
+            # recorded with nothing granted, so the owner's /refund can find and refund it
+            await app.storage.record_payment(sp.telegram_payment_charge_id, uid, "invalid", sp.total_amount, 0)
             await app.notify_owners(f"⚠️ Unexpected Stars payment from <code>{uid}</code> ({sp.total_amount} ⭐). "
                                     f"Check it, or refund: <code>/refund {charge}</code>")
             await _say(msg, "Payment received — the owner will check it and get back to you.")
@@ -324,6 +327,10 @@ def _private_router(app: App) -> Router:
             return
         await msg.answer(billing.status_line(app.plan, user) + "\n\n" + billing.offer_text(app.plan),
                          reply_markup=ui.paywall_kb(app.plan))
+
+    @r.message(Command("terms"))
+    async def terms(msg: Message) -> None:
+        await msg.answer(ui.terms_text(app.plan))
 
     @r.message(Command("paysupport"))
     async def paysupport(msg: Message, command: CommandObject) -> None:
@@ -584,15 +591,16 @@ async def _say(msg: Message, text: str) -> None:
         await msg.answer(text)
 
 
-async def _reply_safe(msg: Message, body_html: str) -> None:
-    """Reply in the private chat; never silently lose the answer to length or markup problems."""
+async def _reply_safe(msg: Message, body_html: str) -> bool:
+    """Reply in the private chat; never silently lose the answer to length or markup problems.
+    Returns True when the reply was delivered."""
     if len(body_html) > 4096:
         body_html = html.escape(truncate(html_to_plain(body_html), 4000), quote=False)
     preview = LinkPreviewOptions(is_disabled=True)
     for attempt in range(2):
         try:
             await msg.reply(body_html, link_preview_options=preview)
-            return
+            return True
         except TelegramRetryAfter as exc:
             if attempt or exc.retry_after > 10:
                 break
@@ -603,11 +611,12 @@ async def _reply_safe(msg: Message, body_html: str) -> None:
             with contextlib.suppress(TelegramAPIError):  # broken markup: send it as plain text
                 await msg.reply(truncate(html_to_plain(body_html), 4096), parse_mode=None,
                                 link_preview_options=preview)
-                return
+                return True
             break
         except TelegramAPIError:
             break
     log.warning("private reply failed")
+    return False
 
 
 async def _private_translate(app: App, msg: Message, target: str, approved: bool) -> None:
@@ -659,9 +668,9 @@ async def _private_translate(app: App, msg: Message, target: str, approved: bool
             body = _PRIVATE_REASONS.get(res.reason, _PRIVATE_REASONS["no_text"]).format(
                 lang=lang, secs=int(app.s.max_media_seconds))
         try:
-            await _reply_safe(msg, body)
+            delivered = await _reply_safe(msg, body)
             pipeline.metrics.observe(f"private_ms.{el.kind.value}", (time.perf_counter() - t0) * 1000)
-            if metered and res.text:  # only delivered translations count
+            if metered and res.text and delivered:  # only delivered translations count
                 await app.storage.add_private_use(uid)
                 after = billing.remaining(app.plan, await app.storage.get_user(uid))
                 if after in (100, 10):

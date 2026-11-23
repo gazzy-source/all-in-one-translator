@@ -142,6 +142,18 @@ async def test_mismatched_payment_is_not_credited_and_owner_is_told(bh: Harness)
     u = await bh.app.storage.get_user(OUTSIDER)
     assert u is None or not u.lifetime
     assert any("Unexpected Stars payment" in c.params["text"] for c in bh.tg.dms_to(OWNER))
+    # the owner can refund it although nothing was granted
+    await bh.send(dm(OWNER, "/refund ch-bad", mid=90))
+    assert any(c.method == "RefundStarPayment" and c.params["telegram_payment_charge_id"] == "ch-bad"
+               and c.params["user_id"] == OUTSIDER for c in bh.tg.calls)
+    u = await bh.app.storage.get_user(OUTSIDER)
+    assert u is not None and not u.lifetime and u.private_credit == 0
+
+
+async def test_terms_command(bh: Harness) -> None:
+    await bh.send(dm(OUTSIDER, "/terms", mid=91))
+    t = texts_to(bh, OUTSIDER)[-1]
+    assert "Terms of purchase" in t and "100 ⭐" in t and "/paysupport" in t
 
 
 async def test_group_approval_does_not_make_private_chat_free(bh: Harness) -> None:
