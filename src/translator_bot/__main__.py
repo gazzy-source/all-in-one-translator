@@ -17,7 +17,8 @@ from translator_bot.config import ConfigError, Settings, load_settings
 from translator_bot.handlers import build_routers, register_commands
 
 # chat_member: membership changes (bot must be admin) -> a removed recipient loses access immediately
-ALLOWED_UPDATES = ["message", "edited_message", "my_chat_member", "chat_member", "callback_query", "inline_query"]
+ALLOWED_UPDATES = ["message", "edited_message", "my_chat_member", "chat_member", "callback_query", "inline_query",
+                   "pre_checkout_query"]  # Telegram Stars purchases (private-chat plan)
 
 _STD = set(logging.LogRecord("", 0, "", 0, "", (), None).__dict__) | {"message", "asctime"}
 

@@ -14,6 +14,7 @@ from aiogram.client.session.base import BaseSession
 from aiogram.exceptions import TelegramAPIError
 from aiogram.types import ChatMemberAdministrator, ChatMemberOwner
 
+from translator_bot.billing import Plan
 from translator_bot.config import Settings
 from translator_bot.context import ContextStore
 from translator_bot.delivery import Deliverer, TelegramTransport, drain_deliveries
@@ -94,7 +95,11 @@ class App:
         self.pipeline: Pipeline | None = None
         self.inline_limiter = KeyedLimiter(settings.inline_per_min, 60.0)
         self.private_limiter = KeyedLimiter(settings.private_per_min, 60.0)
-        self.private_daily: dict[int, tuple[str, int]] = {}  # user id -> (UTC day, count); unapproved users only
+        self.plan = Plan(enabled=settings.paywall_enabled, free=settings.free_private_messages,
+                         pack_size=settings.stars_pack_size, pack_price=settings.stars_pack_price,
+                         lifetime_price=settings.stars_lifetime_price)
+        self.private_daily: dict[int, tuple[str, int]] = {}
+        self.private_pending: dict[int, int] = {}  # user id -> private translations in flight (plan reservation)  # user id -> (UTC day, count); unapproved users only
         self.bot_username = ""
         self.bot_id = settings.bot_id
         self._tasks: list[asyncio.Task[None]] = []

@@ -81,6 +81,13 @@ Maria: ¿Alguien sabe si mañana             Maria: ¿Alguien sabe si mañana   
   limits and a daily cap for users who aren't approved (`PRIVATE_PER_MIN`, `PRIVATE_DAILY_LIMIT`).
 - Typing a language name ("Hindi", "español") offers to switch your language instead of translating it.
 
+### Private-chat plan (Telegram Stars)
+- Every user gets **1,000 free** private-chat translations (only delivered translations count). Then
+  **100 ⭐ for 1,000 more** or **10,000 ⭐ for unlimited, forever** — Telegram Stars, paid inside Telegram.
+- Owners, and people the owner grants with `/approvefree`, are free for life and never counted. Group
+  translations aren't metered. Payments are validated before charging, credited exactly once, refundable
+  (`/refund`), and `/paysupport` reaches the owner. All amounts are configurable (`.env.example`).
+
 ### Inline translator everywhere
 - Type `@your_bot text` in any chat → tap the translated preview to send it. Debounced per keystroke, cached.
 
@@ -184,10 +191,13 @@ published image on GHCR, health checks with self-healing restarts, online backup
 | | `/privacy` · `/forgetme` | What's processed and stored · delete your data |
 | Approved recipients | `/groups` | Groups where you receive translations (mute per group) |
 | | `/pause` · `/resume` | Stop/restart your group translations |
+| Everyone | `/buy` · `/paysupport` | Private-chat plan (Telegram Stars) · payment help |
 | Owners (private) | `/approve <id>` · `/revoke <id>` · `/recipients` | Manage recipients |
+| | `/approvefree <id>` · `/revokefree <id>` | Free private chat for life (separate from `/approve`) |
+| | `/refund <payment id>` | Refund a Stars payment and remove what it unlocked |
 | | `/chats` | Per-group toggles: text, captions, images, stickers, animated, GIFs, videos, voice, context, sender name |
 | | `/status` | Health, delivery counters, provider quota, latency |
-| Owners (hidden, in group) | `/approve` · `/revoke` (as replies) · `/check` · `/glossary term = rendering` | Invisible to members |
+| Owners (hidden, in group) | `/approve` · `/revoke` · `/approvefree` · `/revokefree` (as replies) · `/check` · `/glossary term = rendering` | Invisible to members |
 
 Group translations always need approval; users who aren't approved see their ID to send to the owner (with
 `PRIVATE_ACCESS=approved` the whole private chat is limited to approved users).

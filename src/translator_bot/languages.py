@@ -46,7 +46,7 @@ _LANGS: tuple[Language, ...] = (
     Language("nb", "Norwegian", "Norsk", "Latin", "🇳🇴", ("no", "nor", "bokmal", "bokmål")),
     Language("is", "Icelandic", "Íslenska", "Latin", "🇮🇸", ("isl",)),
     Language("ga", "Irish", "Gaeilge", "Latin", "🇮🇪", ("gle",)),
-    Language("cy", "Welsh", "Cymraeg", "Latin", "🏴", ("cym",)),
+    Language("cy", "Welsh", "Cymraeg", "Latin", "🏴󠁧󠁢󠁷󠁬󠁳󠁿", ("cym",)),
     Language("ca", "Catalan", "Català", "Latin", "", ("cat",)),
     Language("eu", "Basque", "Euskara", "Latin", "", ("eus",)),
     Language("gl", "Galician", "Galego", "Latin", "", ("glg",)),
@@ -151,9 +151,12 @@ def lang_name(code: str | None) -> str:
 
 
 # Languages offered first in pickers (most common in Telegram groups).
+# First picker page: the most used languages on Telegram, ordered by its largest markets (India, Russia,
+# Indonesia, Brazil, US, Iran, Ukraine, Uzbekistan, Turkey, Vietnam, ...). Telegram publishes no per-language
+# figures, so this is an estimate. The reader's own language is always added in front if it's not here.
 POPULAR: tuple[str, ...] = (
-    "en", "es", "hi", "ar", "ru", "pt", "fr", "de", "tr", "id", "zh", "ja", "ko", "it", "uk", "fa", "ur",
-    "bn", "vi", "pl",
+    "en", "ru", "hi", "id", "pt", "es", "ar", "fa", "uk", "uz", "tr", "vi", "de", "fr", "it", "kk", "bn",
+    "ur", "zh", "my", "ko",
 )
 
 
