@@ -7,7 +7,7 @@ Legend: ✅ done & mock-tested · 🟢 live-verified · ⏳ pending live verific
 
 ### 2026-11-23 — completion of pending reader preferences and consecutive bubbles
 
-* Server inspection: `/opt/all-in-one-translator`, image/package **1.3.0**, commit `8e6d5bb`, schema **3**;
+* Pre-deployment inspection: `/opt/all-in-one-translator`, image/package **1.3.0**, commit `8e6d5bb`, schema **3**;
   container healthy, zero restarts. This inspection did not deploy changes or send Telegram messages.
 * Measured defects in the unfinished changes: upgrading a committed schema-4 database left the two new
   user columns missing (`IndexError` on user lookup); the existing revocation test expected two sends
@@ -30,11 +30,23 @@ Legend: ✅ done & mock-tested · 🟢 live-verified · ⏳ pending live verific
   `bandit -q -c pyproject.toml -r src`, the corrected provider-smoke script's lint, and `git diff --check`
   pass. Bandit needed access to its plugin cache outside the sandbox; it reported no security findings.
   The Telegram test double now applies its failure flag to edits as well as sends, covering membership
-  failures on the append path. No new dependency audit; live production probes are recorded in L21 below.
+  failures on the append path. GitHub CI for `575db6a` also passed **472 tests on both Python 3.12 and 3.13**,
+  the production Docker build/native-media smoke test, and a dependency audit with **no known vulnerabilities**
+  ([run 45162424596](https://github.com/gazzy-source/all-in-one-translator/actions/runs/45162424596)).
 * Production log review: no WARNING/ERROR/CRITICAL events in the checked 15-minute window. These are
   bounded health/provider checks, not a guarantee of latency or every real-device behavior.
-* Live acceptance of the new bubble UI, offline/reconnect behavior, and deployment remain pending.
-  Existing live-provider benchmark results below are historical, not new verification of this change.
+* **Deployed 2026-11-23:** v1.4.0, application commit `575db6a`, image
+  `all-in-one-translator:1.4.0-575db6a`, schema **5**. The image reuses the existing v1.3.0 runtime to avoid
+  reinstalling unchanged dependencies on the 952 MB VPS; all 33 application Python/data files and runtime
+  dependency versions were compared successfully before cutover. Low-memory settings were preserved.
+* Recovery: pre-cutover backup retained; restoring the schema-3 backup and migrating it to 5 preserved all
+  existing records and passed integrity checks. The first schema-5 backup was also restored and verified.
+  Daily local backup runs at **03:15 UTC**, keeps **14**, and uses private file permissions (0600).
+  Rollback image/configuration and a syntax-checked runtime rollback script are retained under
+  `/home/ubuntu/translator-deployments/20261123-575db6a-112011/`. Rollback preserves the live database.
+* Post-deployment health/provider checks passed (L22). Visual acceptance of the new bubble UI and
+  offline/reconnect behavior still need real-device verification; no Telegram test messages were sent.
+  Backups are local to the VPS; off-host backup is not configured by this deployment.
 
 | Phase | Status |
 |---|---|
@@ -87,6 +99,19 @@ Legend: ✅ done & mock-tested · 🟢 live-verified · ⏳ pending live verific
 | L20 | Mixed languages, live: 7 code-switched texts × readers (en/my/es) and 2 two-script stickers. Found and fixed: foreign phrase inside target-language text dropped; English sentence lost for Burmese readers; mixed stickers dropped/half-translated a line via vision (now text path). After: all correct (e.g. "WHEN THE TEACHER SAYS / Exam tomorrow"); trivial English ("ok bro") still skipped for Burmese readers; bench_detection unchanged | 🟢 |
 | L10 | Offline recipient: are ephemeral translations shown after reconnecting? after app restart? | ⏳ product decision depends on result |
 | L21 | 2026-11-23 production pre-commit check (still **v1.3.0**, schema 3): container healthy, zero restarts; `/healthz` ok, 4/4 text workers and 1/1 media worker alive, both provider breakers closed, zero blocked public-output attempts. SQLite `quick_check` ok; Telegram authentication succeeds; bot is administrator in the enabled group. Synthetic provider probes: Gemini fast and quality both translated contextual “ni modo” as “oh well” using the 3.5-flash-lite fallback (11,849 ms / 5,618 ms); vision read “NO WAY BRO” and translated to Spanish (6,584 ms); DeepL preserved URL/mention and converted 18:30 correctly (533 ms). Configured Gemini models available; DeepL usage 22,674/1,000,000 chars before the 46-char probe. Corrected the smoke script's old single-target vision shape and removed its test-fixture dependency. No Telegram messages sent; no production deployment. Gemini latency remains variable. | 🟢 service/provider checks; new UI still pending live acceptance |
+
+### L22 — Production deployment, 2026-11-23
+
+Container v1.4.0 started at **11:27:28 UTC**, healthy with zero restarts;
+all four text workers and the media worker alive, empty queues, both provider breakers closed, zero blocked
+public-output attempts. Live schema **5**, `quick_check` OK, new preference fields readable, Telegram
+authentication and administrator status in the enabled group verified. No warning/error/critical log events
+were observed after startup. Synthetic provider probes on the new container: Gemini fast **2,445 ms** and
+quality **1,616 ms** (both 3.1-flash-lite; contextual “ni modo” → “oh well”); vision **2,668 ms** (read “NO WAY
+BRO” and translated to Spanish); DeepL **398 ms** (URL/mention/time preserved). These are individual samples,
+not latency guarantees. No real group message was observed during this check; client-side rendering remains
+pending. The pre-cutover backup is `data/predeploy-575db6a/translator-20261123-112716.sqlite3`; the first verified
+schema-5 backup is `data/backups/translator-20261123-113123.sqlite3`.
 
 ## Measured so far (offline)
 
