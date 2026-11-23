@@ -67,7 +67,8 @@ async def test_free_allowance_then_paywall_then_pack_purchase(bh: Harness) -> No
     for i, t in enumerate(TEXTS[:2]):
         await bh.send(dm(OUTSIDER, t, mid=10 + i))
     await bh.idle()
-    assert sum(t.startswith("[en]") for t in texts_to(bh, OUTSIDER)) == 2
+    got = texts_to(bh, OUTSIDER)
+    assert sum(t.startswith("[en]") for t in got) == 2, got
     u = await bh.app.storage.get_user(OUTSIDER)
     assert u is not None and u.private_used == 2
 

@@ -100,6 +100,7 @@ class App:
                          lifetime_price=settings.stars_lifetime_price)
         self.private_daily: dict[int, tuple[str, int]] = {}
         self.private_pending: dict[int, int] = {}
+        self.plan_locks: dict[int, asyncio.Lock] = {}  # per-user: usage check/reserve vs count/release
         self.reply_targets: dict[tuple[int, int | None], tuple[float, list[str]]] = {}  # /tr + inline targets  # user id -> private translations in flight (plan reservation)  # user id -> (UTC day, count); unapproved users only
         self.bot_username = ""
         self.bot_id = settings.bot_id

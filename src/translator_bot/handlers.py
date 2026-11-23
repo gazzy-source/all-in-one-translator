@@ -801,15 +801,22 @@ async def _private_translate(app: App, msg: Message, target: str, approved: bool
         await _say(msg, "⏳ That's a lot at once — give me a few seconds.")
         return
     is_owner = app.resolver.is_owner(uid)
-    user = await app.storage.get_user(uid)
-    metered = not billing.is_exempt(app.plan, is_owner=is_owner, user=user)
-    if metered:
-        left = billing.remaining(app.plan, user)
+    lock = _plan_lock(app, uid)
+    async with lock:  # read usage + reserve atomically against finishing jobs (count + release)
+        user = await app.storage.get_user(uid)
+        metered = not billing.is_exempt(app.plan, is_owner=is_owner, user=user)
+        left = billing.remaining(app.plan, user) if metered else None
         # translations still in flight are reserved, so a burst can't overshoot the allowance
-        if left is not None and left - app.private_pending.get(uid, 0) <= 0:
-            await _send_paywall(app, msg)
-            return
+        paywall = left is not None and left - app.private_pending.get(uid, 0) <= 0
+        if metered and not paywall:
+            app.private_pending[uid] = app.private_pending.get(uid, 0) + 1  # reservation
+    if paywall:
+        await _send_paywall(app, msg)
+        return
+    reserved = metered
     if not approved and not is_owner and not billing.has_paid(user) and not _daily_ok(app, uid):
+        if reserved:
+            _release(app, uid)
         await _say(msg, "📅 Today's limit of private translations is reached. It resets at 00:00 UTC.")
         return
     if len(el.plain) > app.s.max_text_chars:
@@ -818,38 +825,58 @@ async def _private_translate(app: App, msg: Message, target: str, approved: bool
     lane = pipeline.media_lane if el.has_media else pipeline.text_lane
 
     async def job() -> None:
-        t0 = time.perf_counter()
-        with contextlib.suppress(TelegramAPIError):
-            await app.bot.send_chat_action(uid, "typing")
+        released = False
+
+        def release_once() -> None:  # this job's own reservation, exactly once, however the job ends
+            nonlocal released
+            if reserved and not released:
+                released = True
+                _release(app, uid)
+
         try:
-            res = await asyncio.wait_for(pipeline.translate_private(msg, el, target),
-                                         timeout=max(3.0, lane.job_timeout - 2))
-        except Exception:
-            log.warning("private translation failed", exc_info=True)
-            res = PrivateResult(None, None, "failed")
-        lang = html.escape(lang_name(target))
-        if res.text:
-            body = res.text  # only the translation
-        else:
-            body = _PRIVATE_REASONS.get(res.reason, _PRIVATE_REASONS["no_text"]).format(
-                lang=lang, secs=int(app.s.max_media_seconds))
-        try:
+            t0 = time.perf_counter()
+            with contextlib.suppress(TelegramAPIError):
+                await app.bot.send_chat_action(uid, "typing")
+            try:
+                res = await asyncio.wait_for(pipeline.translate_private(msg, el, target),
+                                             timeout=max(3.0, lane.job_timeout - 2))
+            except Exception:
+                log.warning("private translation failed", exc_info=True)
+                res = PrivateResult(None, None, "failed")
+            lang = html.escape(lang_name(target))
+            if res.text:
+                body = res.text  # only the translation
+            else:
+                body = _PRIVATE_REASONS.get(res.reason, _PRIVATE_REASONS["no_text"]).format(
+                    lang=lang, secs=int(app.s.max_media_seconds))
             delivered = await _reply_safe(msg, body)
             pipeline.metrics.observe(f"private_ms.{el.kind.value}", (time.perf_counter() - t0) * 1000)
-            if metered and res.text and delivered:  # only delivered translations count
-                await app.storage.add_private_use(uid)
-                after = billing.remaining(app.plan, await app.storage.get_user(uid))
-                if after in (100, 10):
-                    await _say(msg, f"🎟 {billing.fmt(after)} private translations left · /buy")
+            after: int | None = None
+            if reserved:
+                async with lock:  # count + release together, so a concurrent check never counts this twice
+                    if res.text and delivered:  # only delivered translations count
+                        await app.storage.add_private_use(uid)
+                        after = billing.remaining(app.plan, await app.storage.get_user(uid))
+                    release_once()
+            if after in (100, 10):
+                await _say(msg, f"🎟 {billing.fmt(after)} private translations left · /buy")
         finally:
-            _release(app, uid)
+            release_once()
 
-    if metered:
-        app.private_pending[uid] = app.private_pending.get(uid, 0) + 1
     if not await lane.submit(uid, job, key=f"p:{uid}:{msg.message_id}"):
-        if metered:
+        if reserved:
             _release(app, uid)
         await _say(msg, "⏳ I'm busy right now — please try again in a moment.")
+
+
+def _plan_lock(app: App, uid: int) -> asyncio.Lock:
+    lk = app.plan_locks.get(uid)
+    if lk is None:
+        if len(app.plan_locks) > 10_000:
+            for k in [k for k, v in app.plan_locks.items() if not v.locked()][:5000]:
+                del app.plan_locks[k]
+        lk = app.plan_locks[uid] = asyncio.Lock()
+    return lk
 
 
 def _release(app: App, uid: int) -> None:
