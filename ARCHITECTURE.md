@@ -14,7 +14,7 @@ Telegram ──► aiogram Dispatcher ──► handlers (return immediately)
    group: Pipeline.on_message                          private: 1:1 translator (Pipeline.translate_private) + onboarding / settings
      1 chat config (cached 30s) · enabled? bot admin?   inline:  debounce → detect → translate
      2 eligibility (pure): bots, own inline results,
-       commands, emoji/URL/code-only, toggles
+       commands (except visible /play song arguments), emoji/URL/code-only, toggles
      3 claim (chat_id,message_id) UNIQUE  → idempotent
      4 context buffer (memory, pseudonymized, TTL)
      5 burst coalescer (same sender, 700 ms)
@@ -123,3 +123,5 @@ Other administrators can still approve individuals and disable approve-all with 
 Group command menus are registered only per member, with ephemeral commands; broad group/admin scopes
 are removed during registration. The output guard rejects broad/default command registration and
 non-ephemeral per-member commands. Approval invalidates membership rather than trusting an old reply.
+
+Private recent pages read from a recipient- and language-scoped in-memory store of successful deliveries (15 minutes, 2,000 entries total). Each group or topic page rechecks approval and live Telegram membership. Page navigation uses source message IDs to keep older pages stable as new messages arrive.

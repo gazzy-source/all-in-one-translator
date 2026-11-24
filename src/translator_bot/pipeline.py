@@ -201,8 +201,9 @@ class Pipeline:
         else:
             key = (msg.chat.id, thread, sid or 0)
             await self.bursts.flush(key)  # keep ordering: pending text from this sender goes first
-            await self.media_lane.submit(msg.chat.id, lambda: self._process_media(msg, res, meta),
-                                         key=f"m:{msg.chat.id}:{msg.message_id}")
+            if not await self.media_lane.submit(msg.chat.id, lambda: self._process_media(msg, res, meta),
+                                                key=f"m:{msg.chat.id}:{msg.message_id}"):
+                await self.storage.update_message(msg.chat.id, msg.message_id, status="queue_rejected")
 
     async def on_edit(self, msg: Message) -> None:
         self.metrics.inc("updates.edit")
@@ -409,8 +410,10 @@ class Pipeline:
         assert isinstance(meta, UnitMeta)
         if len(items) > 1:
             self.metrics.inc("burst.coalesced", len(items))
-        await self.text_lane.submit(meta.chat_id, lambda: self._process_text(meta, items),
-                                    key=f"u:{meta.chat_id}:{items[0].message_id}")
+        if not await self.text_lane.submit(meta.chat_id, lambda: self._process_text(meta, items),
+                                           key=f"u:{meta.chat_id}:{items[0].message_id}"):
+            for item in items:
+                await self.storage.update_message(meta.chat_id, item.message_id, status="queue_rejected")
 
     def _remember(self, meta: UnitMeta, items: list[BurstItem]) -> None:
         rec = UnitRecord(meta, items)
@@ -475,6 +478,26 @@ class Pipeline:
         return out, src, ""
 
     # -- private chat (1:1 translator) -------------------------------------------------------------
+    async def recover_group(self, msg: Message, el: Eligible, lang: str, settings: dict[str, Any]) -> PrivateResult:
+        if el.has_media or not el.plain:
+            return await self.translate_private(msg, el, lang)
+        rec = self._units.get((msg.chat.id, msg.message_id))
+        meta = UnitMeta(msg.chat.id, msg.chat.title, topic_of(msg), sender_id(msg), sender_name(msg),
+                        self._reply_ctx(msg, sender_id(msg)), settings, arrival_context=(),
+                        parent_id=msg.reply_to_message.message_id if msg.reply_to_message else None)
+        if (rec and rec.meta.thread_id == meta.thread_id and settings.get("context", True)
+                and time.monotonic() - rec.created <= min(self.edit_memory_s, self.context.ttl_s)):
+            meta = replace(meta, arrival_context=rec.meta.arrival_context or (),
+                           reply_ctx=meta.reply_ctx or rec.meta.reply_ctx,
+                           parent_id=meta.parent_id or rec.meta.parent_id)
+        glossary = tuple(await self.storage.glossary(msg.chat.id))
+        (out, src, why), parent = await asyncio.gather(
+            self._translate_outcome(meta, el.text_html, el.plain, lang, glossary=glossary),
+            self._translated_parent(meta, lang, glossary))
+        if parent and (out or why == "same"):
+            out = f"<blockquote>{_html.escape(truncate(parent, 240))}</blockquote>\n" + (out or _html.escape(el.plain))
+        return PrivateResult(out, src, why)
+
     async def translate_private(self, msg: Message, el: Eligible, target: str) -> PrivateResult:
         """Translate one message sent to the bot in a private chat into `target`. Nothing is stored; the
         media cache (by Telegram file id) is shared with groups."""

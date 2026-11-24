@@ -22,6 +22,8 @@ STICKER = {"file_id": "f", "file_unique_id": "u", "type": "regular", "width": 51
 
 @pytest.mark.parametrize(("msg", "expected"), [
     (group_message("hola amigos"), Kind.TEXT),
+    (group_message("/play အောင်မြင့်မြတ်သီချင်းကောင်းများ"), Kind.TEXT),
+    (group_message("/play"), Skip.COMMAND),
     (group_message("/start"), Skip.COMMAND),
     (group_message("😂😂"), Skip.NON_LINGUISTIC),
     (group_message("https://x.io"), Skip.NON_LINGUISTIC),

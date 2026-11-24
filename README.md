@@ -208,7 +208,8 @@ private translation access is restricted. This does not grant global approval or
 | Who | Command | Purpose |
 |---|---|---|
 | Everyone (`PRIVATE_ACCESS=everyone`) | *any message* | Translated into your language, as a reply |
-| | `/start` · `/help` | Welcome and short help (role-aware), language picker |
+| | `/recent` | Browse your recent group translations in private, five per page, for up to 15 minutes |
+| | `/start` · `/help` | Home and topic-based help |
 | | `/language` · `/settings` | Change translation language · preferences |
 | | `/privacy` · `/forgetme` | What's processed and stored · delete your data |
 | Approved recipients | `/groups` | Groups where you receive translations (mute per group) |

@@ -186,6 +186,18 @@ Changes remain local; no deployment or real-user message was sent during this re
   (all providers/Telegram mocked; media tests use real ffmpeg/rlottie/RapidOCR on synthetic images).
 * ruff, mypy --strict, bandit: clean. pip-audit: no known vulnerabilities.
 
+## Private navigation and recent translations
+
+The home screen combines the previous welcome and language picker into one message. Recent deliveries
+are kept in a bounded in-memory reader for up to 15 minutes. Opening a group or topic page checks current
+access again. A reply with /tr can reuse an exact previous delivery. Visible /play song arguments
+now enter the ordinary translation path. Queue rejection is recorded separately from successful enqueueing.
+
+Pre-deploy VPS check on November 24: healthy, zero container restarts, all four text workers and one media
+worker alive, queues empty. A direct Gemini probe returned HTTP 503. Synthetic probes through the configured
+endpoint translated a meeting-time question Burmese → English in 16.6 s and English → Burmese in 8.0 s.
+These probes exercised the provider without sending messages to Telegram users.
+
 ## Known gaps / next steps
 
 * Videos and voice messages longer than `MAX_MEDIA_SECONDS` (default 1 min) are skipped.

@@ -69,38 +69,20 @@ LANGUAGE_PROMPT = (
 MEDIA_TYPES = "text, stickers, GIFs, photos, videos and voice notes"
 
 
-def _how_lines(*, uid: int, bot_username: str, approved: bool, private_ok: bool, inline_ok: bool,
-               max_seconds: int) -> list[str]:
-    """The three ways to use the bot, one short line each (shared by /start and /help)."""
-    lines = []
+def home(user: User, default_lang: str, *, approved: bool, private_ok: bool) -> tuple[str, InlineKeyboardMarkup]:
+    lang = user.effective_lang or default_lang
+    lines = [f"<b>Your translator</b> · {html.escape(lang_name(lang))}"]
     if private_ok:
-        lines.append(f"📩 <b>Here</b> — send or forward text, stickers, GIFs, photos or voice (≤ {max_seconds} s)")
+        lines.append("To translate, send or forward a message here.")
     if approved:
-        lines.append("💬 <b>Groups</b> — translations appear right in the chat, visible <b>only to you</b>")
-        lines.append("↩️ <b>Reply /tr</b> to any message to translate it · <b>/tr your text</b> → the group's "
-                     "language, ready to copy or send (only you see it)")
+        lines.append("Automatic group translations are paused." if user.paused else
+                     "Group translations appear beside the conversation.")
     else:
-        lines.append("💬 <b>Groups</b> — ask a group admin to approve you (they reply /approve to your message)")
-    if inline_ok:
-        lines.append(f"✍️ <b>Anywhere</b> — type <code>@{html.escape(bot_username)} hello</code>, tap to send")
-    return lines
-
-
-def welcome(user: User, *, default_lang: str, is_owner: bool, bot_username: str = "this_bot",
-            approved: bool = True, private_ok: bool = True, inline_ok: bool = True, max_seconds: int = 60) -> str:
-    lang = html.escape(lang_name(user.effective_lang or default_lang))
-    name = html.escape((user.first_name or "").strip()[:40])
-    lines = [f"👋 <b>Hi{' ' + name if name else ''}! I translate into {lang}.</b>", ""]
-    lines += _how_lines(uid=user.user_id, bot_username=bot_username, approved=approved, private_ok=private_ok,
-                        inline_ok=inline_ok, max_seconds=max_seconds)
-    lines.append("")
-    if not user.lang:
-        lines.append("<i>Picked automatically — change it below.</i>" if user.effective_lang
-                     else f"<i>{html.escape(lang_name(default_lang))} is selected by default — choose yours below.</i>")
-    elif user.paused and approved:
-        lines.append("⏸ Group translations are paused — /resume")
-    lines.append("/help · /language" + (" · 👑 /status" if is_owner else ""))
-    return "\n".join(lines)
+        lines.append("For group translations, ask a group admin to reply /approve to your message.")
+    rows = [[_btn("Recent translations", "recent:menu:0")]] if approved else []
+    rows += [[_btn("Change language", "lang:menu"), _btn("Settings", "me:show")],
+             [_btn("Help", "help:home")]]
+    return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 ACCESS_DENIED = (
@@ -115,42 +97,6 @@ def flag(code: str | None) -> str:
     return (lg.flag if lg and lg.flag else "🌐") if code else "🌐"
 
 
-def lang_source(user: User | None) -> str:
-    """Where the reader's language comes from, in a few words."""
-    if user is None or user.lang:
-        return "your choice" if user is not None and user.lang else "default"
-    if user.lang_guess:
-        return "auto · from how you write"
-    if user.tg_lang:
-        return "auto · from your Telegram app"
-    return "default"
-
-
-def help_text(*, uid: int, lang: str, bot_username: str, approved: bool, private_ok: bool, inline_ok: bool,
-              max_seconds: int = 60, is_owner: bool = False, paused: bool = False, user: User | None = None,
-              groups: int | None = None, plan_line: str | None = None) -> str:
-    """/help: who I am for you right now, the three ways to use me, then collapsible help and commands."""
-    status = f"{flag(lang)} <b>{html.escape(lang_name(lang))}</b> <i>({lang_source(user)})</i>"
-    if paused and approved:
-        status += " · ⏸ paused"
-    lines = [status]
-    if approved and groups is not None:
-        lines.append(f"💬 Translating for you in <b>{groups}</b> group{'' if groups == 1 else 's'}" if groups
-                     else "💬 Not in a translated group yet")
-    if plan_line:
-        unlimited = user is not None and (user.lifetime or user.free_pass)
-        lines.append(plan_line + ("" if unlimited else " · /buy"))
-    lines.append("")
-    lines += _how_lines(uid=uid, bot_username=bot_username, approved=approved, private_ok=private_ok,
-                        inline_ok=inline_ok, max_seconds=max_seconds)
-    lines += ["", "Choose a guide below, or adjust your personal controls."]
-    if approved:
-        lines.append("/pause · /resume affect only your automatic group translations.")
-    if is_owner:
-        lines.append("👑 /status · /recipients · /chats")
-    return "\n".join(lines)
-
-
 def help_kb(lang: str | None = None, *, approved: bool = True, paused: bool = False) -> InlineKeyboardMarkup:
     rows = [[_btn(f"{flag(lang)} Change language", "lang:menu"), _btn("⚙️ Settings", "me:show")]]
     if approved:
@@ -158,7 +104,7 @@ def help_kb(lang: str | None = None, *, approved: bool = True, paused: bool = Fa
                           "me:resume" if paused else "me:stop"), _btn("👥 My groups", "me:mygroups")])
     rows += [[_btn("📖 Read translations", "help:read"), _btn("✍️ Write & reply", "help:write")],
              [_btn("👥 Set up a group", "help:setup"), _btn("❓ Missing translations", "help:missing")],
-             [_btn("🔒 Privacy", "me:privacy")]]
+             [_btn("🔒 Privacy", "me:privacy"), _btn("‹ Home", "home:open")]]
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -168,7 +114,7 @@ def help_topic(topic: str, max_seconds: int = 60) -> str | None:
             "📖 <b>Read in your language</b>\n\n"
             "Choose your reading language with /language. English readers receive Burmese → English; "
             "Burmese readers receive English → Burmese. Each person sees only their own translations.\n\n"
-            "Use /settings → I also read to skip languages you understand. "
+            "Open /recent to browse recent deliveries by group and topic. Use /settings → I also read to skip languages you understand. "
             "Your chosen reading language stays selected even if you write in another language.\n\n"
             "<b>Your controls</b>\n/pause stops automatic translations for you in every group. "
             "/resume turns them back on. /groups lets you mute just one group. "
@@ -203,7 +149,7 @@ def help_topic(topic: str, max_seconds: int = 60) -> str | None:
             "• Use the same Telegram account that is approved and currently in the group. "
             "Ask a group admin about /approve, or the group owner about /approveall. The bot must be an admin too.\n"
             "• Your own messages and messages already in your language are skipped automatically. "
-            "Slash commands such as /play are also skipped.\n"
+            "Song requests after /play can be translated. Other commands are skipped.\n"
             "• Telegram may miss private in-group translations while you are offline. Providers can "
             "also be temporarily unavailable. Reply /tr to the original to request it again."
         ),
@@ -247,6 +193,7 @@ PRIVACY = (
     "IDs (no content) for up to 48 h to handle edits and avoid duplicates.\n"
     "• Translations are shown only to you via Telegram ephemeral messages. Telegram may not deliver them when "
     "you're offline and may remove them later; this is not end-to-end encryption.\n"
+    "• Recent translations stay in memory for up to 15 minutes. Pages opened here remain in your Telegram chat.\n"
     "• Purchases: Telegram processes Stars payments; the bot keeps the payment ID, amount and what it unlocked "
     "(needed for refunds) and a count of your private-chat translations.\n"
     "/forgetme deletes your preferences and delivery records (purchases and usage counts are kept)."
@@ -258,12 +205,12 @@ def settings_kb(user: User, default_lang: str) -> InlineKeyboardMarkup:
         [_btn(f"🌐 Language: {lang_name(user.effective_lang or default_lang)}", "lang:menu")],
         [_btn("▶️ Resume translations" if user.paused else "⏸ Pause translations", "me:resume" if user.paused else "me:stop")],
         [_btn(("✅" if user.dm_fallback else "⬜") + " Private-chat backup if in-group delivery fails",
-              "me:dm")],
+              "me:dm:off" if user.dm_fallback else "me:dm:on")],
         [_btn("📚 I also read: " + (", ".join(flag(c) for c in sorted(user.also_reads_set)) or "—"), "also:menu")],
-        [_btn(("✅" if user.show_original else "⬜") + " Show the original above translations", "me:orig")],
+        [_btn(("✅" if user.show_original else "⬜") + " Show the original above translations", "me:orig:off" if user.show_original else "me:orig:on")],
         [_btn(f"✍️ Inline target: {lang_name(user.inline_lang or 'en')}", "ilang:menu")],
         [_btn("👥 My groups", "me:groups"), _btn("🔒 Privacy", "me:privacy")],
-        [_btn("❓ Help & controls", "help:home")],
+        [_btn("‹ Home", "home:open")],
     ])
 
 
@@ -291,17 +238,7 @@ def also_reads_kb(user: User, default_lang: str, page: int = 0) -> InlineKeyboar
 
 
 def settings_text(user: User, default_lang: str) -> str:
-    return (
-        "<b>Your settings</b>\nOnly your account is affected. One-off /tr requests still work while paused.\n\n"
-        f"Language: <b>{html.escape(lang_name(user.effective_lang or default_lang))}</b>"
-        f"{' (default)' if not user.lang else ''}\n"
-        f"Automatic group translations: {'⏸ paused' if user.paused else '▶️ active'}\n"
-        f"Private-chat backup: {'on' if user.dm_fallback else 'off'} — if a private in-group translation can't "
-        "be delivered, send it to this chat instead (never to the group).\n"
-        f"Inline translator target: {html.escape(lang_name(user.inline_lang or 'en'))}\n"
-        "I also read: " + (html.escape(", ".join(lang_name(c) for c in sorted(user.also_reads_set))) or "—")
-        + " · Show originals: " + ("on" if user.show_original else "off")
-    )
+    return "<b>Your settings</b>\nChoose what you receive. You can always reply /tr for a single translation."
 
 
 def groups_kb(groups: list[tuple[Chat, bool]]) -> InlineKeyboardMarkup:

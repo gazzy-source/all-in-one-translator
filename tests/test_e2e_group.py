@@ -289,7 +289,8 @@ async def test_private_start_access_denied_when_private_access_approved(tmp_path
 async def test_private_start_open_to_everyone_by_default(h: Harness) -> None:
     await h.send(dm(OUTSIDER, "/start"))
     out = h.tg.dms_to(OUTSIDER)
-    assert len(out) == 2  # welcome + language picker
+    assert len(out) == 1
+    assert out[0].params["reply_markup"]["inline_keyboard"][0][0]["callback_data"] == "lang:menu"
     assert "send or forward" in out[0].params["text"] and "group admin" in out[0].params["text"]  # approval hint
     assert "@babel_test_bot" not in out[0].params["text"]  # inline is approved-only by default
 
@@ -344,13 +345,11 @@ async def test_help_is_short_and_role_aware(h: Harness) -> None:
     await h.send(dm(OUTSIDER, "/help"))
     await h.send(dm(OWNER, "/help", mid=6))
     outsider, owner = h.tg.dms_to(OUTSIDER)[0].params["text"], h.tg.dms_to(OWNER)[0].params["text"]
-    assert "<b>Here</b>" in outsider and "group admin" in outsider and "/pause" not in outsider
-    assert "only to you" in owner and "/pause" in owner and "@babel_test_bot" in owner and "/status" in owner
-    assert "Choose a guide" in owner and len(owner) < 1200
-    assert owner.startswith("🇬🇧 <b>English</b>") and "(default)" in owner
+    assert "group admin" in outsider and "/status" not in outsider
+    assert "Choose a guide" in owner and "/status" in owner and len(owner) < 250
     kb = h.tg.dms_to(OWNER)[0].params["reply_markup"]["inline_keyboard"]
     assert {b["callback_data"] for row in kb for b in row} == {"lang:menu", "me:show", "me:mygroups", "me:privacy", "me:stop",
-                                                                      "help:read", "help:write", "help:setup", "help:missing"}
+                                                                      "help:read", "help:write", "help:setup", "help:missing", "home:open"}
     okb = h.tg.dms_to(OUTSIDER)[0].params["reply_markup"]["inline_keyboard"]
     assert "me:mygroups" not in {b["callback_data"] for row in okb for b in row}  # not approved: no groups
 
@@ -361,10 +360,9 @@ async def test_private_start_onboarding_for_approved(h: Harness) -> None:
           "entities": [{"type": "bot_command", "offset": 0, "length": 6}]}
     await h.send(dm)
     out = h.tg.dms_to(OWNER)
-    assert len(out) == 2
-    assert "English" in out[0].params["text"] and "selected by default" in out[0].params["text"]
-    kb = out[1].params["reply_markup"]["inline_keyboard"]
-    assert any(b["callback_data"] == "lang:set:hi" for row in kb for b in row)
+    assert len(out) == 1 and "English" in out[0].params["text"]
+    kb = out[0].params["reply_markup"]["inline_keyboard"]
+    assert {b["callback_data"] for row in kb for b in row} == {"lang:menu", "recent:menu:0", "me:show", "help:home"}
 
 
 async def test_show_sender_is_opt_in(h: Harness) -> None:
@@ -892,3 +890,54 @@ async def test_tagged_parent_uses_its_own_reply_context(h: Harness) -> None:
     assert jobs and all(j.reply_to and j.reply_to.text == "Which team?" for j in jobs)
     body = h.tg.ephemeral_to(OWNER)[-1].params["text"]
     assert "<blockquote>" in body and "Replying to" not in body and "<b>Reply:" not in body
+
+
+async def test_recent_reader_pages_are_scoped_and_recheck_membership(h: Harness) -> None:
+    from tests.test_billing import press
+
+    for mid in range(1, 8):
+        h.app.deliverer.recent.put(HINDI, GROUP_ID, None, mid, "hi", "<Group>", f"line {mid}", f"source {mid}")
+    h.app.deliverer.recent.put(OWNER, GROUP_ID, None, 99, "hi", "Group", "other reader", None)
+    h.app.deliverer.recent.put(HINDI, GROUP_ID, 8, 100, "hi", "Group", "other topic", None)
+
+    async def page(anchor: int) -> str:
+        payload = press(HINDI, f"recent:p:{GROUP_ID}:0:{anchor}")
+        await h.dp.feed_update(h.app.bot, Update.model_validate({"update_id": 997, **payload}))
+        return str([c for c in h.tg.calls if c.method == "EditMessageText"][-1].params["text"])
+
+    await h.send(dm(HINDI, "/recent"))
+    assert "recent:p:" in str(h.tg.dms_to(HINDI)[-1].params["reply_markup"])
+    newest = await page(0)
+    assert "line 3" in newest and "line 7" in newest and "line 2" not in newest and "other" not in newest
+    assert "&lt;Group&gt;" in newest
+    older = await page(2)
+    assert older.index("line 1") < older.index("line 2") and "line 3" not in older
+    h.tg.members[GROUP_ID].discard(HINDI)
+    assert "unavailable" in await page(0)
+    assert not h.tg.public_group_output()
+
+
+async def test_play_argument_reaches_translation_without_command(h: Harness) -> None:
+    await h.send(group_message("/play@music_bot ¿Alguien sabe si mañana estará abierto? 😂", sender=SPANISH_SPEAKER))
+    await h.idle()
+    assert "Does anyone know" in h.tg.ephemeral_to(OWNER)[0].params["text"]
+    assert not h.tg.public_group_output()
+
+
+async def test_recent_exact_reply_skips_queue_and_rejects_changed_text(h: Harness) -> None:
+    source = group_message("Que locura jajaja 😂", sender=SPANISH_SPEAKER)
+    await h.send(source)
+    await h.idle()
+    mid = source["message_id"]
+    cache = h.app.deliverer.recent
+    assert cache.exact(OWNER, GROUP_ID, mid, "en", source["text"])
+    assert cache.exact(OWNER, GROUP_ID, mid, "en", source["text"] + "!") is None
+    assert cache.exact(OUTSIDER, GROUP_ID, mid, "en", source["text"]) is None
+    assert cache.exact(OWNER, GROUP_ID, mid, "my", source["text"]) is None
+    count = len(h.tg.ephemeral_to(OWNER))
+    await h.send(group_message("/tr", sender=OWNER, reply_to=source))
+    fresh = h.tg.ephemeral_to(OWNER)[count:]
+    assert len(fresh) == 1 and "Translating" not in fresh[0].params["text"]
+    assert fresh[0].params["reply_parameters"]["message_id"] == mid
+    await h.send(dm(OWNER, "/forgetme"))
+    assert not cache.rows(OWNER, "en")

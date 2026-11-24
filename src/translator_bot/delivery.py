@@ -27,6 +27,7 @@ from aiogram.exceptions import (
 from aiogram.types import EphemeralMessageParameters, LinkPreviewOptions, ReplyParameters
 
 from translator_bot.metrics import Metrics
+from translator_bot.recent import Recent
 from translator_bot.recipients import Recipient
 from translator_bot.resilience import KeyedLimiter, SlidingWindowLimiter
 from translator_bot.storage import Storage
@@ -265,6 +266,7 @@ class Deliverer:
                  member_check: Callable[[int, int], Awaitable[bool]] | None = None) -> None:
         self.transport = transport
         self.storage = storage
+        self.recent = Recent()
         self.metrics = metrics
         self.member_check = member_check
         self.digest = FailureDigest()
@@ -325,6 +327,11 @@ class Deliverer:
                                 or time.monotonic() - next(iter(self._bubbles.values())).ts > BUBBLE_WINDOW_S):
             self._bubbles.popitem(last=False)
 
+    def _remember_delivery(self, d: Delivery, r: Recipient) -> None:
+        self.recent.put(r.user_id, d.chat_id, d.thread_id, d.message_ids[-1], d.target_lang,
+                        d.chat_title or "Group", format_delivery(replace(d, original_plain=None, show_sender=True)),
+                        d.original_plain if d.kind == "text" and len(d.message_ids) == 1 else None)
+
     async def _deliver_one(self, d: Delivery, r: Recipient, show_original: bool) -> None:
         async with self._lock(d, r):
             await self._deliver_one_locked(d, r, show_original)
@@ -337,6 +344,7 @@ class Deliverer:
         t0 = time.perf_counter()
         try:
             if notice is None and await self._append_to_bubble(d, r, view):
+                self._remember_delivery(d, r)
                 return
             eph_id = await self._send_with_retries(d.chat_id, r.user_id, text, anchor, d.thread_id, view, notice)
         except DeliveryError as err:
@@ -348,6 +356,7 @@ class Deliverer:
                                                    lang=d.target_lang, error=err.reason[:80])
             await self._fallback(view, r, err)
             return
+        self._remember_delivery(d, r)
         self.metrics.inc("delivered.ephemeral")
         self.metrics.observe("delivery_ms", (time.perf_counter() - t0) * 1000)
         self._remember_bubble(view, r, eph_id, text)
@@ -406,6 +415,7 @@ class Deliverer:
             if err2.reason == "forbidden":  # user blocked the bot: stop trying DM until they /start again
                 await self.storage.upsert_user(r.user_id, started=False)
             return
+        self._remember_delivery(d, r)
         self.metrics.inc("delivered.dm_fallback")
         for m in d.message_ids:
             await self.storage.record_delivery(d.chat_id, m, r.user_id, channel="dm", status="sent",
@@ -435,6 +445,7 @@ class Deliverer:
         for attempt in range(3):
             try:
                 await self.transport.edit_ephemeral(d.chat_id, r.user_id, eph_id, text)
+                self._remember_delivery(d, r)
                 self.metrics.inc("delivery_edit.ok")
                 return
             except DeliveryError as err:
