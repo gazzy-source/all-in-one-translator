@@ -92,7 +92,7 @@ def cache_key(job: TranslationJob, scope: str, uses_context: bool) -> str:
         parts.append(scope)
         parts.extend(f"{c.speaker}:{c.text}" for c in job.context)
         if job.reply_to:
-            parts.append(f"R:{job.reply_to.text}")
+            parts.append(f"R:{job.reply_to.speaker}:{job.reply_to.text}")
         parts.extend(f"{a}={b}" for a, b in job.glossary)
     h.update("\x1f".join(parts).encode("utf-8"))
     return h.hexdigest()

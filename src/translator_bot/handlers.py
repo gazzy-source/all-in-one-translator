@@ -101,7 +101,7 @@ SETUP_GUIDE = (
     "2. Reply <code>/approve</code> to a member's message — the group owner can send <code>/approveall</code> for everyone here.\n\n"
     "Then messages, stickers, GIFs and voice notes are translated into each reader's language, visible only to "
     "them. Members can reply <code>/tr</code> to any message, or write <code>/tr text</code> to answer in the "
-    "group's languages. Only you see this message."
+    "group's languages."
 )
 
 
@@ -143,7 +143,7 @@ async def register_owner_group_commands(app: App, chat_id: int) -> None:
 async def _guide_adder(app: App, chat_id: int, user_id: int, *, ready: bool) -> None:
     """Whoever added/promoted the bot gets the setup steps - privately, in the group (DM fallback)."""
     text = ("✅ <b>I'm ready.</b> Reply <code>/approve</code> to a member's message, or "
-            "ask the group owner to use <code>/approveall</code> for everyone here. Only you see this message." if ready else SETUP_GUIDE)
+            "ask the group owner to use <code>/approveall</code> for everyone here." if ready else SETUP_GUIDE)
     try:
         await app.bot.send_message(chat_id=chat_id, text=text,
                                    ephemeral_message_parameters=EphemeralMessageParameters(receiver_user_id=user_id))

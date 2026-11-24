@@ -100,7 +100,7 @@ async def test_acceptance_three_members(h: Harness) -> None:
     assert en[0].params["reply_parameters"]["message_id"] > 0  # reply context to the original
     assert en[0].params["disable_notification"] is True
     # OWNER never chose a language: default notice shown exactly once
-    assert "Only you see this" in en[0].params["text"]
+    assert "/language" in en[0].params["text"] and "Only you see this" not in en[0].params["text"]
 
     await h.send(group_message("Are you coming tonight?", sender=OWNER, name="Owner"))
     await h.idle()
@@ -112,7 +112,7 @@ async def test_acceptance_three_members(h: Harness) -> None:
     await h.idle()
     en = h.tg.ephemeral_to(OWNER)
     assert len(en) == 2 and "dude, what's the plan?" in en[1].params["text"]
-    assert "Only you see this" not in en[1].params["text"]  # notice only once
+    assert "/language" not in en[1].params["text"]  # notice only once
     assert len(h.tg.ephemeral_to(HINDI)) == 2  # romanized Hindi is already Hindi for the Hindi reader
 
     await h.send(group_message("😂😂😂", sender=OUTSIDER))
@@ -874,3 +874,21 @@ async def test_reader_gets_translated_parent_and_current_reply(h: Harness, body:
     assert ("coming tonight" if body.startswith("Are") else "Does anyone know") in sent.params["text"].split("</blockquote>")[1]
     assert sent.params["reply_parameters"]["message_id"] == 151
     assert not h.tg.public_group_output()
+
+
+async def test_tagged_parent_uses_its_own_reply_context(h: Harness) -> None:
+    first = group_message("Which team?", sender=OWNER, message_id=910)
+    parent = group_message("El equipo rojo", sender=OUTSIDER, message_id=911)
+    parent["reply_to_message"] = first
+    child = group_message("Estoy de acuerdo", sender=SPANISH_SPEAKER, message_id=912)
+    child["reply_to_message"] = parent
+    await h.send(parent)
+    await h.idle()
+    h.app.orchestrator.cache.clear()
+    h.gemini.jobs.clear()
+    await h.send(child)
+    await h.idle()
+    jobs = [j for j, _ in h.gemini.jobs if j.text == "El equipo rojo" and j.target == "en"]
+    assert jobs and all(j.reply_to and j.reply_to.text == "Which team?" for j in jobs)
+    body = h.tg.ephemeral_to(OWNER)[-1].params["text"]
+    assert "<blockquote>" in body and "Replying to" not in body and "<b>Reply:" not in body

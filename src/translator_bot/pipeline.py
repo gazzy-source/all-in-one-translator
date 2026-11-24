@@ -59,6 +59,7 @@ class UnitMeta:
     ctx_before: int | None = None  # ContextStore.mark when the (first) message arrived
     append_after: int | None = None  # exact preceding original; never merge out-of-order translations
     arrival_context: tuple[ContextLine, ...] | None = None
+    parent_id: int | None = None
 
 
 @dataclass(slots=True)
@@ -190,7 +191,8 @@ class Pipeline:
             return
         self.metrics.inc(f"eligible.{res.kind.value}")
         meta = UnitMeta(msg.chat.id, msg.chat.title, thread, sid, sender_name(msg), reply_ctx,
-                        chat.settings, ctx_mark, append_after, arrival_context)
+                        chat.settings, ctx_mark, append_after, arrival_context,
+                        msg.reply_to_message.message_id if reply_ctx and msg.reply_to_message else None)
         if res.kind is Kind.TEXT:
             await self.bursts.add((msg.chat.id, thread, sid or 0),
                                   BurstItem(msg.message_id, res.text_html, res.plain), meta)
@@ -393,6 +395,11 @@ class Pipeline:
         source = meta.reply_ctx.text
         # Translate the quoted speaker independently. Later conversation belongs to the reply.
         parent = replace(meta, reply_ctx=None, settings={"context": False}, arrival_context=())
+        record = self._units.get((meta.chat_id, meta.parent_id)) if meta.parent_id is not None else None
+        if (record and record.meta.thread_id == meta.thread_id and record.meta.arrival_context is not None
+                and time.monotonic() - record.created <= min(self.edit_memory_s, self.context.ttl_s)
+                and len(record.items) == 1 and source in record.items[0].plain):
+            parent = record.meta
         out, _, why = await self._translate_outcome(parent, source, source, lang, glossary=glossary)
         if why == "same":
             return source

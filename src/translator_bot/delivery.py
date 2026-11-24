@@ -180,11 +180,9 @@ def format_delivery(d: Delivery, *, notice: str | None = None) -> str:
     head = who + ("✏️ " if d.edited else "")
     parts = []
     if d.parent_excerpt:
-        parts.append("<i>Replying to</i>\n<blockquote>" + html.escape(truncate(d.parent_excerpt, 240)) + "</blockquote>")
+        parts.append("<blockquote>" + html.escape(truncate(d.parent_excerpt, 240)) + "</blockquote>")
     if d.original_plain:
         parts.append(f"<blockquote>{html.escape(truncate(d.original_plain, 300))}</blockquote>")
-    if d.parent_excerpt:
-        head = f"<b>{html.escape(d.sender_name or 'Reply')}:</b> " if d.show_sender else "<b>Reply:</b> "
     parts.append(head + sanitize_html(d.translation_html))
     if notice:
         parts.append(f"<i>{html.escape(notice)}</i>")
@@ -215,7 +213,7 @@ def message_link(chat_id: int, message_id: int, thread_id: int | None) -> str | 
     return f"https://t.me/c/{internal}/{thread_id}/{message_id}" if thread_id else f"https://t.me/c/{internal}/{message_id}"
 
 
-DEFAULT_NOTICE = "Only you see this. To change the language, message me and send /language."
+DEFAULT_NOTICE = "Change your reading language in private with /language."
 
 
 # --- deliverer -----------------------------------------------------------------------------------
