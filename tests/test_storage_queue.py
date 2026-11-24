@@ -193,3 +193,21 @@ async def test_online_backup_while_open(tmp_path: Path) -> None:
         assert len(list((tmp_path / "backups").glob("translator-*.sqlite3"))) <= 2
     finally:
         await st.close()
+
+
+async def test_expired_timer_cannot_flush_next_burst() -> None:
+    batches = []
+
+    async def record(key, items, meta):
+        batches.append([item.message_id for item in items])
+
+    b = BurstCoalescer(record, window=60)
+    key = (1, None, 1)
+    await b.add(key, BurstItem(1, "a", "a"), None)
+    b._pending[key][2].cancel()
+    b._spawn_flush(key)
+    await b.add(key, BurstItem(2, "b", "b"), None)
+    await asyncio.sleep(0)
+    assert batches == [[1]]
+    await b.flush_all()
+    assert batches == [[1], [2]]

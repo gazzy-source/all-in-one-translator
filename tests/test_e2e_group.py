@@ -439,6 +439,9 @@ async def test_context_is_what_was_said_before_the_message(tmp_path: Path, detec
         await hh.send(group_message("Are you coming tonight?", sender=OUTSIDER))
         await hh.send(group_message("no sé todavía", sender=SPANISH_SPEAKER))
         await hh.send(group_message("ni modo jaja", sender=SPANISH_SPEAKER))  # same burst
+        # The pending burst still needs its original context after the live buffer turns over.
+        for i in range(12):
+            app.context.add(GROUP_ID, None, OUTSIDER, f"Later unrelated line {i}")
         await hh.idle()
         [(job, _q)] = [j for j in gemini.jobs if "ni modo" in j[0].text]
         assert [c.text for c in job.context] == ["Are you coming tonight?"]
@@ -856,4 +859,18 @@ async def test_admin_menus_are_per_person_and_approveall_only_for_creator(
         commands = {c["command"] for c in menu["commands"]}
         assert ("approveall" in commands) is (menu["scope"]["user_id"] == OWNER)
         assert all(c["is_ephemeral"] for c in menu["commands"])
+    assert not h.tg.public_group_output()
+
+
+@pytest.mark.parametrize("body", ["Are you coming tonight?", "¿Alguien sabe si mañana estará abierto? 😂"])
+async def test_reader_gets_translated_parent_and_current_reply(h: Harness, body: str) -> None:
+    parent = group_message("Que locura jajaja 😂", sender=SPANISH_SPEAKER, message_id=150)
+    reply = group_message(body, sender=OUTSIDER, message_id=151)
+    reply["reply_to_message"] = parent
+    await h.send(reply)
+    await h.idle()
+    [sent] = h.tg.ephemeral_to(OWNER)
+    assert "crazy hahaha" in sent.params["text"].split("</blockquote>")[0]
+    assert ("coming tonight" if body.startswith("Are") else "Does anyone know") in sent.params["text"].split("</blockquote>")[1]
+    assert sent.params["reply_parameters"]["message_id"] == 151
     assert not h.tg.public_group_output()

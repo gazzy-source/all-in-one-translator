@@ -1104,7 +1104,7 @@ def _status_text(app: App) -> str:
         lines += [f"{html.escape(k)}: {v}" for k, v in sorted(fails.items())]
     lat = snap["latency_ms"]
     assert isinstance(lat, dict)
-    for k in ("latency.gemini", "latency.deepl", "delivery_ms", "pipeline_text_ms"):
+    for k in ("queue_wait_ms.text", "queue_wait_ms.media", "latency.gemini", "latency.deepl", "delivery_ms", "pipeline_text_ms"):
         if lat.get(k):
             lines.append(f"{k}: {lat[k]}")
     for k in sorted(k for k in lat if k.startswith(("pipeline_media_ms.", "private_ms."))):

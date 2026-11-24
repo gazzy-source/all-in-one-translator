@@ -184,3 +184,15 @@ async def test_eviction_during_append_still_records_delivery(delivery: Any, monk
     await d.deliver(replace(first, message_ids=[11], translation_html="Second", append_after=10), [r])
     assert t.edits == [(1, "First\nSecond")]
     assert (await st.deliveries_for(-1001, 11))[0]["status"] == "sent"
+
+
+def test_long_emoji_reply_preserves_quote_and_notice() -> None:
+    from translator_bot.delivery import format_delivery
+    from translator_bot.textutil import html_to_plain
+
+    d = Delivery(-1, "Group", None, [11], "A", "my", "en", "\U0001f600" * 3000,
+                 "text", parent_excerpt="Question & answer")
+    html = format_delivery(d, notice="Private")
+    assert "<blockquote>Question &amp; answer</blockquote>" in html
+    assert html.endswith("<i>Private</i>")
+    assert len(html_to_plain(html).encode("utf-16-le")) // 2 <= 4096

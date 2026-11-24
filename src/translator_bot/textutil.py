@@ -453,4 +453,22 @@ def normalize_for_key(text: str) -> str:
 
 
 def truncate(text: str, limit: int) -> str:
-    return text if len(text) <= limit else text[: max(0, limit - 1)].rstrip() + "…"
+    if len(text) <= limit:
+        return text
+    end = 0
+    for match in re.finditer(r"\X", text):
+        if match.end() >= limit:
+            break
+        end = match.end()
+    return text[:end].rstrip() + "\u2026"
+
+
+def utf16_prefix(text: str, budget: int) -> str:
+    """Take whole graphemes without exceeding a Telegram UTF-16 budget."""
+    end = 0
+    for match in re.finditer(r"\X", text):
+        budget -= len(match.group().encode("utf-16-le")) // 2
+        if budget < 0:
+            break
+        end = match.end()
+    return text[:end]

@@ -30,7 +30,7 @@ from translator_bot.metrics import Metrics
 from translator_bot.recipients import Recipient
 from translator_bot.resilience import KeyedLimiter, SlidingWindowLimiter
 from translator_bot.storage import Storage
-from translator_bot.textutil import html_to_plain, sanitize_html, truncate
+from translator_bot.textutil import html_to_plain, sanitize_html, truncate, utf16_prefix
 
 log = logging.getLogger(__name__)
 
@@ -153,6 +153,7 @@ class Delivery:
     show_sender: bool = False
     sender_id: int | None = None
     append_after: int | None = None  # exact preceding original in this sender's run
+    parent_excerpt: str | None = None
 
 
 @dataclass(slots=True)
@@ -178,15 +179,24 @@ def format_delivery(d: Delivery, *, notice: str | None = None) -> str:
     who = f"<b>{html.escape(d.sender_name or 'Someone')}:</b> " if d.show_sender else ""
     head = who + ("✏️ " if d.edited else "")
     parts = []
+    if d.parent_excerpt:
+        parts.append("<i>Replying to</i>\n<blockquote>" + html.escape(truncate(d.parent_excerpt, 240)) + "</blockquote>")
     if d.original_plain:
         parts.append(f"<blockquote>{html.escape(truncate(d.original_plain, 300))}</blockquote>")
+    if d.parent_excerpt:
+        head = f"<b>{html.escape(d.sender_name or 'Reply')}:</b> " if d.show_sender else "<b>Reply:</b> "
     parts.append(head + sanitize_html(d.translation_html))
     if notice:
         parts.append(f"<i>{html.escape(notice)}</i>")
     text = "\n".join(parts)
-    if len(text) > MAX_TEXT:  # keep valid HTML: truncate the plain body instead of slicing tags
-        body = truncate(html_to_plain(d.translation_html), MAX_TEXT - len(head) - 200)
-        text = "\n".join([head + html.escape(body)] + ([f"<i>{html.escape(notice)}</i>"] if notice else []))
+    if len(html_to_plain(text).encode("utf-16-le")) // 2 > MAX_TEXT - 100:
+        body_index = -2 if notice else -1
+        parts[body_index] = head
+        reserved = len(html_to_plain("\n".join(parts)).encode("utf-16-le")) // 2
+        budget = max(0, MAX_TEXT - 101 - reserved)
+        body = utf16_prefix(html_to_plain(d.translation_html), budget)
+        parts[body_index] = head + html.escape(body) + "\u2026"
+        text = "\n".join(parts)
     return text
 
 
@@ -286,7 +296,7 @@ class Deliverer:
                 or time.monotonic() - b.ts > BUBBLE_WINDOW_S):
             return False
         text = b.text + "\n" + format_delivery(view)
-        if len(text) > MAX_TEXT - 100:
+        if len(html_to_plain(text).encode("utf-16-le")) // 2 > MAX_TEXT - 100:
             return False
         try:
             await self.transport.edit_ephemeral(d.chat_id, r.user_id, b.ephemeral_id, text)

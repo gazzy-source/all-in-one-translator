@@ -181,3 +181,11 @@ def test_romanized_output_detection() -> None:
     assert not romanized_output("Maria and Dave Smith", "Maria और Dave Smith", "Devanagari")  # copied names
     assert not romanized_output("x", "anything goes here in latin", "Latin")
     assert not romanized_output("x", "lol ok", "Devanagari")  # too short to judge
+
+
+def test_emoji_and_combining_clusters_survive_cutoff() -> None:
+    from translator_bot.textutil import truncate, utf16_prefix
+
+    for cluster in ("\U0001f469\u200d\U0001f4bb", "e\u0301", "\U0001f1f2\U0001f1f2", "\U0001f44d\U0001f3fd"):
+        assert truncate("A" + cluster + "B", 3) == "A\u2026"
+        assert utf16_prefix("A" + cluster, len(cluster.encode("utf-16-le")) // 2) == "A"

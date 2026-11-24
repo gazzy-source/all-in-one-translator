@@ -12,7 +12,7 @@ import logging
 import time
 from collections import Counter, OrderedDict, defaultdict, deque
 from collections.abc import AsyncIterator, Awaitable, Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from aiogram.types import Message
@@ -58,6 +58,7 @@ class UnitMeta:
     settings: dict[str, Any]
     ctx_before: int | None = None  # ContextStore.mark when the (first) message arrived
     append_after: int | None = None  # exact preceding original; never merge out-of-order translations
+    arrival_context: tuple[ContextLine, ...] | None = None
 
 
 @dataclass(slots=True)
@@ -137,6 +138,10 @@ class Pipeline:
         sid = sender_id(msg)
         thread = topic_of(msg)  # one key for context, bursts, claims and delivery
         ctx_mark = self.context.mark  # context = what was said *before* this message
+        arrival_context = (self.context.get(msg.chat.id, thread, sid or 0, limit=self.s.context_messages)
+                           if chat.active and chat.enabled and chat.settings.get("context", True)
+                           and self.s.context_messages else ())
+        reply_ctx = self._reply_ctx(msg, sid)
         prev = self._last_speaker.get((msg.chat.id, thread))
         now = time.monotonic()
         append_after = (prev[2] if prev is not None and sid is not None and prev[0] == sid
@@ -184,11 +189,13 @@ class Pipeline:
             self.metrics.inc("skip.duplicate")
             return
         self.metrics.inc(f"eligible.{res.kind.value}")
-        meta = UnitMeta(msg.chat.id, msg.chat.title, thread, sid, sender_name(msg), self._reply_ctx(msg, sid),
-                        chat.settings, ctx_mark, append_after)
+        meta = UnitMeta(msg.chat.id, msg.chat.title, thread, sid, sender_name(msg), reply_ctx,
+                        chat.settings, ctx_mark, append_after, arrival_context)
         if res.kind is Kind.TEXT:
             await self.bursts.add((msg.chat.id, thread, sid or 0),
                                   BurstItem(msg.message_id, res.text_html, res.plain), meta)
+            if reply_ctx:
+                await self.bursts.flush((msg.chat.id, thread, sid or 0))
         else:
             key = (msg.chat.id, thread, sid or 0)
             await self.bursts.flush(key)  # keep ordering: pending text from this sender goes first
@@ -369,6 +376,8 @@ class Pipeline:
 
     def _reply_ctx(self, msg: Message, sid: int | None) -> ContextLine | None:
         r = msg.reply_to_message
+        if r is None or r.chat.id != msg.chat.id or r.ephemeral_message_id is not None or r.forum_topic_created:
+            return None
         quote = msg.quote.text if msg.quote is not None else None
         text = quote or (r.text or r.caption if r is not None else None)
         if not text:
@@ -376,6 +385,18 @@ class Pipeline:
         other = sender_id(r) if r is not None else None
         label = self.context.speaker_label(msg.chat.id, topic_of(msg), sid or 0, other or -1)
         return ContextLine(label, truncate(text, 300))
+
+    async def _translated_parent(self, meta: UnitMeta, lang: str,
+                                 glossary: tuple[tuple[str, str], ...]) -> str | None:
+        if not meta.reply_ctx or not meta.settings.get("context", True):
+            return None
+        source = meta.reply_ctx.text
+        # Translate the quoted speaker independently. Later conversation belongs to the reply.
+        parent = replace(meta, reply_ctx=None, settings={"context": False}, arrival_context=())
+        out, _, why = await self._translate_outcome(parent, source, source, lang, glossary=glossary)
+        if why == "same":
+            return source
+        return _html.unescape(out) if out else None
 
     async def _on_burst(self, key: tuple[int, int | None, int], items: list[BurstItem], meta: object) -> None:
         assert isinstance(meta, UnitMeta)
@@ -402,8 +423,8 @@ class Pipeline:
                                                           or verdict is Verdict.UNSURE)
         ctx: tuple[ContextLine, ...] = ()
         if use_ctx and self.s.context_messages:
-            ctx = self.context.get(meta.chat_id, meta.thread_id, meta.sender_id or 0, limit=self.s.context_messages,
-                                   before=meta.ctx_before)
+            ctx = meta.arrival_context if meta.arrival_context is not None else self.context.get(
+                meta.chat_id, meta.thread_id, meta.sender_id or 0, limit=self.s.context_messages, before=meta.ctx_before)
             # no arrival mark (edit after restart): the current message itself is the last entry - drop it
             if meta.ctx_before is None and ctx and ctx[-1].text.strip() == truncate(plain, 280).strip():
                 ctx = ctx[:-1]
@@ -549,17 +570,29 @@ class Pipeline:
             rs = await self._filter_readers(plain, lang, rs)
             if not rs:
                 return
-            out = await self._translate_for(meta, text_html, plain, lang, glossary=glossary)
-            if out is None:
-                return
-            translation, src = out
+            parent = None
+            if meta.reply_ctx and meta.settings.get("context", True):
+                (translation, src, reason), parent = await asyncio.gather(
+                    self._translate_outcome(meta, text_html, plain, lang, glossary=glossary),
+                    self._translated_parent(meta, lang, glossary),
+                )
+                if translation is None:
+                    if reason != "same" or not parent or parent == meta.reply_ctx.text:
+                        return
+                    # The reply is readable, but its parent still needs translating.
+                    translation = _html.escape(plain)
+            else:
+                out = await self._translate_for(meta, text_html, plain, lang, glossary=glossary)
+                if out is None:
+                    return
+                translation, src = out
             rs = await self._filter_readers(plain, lang, await self._current_readers(meta, lang, rs))
             if not rs:
                 return
             d = Delivery(meta.chat_id, meta.chat_title, meta.thread_id, [i.message_id for i in items],
                          meta.sender_name, src, lang, translation, "text", plain, edited,
                          show_sender=bool(meta.settings.get("show_sender")), sender_id=meta.sender_id,
-                         append_after=meta.append_after if not edited else None)
+                         append_after=meta.append_after if not edited else None, parent_excerpt=parent)
             if edited and not fresh:
                 await self.deliverer.update(d, rs, show_original=bool(meta.settings.get("show_original")))
             else:  # new message, or an edit that must not overwrite a burst's shared ephemeral
@@ -654,6 +687,7 @@ class Pipeline:
                     parts.append((icon if el.plain else "") + tr)
             if not parts:
                 return
+            parent = await self._translated_parent(meta, lang, glossary)
             rs = await self._current_readers(meta, lang, rs)
             caption_readers = await self._filter_readers(el.plain, lang, rs)
             media_readers = await self._filter_readers(media_text.text if media_text else "", lang, rs)
@@ -676,7 +710,7 @@ class Pipeline:
                 d = Delivery(meta.chat_id, meta.chat_title, meta.thread_id, [msg.message_id], meta.sender_name,
                              src, lang, "\n".join(selected), kind,
                              "\n".join(originals) or None, edited,
-                             show_sender=bool(meta.settings.get("show_sender")))
+                             show_sender=bool(meta.settings.get("show_sender")), parent_excerpt=parent)
                 if edited:
                     await self.deliverer.update(d, [r], show_original=bool(meta.settings.get("show_original")))
                 else:

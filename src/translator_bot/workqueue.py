@@ -8,9 +8,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections import OrderedDict, deque
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from translator_bot.metrics import Metrics
 
@@ -23,6 +24,7 @@ JobFn = Callable[[], Awaitable[None]]
 class _Job:
     key: str | None
     fn: JobFn
+    queued_at: float = field(default_factory=time.monotonic)
 
 
 class Lane:
@@ -89,6 +91,7 @@ class Lane:
             job = await self._next()
             if job is None:
                 return
+            self.metrics.observe(f"queue_wait_ms.{self.name}", (time.monotonic() - job.queued_at) * 1000)
             self.inflight += 1
             try:
                 await asyncio.wait_for(job.fn(), timeout=self.job_timeout)
@@ -100,7 +103,7 @@ class Lane:
                 if self._closing or (task is not None and task.cancelling()):
                     raise  # the worker itself is being stopped
                 # a job surfaced someone else's cancellation (e.g. a coalesced request whose owner timed out):
-                # count it and keep serving — an escaping CancelledError used to kill this worker for good
+                # count it and keep serving â€” an escaping CancelledError used to kill this worker for good
                 self.metrics.inc(f"queue.{self.name}.error")
                 log.warning("job cancelled unexpectedly", extra={"lane": self.name})
             except Exception:
@@ -148,7 +151,11 @@ class BurstCoalescer:
         self._flushing: set[asyncio.Task[None]] = set()  # strong refs: the loop only keeps weak ones
 
     def _spawn_flush(self, key: tuple[int, int | None, int]) -> None:
-        task = asyncio.ensure_future(self.flush(key))
+        entry = self._pending.pop(key, None)
+        if entry is None:
+            return
+        items, meta, _ = entry
+        task = asyncio.ensure_future(self._flush_cb(key, items, meta))
         self._flushing.add(task)
         task.add_done_callback(self._flushed)
 
@@ -167,14 +174,9 @@ class BurstCoalescer:
             handle = loop.call_later(self.window, lambda: self._spawn_flush(key))
             self._pending[key] = ([item], meta, handle)
         else:
-            items, first_meta, handle = entry
+            items, _, _ = entry
             items.append(item)
-            # latest meta (sender name etc.), but context stays "what was said before the burst's first line"
-            if getattr(first_meta, "ctx_before", None) is not None and hasattr(meta, "ctx_before"):
-                meta.ctx_before = first_meta.ctx_before  # type: ignore[attr-defined]
-            if hasattr(first_meta, "append_after") and hasattr(meta, "append_after"):
-                meta.append_after = first_meta.append_after
-            self._pending[key] = (items, meta, handle)
+            # The first line establishes the reply, speaker context and bubble predecessor for the burst.
         items = self._pending[key][0]
         if len(items) >= self.max_items or sum(len(i.plain) for i in items) >= self.max_chars:
             await self.flush(key)
@@ -202,3 +204,5 @@ class BurstCoalescer:
     async def flush_all(self) -> None:
         for key in list(self._pending):
             await self.flush(key)
+        if self._flushing:
+            await asyncio.gather(*tuple(self._flushing), return_exceptions=True)
