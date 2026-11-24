@@ -113,3 +113,13 @@ confirmed live (see `PLAN.md` → live verification).
 * `getFile` downloads ≤ 20 MB (we cap at 8 MB). Inline queries ≤ 256 chars; results' message text ≤ 4096.
 * Adding the bot creates a public "X added the bot" service message and the bot appears in the member list —
   no bot can avoid this.
+
+Personal controls use explicit pause/resume callback actions, so repeated clicks on old keyboards do not
+reverse the intended setting. Private help and settings accept group-approved readers, including current
+seen members in approve-all groups, while private translation and inline authorization stay global.
+
+`/approveall` requires a fresh Telegram group-owner (`creator`) check without a bot-owner override.
+Other administrators can still approve individuals and disable approve-all with `/revokeall`.
+Group command menus are registered only per member, with ephemeral commands; broad group/admin scopes
+are removed during registration. The output guard rejects broad/default command registration and
+non-ephemeral per-member commands. Approval invalidates membership rather than trusting an old reply.

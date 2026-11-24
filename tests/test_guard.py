@@ -79,3 +79,27 @@ async def test_guard_is_in_the_live_request_chain(tmp_path: Path, detector: Any)
         assert app.guard.blocked == 2
     finally:
         await app.stop()
+
+
+@pytest.mark.parametrize("scope", [None, {"type": "all_group_chats"}, {"type": "all_chat_administrators"},
+                                  {"type": "chat", "chat_id": GROUP_ID},
+                                  {"type": "chat_administrators", "chat_id": GROUP_ID}])
+def test_group_command_menus_are_blocked(scope: Any) -> None:
+    from aiogram.methods import SetMyCommands
+
+    with pytest.raises(PublicOutputBlocked):
+        check_method(SetMyCommands(commands=[{"command": "tr", "description": "Translate", "is_ephemeral": True}],
+                                   scope=scope))
+
+
+@pytest.mark.parametrize("ephemeral", [False, True])
+def test_per_member_commands_must_be_ephemeral(ephemeral: bool) -> None:
+    from aiogram.methods import SetMyCommands
+
+    method = SetMyCommands(commands=[{"command": "tr", "description": "Translate", "is_ephemeral": ephemeral}],
+                           scope={"type": "chat_member", "chat_id": GROUP_ID, "user_id": 123})
+    if ephemeral:
+        check_method(method)
+    else:
+        with pytest.raises(PublicOutputBlocked):
+            check_method(method)

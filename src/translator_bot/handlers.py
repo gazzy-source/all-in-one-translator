@@ -90,7 +90,7 @@ ADMIN_GROUP_COMMANDS = [
     BotCommand(command="approve", description="Reply to a member: translations for them in this group",
                is_ephemeral=True),
     BotCommand(command="revoke", description="Reply to a member: stop their translations here", is_ephemeral=True),
-    BotCommand(command="approveall", description="Translations for everyone in this group", is_ephemeral=True),
+    BotCommand(command="approveall", description="Group owner: translations for everyone", is_ephemeral=True),
     BotCommand(command="revokeall", description="Back to approving members one by one", is_ephemeral=True),
     BotCommand(command="glossary", description="term = rendering (names, in-jokes) | -term", is_ephemeral=True),
     *MEMBER_GROUP_COMMANDS,
@@ -98,7 +98,7 @@ ADMIN_GROUP_COMMANDS = [
 SETUP_GUIDE = (
     "👋 <b>Thanks for adding me!</b> Two steps, then everyone reads everyone:\n"
     "1. Make me an <b>admin</b> (all rights can stay off) — that's how translations show up only for each reader.\n"
-    "2. Reply <code>/approve</code> to a member's message — or send <code>/approveall</code> for everyone here.\n\n"
+    "2. Reply <code>/approve</code> to a member's message — the group owner can send <code>/approveall</code> for everyone here.\n\n"
     "Then messages, stickers, GIFs and voice notes are translated into each reader's language, visible only to "
     "them. Members can reply <code>/tr</code> to any message, or write <code>/tr text</code> to answer in the "
     "group's languages. Only you see this message."
@@ -112,16 +112,29 @@ def build_routers(app: App) -> list[Router]:
 async def register_commands(app: App) -> None:
     await app.bot.set_my_commands(PRIVATE_COMMANDS, scope=BotCommandScopeAllPrivateChats())
     with contextlib.suppress(TelegramAPIError):
-        await app.bot.set_my_commands(MEMBER_GROUP_COMMANDS, scope=BotCommandScopeAllGroupChats())
+        await app.bot.delete_my_commands(scope=BotCommandScopeAllGroupChats())
     # existing groups: hidden /approve for their owner/admins (new groups get it when the bot is added)
     for chat in (await app.storage.active_chats())[:200]:
         await register_owner_group_commands(app, chat.chat_id)
 
 
 async def register_owner_group_commands(app: App, chat_id: int) -> None:
+    configured: set[int] = set()
     with contextlib.suppress(TelegramAPIError):
-        await app.bot.set_my_commands(ADMIN_GROUP_COMMANDS, scope=BotCommandScopeChatAdministrators(chat_id=chat_id))
+        await app.bot.delete_my_commands(scope=BotCommandScopeChatAdministrators(chat_id=chat_id))
+        for member in await app.bot.get_chat_administrators(chat_id):
+            if member.user.is_bot:
+                continue
+            commands = [c for c in ADMIN_GROUP_COMMANDS if c.command != "approveall" or member.status == "creator"]
+            if member.user.id in app.s.owner_ids:
+                commands = [*commands, *(c for c in OWNER_GROUP_COMMANDS
+                                        if c.command not in {a.command for a in commands})]
+            await app.bot.set_my_commands(commands, scope=BotCommandScopeChatMember(
+                chat_id=chat_id, user_id=member.user.id))
+            configured.add(member.user.id)
     for oid in app.s.owner_ids:
+        if oid in configured:
+            continue
         with contextlib.suppress(TelegramAPIError):
             await app.bot.set_my_commands(OWNER_GROUP_COMMANDS,
                                           scope=BotCommandScopeChatMember(chat_id=chat_id, user_id=oid))
@@ -129,8 +142,8 @@ async def register_owner_group_commands(app: App, chat_id: int) -> None:
 
 async def _guide_adder(app: App, chat_id: int, user_id: int, *, ready: bool) -> None:
     """Whoever added/promoted the bot gets the setup steps - privately, in the group (DM fallback)."""
-    text = ("✅ <b>I'm ready.</b> Reply <code>/approve</code> to a member's message, or send "
-            "<code>/approveall</code> for everyone here. Only you see this message." if ready else SETUP_GUIDE)
+    text = ("✅ <b>I'm ready.</b> Reply <code>/approve</code> to a member's message, or "
+            "ask the group owner to use <code>/approveall</code> for everyone here. Only you see this message." if ready else SETUP_GUIDE)
     try:
         await app.bot.send_message(chat_id=chat_id, text=text,
                                    ephemeral_message_parameters=EphemeralMessageParameters(receiver_user_id=user_id))
@@ -216,10 +229,13 @@ def _group_router(app: App) -> Router:
             return
         uid = msg.from_user.id
         is_owner = app.resolver.is_owner(uid)
-        group_admin = (cmd in ("approve", "revoke", "approveall", "revokeall", "glossary") and not is_owner
+        group_admin = (cmd in ("approve", "revoke", "revokeall", "glossary") and not is_owner
                        and await app.is_chat_admin(msg.chat.id, uid))
         if cmd in ("approveall", "revokeall"):
-            if not (is_owner or group_admin):
+            if cmd == "approveall":
+                if msg.sender_chat is not None or not await app.is_chat_owner(msg.chat.id, uid):
+                    return
+            elif not (is_owner or group_admin):
                 return
             chat = await app.storage.get_chat(msg.chat.id)
             settings = dict(chat.settings) if chat else {}
@@ -262,7 +278,7 @@ def _group_router(app: App) -> Router:
             if is_owner:  # bot owner: every group
                 await app.storage.set_approved(member.id, cmd == "approve", by=uid)
             await app.storage.set_chat_approved(member.id, msg.chat.id, cmd == "approve", by=uid)  # this group
-            app.membership.set(msg.chat.id, member.id, True)
+            app.membership.invalidate(msg.chat.id, member.id)
             app.reply_targets.clear()
             if cmd == "approve":
                 verb = ("approved ✅ — they now get translations, only they see them" if is_owner
@@ -508,12 +524,14 @@ def _private_router(app: App) -> Router:
     r.message.filter(PRIVATE)
     awaiting_lang: dict[int, float] = {}  # user id -> when the language prompt was shown (typed names resolve)
 
-    async def access(msg: Message) -> tuple[bool, bool]:
+    async def access(msg: Message, *, controls: bool = False) -> tuple[bool, bool]:
         """(may use the private chat, is approved for group translations). Replies when access is denied."""
         if msg.from_user is None:
             return False, False
         await app.storage.upsert_user(msg.from_user.id, first_name=msg.from_user.first_name, started=True)
         approved = await app.resolver.is_approved(msg.from_user.id)
+        if controls:
+            approved = approved or await app.resolver.has_group_access(msg.from_user.id)
         if approved or app.s.private_access == "everyone":
             return True, approved
         await msg.answer(ui.ACCESS_DENIED.format(uid=msg.from_user.id))
@@ -521,7 +539,7 @@ def _private_router(app: App) -> Router:
 
     async def gate(msg: Message) -> bool:
         """Group-translation features (groups, pause): readers of at least one group."""
-        ok, approved = await access(msg)
+        ok, approved = await access(msg, controls=True)
         if not ok or msg.from_user is None:
             return False
         reader = approved or await app.resolver.has_group_access(msg.from_user.id)
@@ -637,7 +655,7 @@ def _private_router(app: App) -> Router:
 
     @r.message(Command("start"))
     async def start(msg: Message) -> None:
-        ok, approved = await access(msg)
+        ok, approved = await access(msg, controls=True)
         if not ok:
             return
         assert msg.from_user is not None
@@ -645,15 +663,19 @@ def _private_router(app: App) -> Router:
         assert user is not None
         await msg.answer(ui.welcome(user, default_lang=app.s.default_target_lang,
                                     is_owner=app.resolver.is_owner(user.user_id), bot_username=app.bot_username,
-                                    approved=approved, inline_ok=approved or app.s.inline_access == "everyone",
-                                    max_seconds=int(app.s.max_media_seconds)))
+                                    approved=approved,
+                                    private_ok=app.s.private_access == "everyone" or await app.resolver.is_approved(user.user_id),
+                                    inline_ok=await app.resolver.is_approved(user.user_id) or app.s.inline_access == "everyone",
+                                    max_seconds=int(app.s.max_media_seconds)),
+                         reply_markup=ui.help_kb(user.effective_lang or app.s.default_target_lang,
+                                                 approved=approved, paused=user.paused))
         if not user.onboarded:
             prompt_language(user.user_id)
             await msg.answer(ui.LANGUAGE_PROMPT, reply_markup=ui.language_menu(user.effective_lang or app.s.default_target_lang))
 
     @r.message(Command("language"))
     async def language(msg: Message) -> None:
-        ok, _approved = await access(msg)
+        ok, _approved = await access(msg, controls=True)
         if not ok:
             return
         assert msg.from_user is not None
@@ -664,7 +686,7 @@ def _private_router(app: App) -> Router:
 
     @r.message(Command("settings"))
     async def settings(msg: Message) -> None:
-        ok, _approved = await access(msg)
+        ok, _approved = await access(msg, controls=True)
         if not ok:
             return
         assert msg.from_user is not None
@@ -686,29 +708,19 @@ def _private_router(app: App) -> Router:
             return
         assert msg.from_user is not None
         paused = command.command == "pause"
-        await app.storage.upsert_user(msg.from_user.id, paused=paused)
-        await msg.answer("⏸ Your translations are paused. /resume to restart." if paused
-                         else "▶️ Your translations are active again.")
+        user = await app.storage.upsert_user(msg.from_user.id, paused=paused)
+        await msg.answer("⏸ Your automatic group translations are paused. One-off /tr requests still work."
+                         if paused else "▶️ Your automatic group translations are active again.",
+                         reply_markup=ui.help_kb(user.effective_lang or app.s.default_target_lang,
+                                                 paused=paused))
 
     @r.message(Command("help"))
     async def help_(msg: Message) -> None:
-        ok, approved = await access(msg)
+        ok, _approved = await access(msg, controls=True)
         if not ok:
             return
         assert msg.from_user is not None
-        uid = msg.from_user.id
-        user = await app.storage.get_user(uid)
-        lang = (user.effective_lang if user else None) or app.s.default_target_lang
-        groups = await _group_count(app, uid) if approved else None
-        await msg.answer(ui.help_text(uid=uid, lang=lang, bot_username=app.bot_username,
-                                      approved=approved, private_ok=True,
-                                      inline_ok=approved or app.s.inline_access == "everyone",
-                                      max_seconds=int(app.s.max_media_seconds),
-                                      is_owner=app.resolver.is_owner(uid),
-                                      paused=bool(user and user.paused), user=user, groups=groups,
-                                      plan_line=None if app.resolver.is_owner(uid) or not app.plan.enabled
-                                      else billing.status_line(app.plan, user)),
-                         reply_markup=ui.help_kb(lang, approved=approved))
+        await _send_help(app, msg, msg.from_user.id)
 
     @r.message(Command("privacy"))
     async def privacy(msg: Message) -> None:
@@ -780,7 +792,9 @@ def _private_router(app: App) -> Router:
 
     @r.message(F.text)
     async def free_text(msg: Message) -> None:
-        ok, approved = await access(msg)
+        waiting_for_language = bool(msg.from_user and
+                                    time.monotonic() - awaiting_lang.get(msg.from_user.id, -1e9) < 600)
+        ok, approved = await access(msg, controls=waiting_for_language)
         if not ok or not msg.text:
             return
         assert msg.from_user is not None
@@ -803,6 +817,10 @@ def _private_router(app: App) -> Router:
             hits = suggest_languages(text)
             if hits:
                 await msg.answer("Did you mean:", reply_markup=ui.suggestions_kb(hits, current))
+                return
+        if waiting_for_language:
+            ok, approved = await access(msg)
+            if not ok:
                 return
         await _private_translate(app, msg, current, approved)
 
@@ -1013,6 +1031,26 @@ async def _send_invoice(app: App, uid: int, product: str) -> str | None:
     return None
 
 
+async def _send_help(app: App, msg: Message, uid: int, *, edit: bool = False) -> None:
+    approved = await app.resolver.has_group_access(uid)
+    user = await app.storage.get_user(uid)
+    lang = (user.effective_lang if user else None) or app.s.default_target_lang
+    text = ui.help_text(uid=uid, lang=lang, bot_username=app.bot_username, approved=approved,
+                        private_ok=app.s.private_access == "everyone" or await app.resolver.is_approved(uid),
+                        inline_ok=await app.resolver.is_approved(uid) or app.s.inline_access == "everyone",
+                        max_seconds=int(app.s.max_media_seconds), is_owner=app.resolver.is_owner(uid),
+                        paused=bool(user and user.paused), user=user,
+                        groups=await _group_count(app, uid) if approved else None,
+                        plan_line=None if app.resolver.is_owner(uid) or not app.plan.enabled
+                        else billing.status_line(app.plan, user))
+    kb = ui.help_kb(lang, approved=approved, paused=bool(user and user.paused))
+    if edit:
+        with contextlib.suppress(TelegramAPIError):
+            await msg.edit_text(text, reply_markup=kb)
+    else:
+        await msg.answer(text, reply_markup=kb)
+
+
 async def _group_count(app: App, user_id: int) -> int | None:
     """Enabled groups where this user is a member and hasn't muted the bot (None if it can't be checked)."""
     try:
@@ -1097,13 +1135,27 @@ def _callback_router(app: App) -> Router:
         uid = cb.from_user.id
         data = cb.data or ""
         msg = cb.message
-        if not await app.resolver.is_approved(uid) and (app.s.private_access != "everyone"
+        personal = data.partition(":")[0] in ("lang", "ilang", "me", "also", "help")
+        controls_ok = personal and await app.resolver.has_group_access(uid)
+        if not controls_ok and not await app.resolver.is_approved(uid) and (app.s.private_access != "everyone"
                                                          or data.partition(":")[0] not in ("lang", "ilang", "me",
-                                                                                            "pay", "also")):
+                                                                                            "pay", "also", "help")):
             await cb.answer("This translator is private.", show_alert=True)
             return
         user = await app.storage.get_user(uid) or await app.storage.upsert_user(uid)
         prefix, _, rest = data.partition(":")
+        if prefix == "help":
+            if rest == "home":
+                await _send_help(app, msg, uid, edit=True)
+            else:
+                text = ui.help_topic(rest, int(app.s.max_media_seconds))
+                if text is None:
+                    await cb.answer("Open /help for the current menu.")
+                    return
+                with contextlib.suppress(TelegramAPIError):
+                    await msg.edit_text(text, reply_markup=ui.help_back_kb())
+            await cb.answer()
+            return
         if prefix in ("lang", "ilang"):
             current = (user.effective_lang if prefix == "lang" else user.inline_lang) or (
                 app.s.default_target_lang if prefix == "lang" else "en")
@@ -1120,7 +1172,8 @@ def _callback_router(app: App) -> Router:
                     await app.storage.upsert_user(uid, inline_lang=lang.code)
                     note = f"✅ Inline translations will go to <b>{html.escape(lang.label)}</b>."
                 with contextlib.suppress(TelegramAPIError):
-                    await msg.edit_text(note)
+                    await msg.edit_text(note + ("\nAutomatic group translations remain paused." if user.paused else ""),
+                                        reply_markup=ui.help_back_kb())
                 await cb.answer("Saved")
                 return
             if action == "page":
@@ -1128,13 +1181,15 @@ def _callback_router(app: App) -> Router:
             else:
                 kb = ui.language_menu(current, prefix)
             with contextlib.suppress(TelegramAPIError):
-                await msg.edit_reply_markup(reply_markup=kb)
+                await msg.edit_text("Choose a language below. Use /language to enter a language name.",
+                                    reply_markup=kb)
             await cb.answer()
             return
         if prefix == "me":
             action, _, val = rest.partition(":")
-            if action == "pause":
-                user = await app.storage.upsert_user(uid, paused=not user.paused)
+            if action in ("pause", "stop", "resume"):
+                user = await app.storage.upsert_user(
+                    uid, paused=not user.paused if action == "pause" else action == "stop")
             elif action == "dm":
                 user = await app.storage.upsert_user(uid, dm_fallback=not user.dm_fallback)
             elif action == "orig":
@@ -1154,7 +1209,7 @@ def _callback_router(app: App) -> Router:
                 await cb.answer("Muted" if not muted else "Unmuted")
                 return
             elif action == "privacy":
-                await msg.answer(ui.PRIVACY)
+                await msg.answer(ui.PRIVACY, reply_markup=ui.help_back_kb())
                 await cb.answer()
                 return
             elif action == "mygroups":  # from /help: list below, keep the help message

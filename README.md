@@ -51,7 +51,7 @@ Maria: ¿Alguien sabe si mañana             Maria: ¿Alguien sabe si mañana   
 
 ### Private, per-person translation
 - **Approved recipients:** bot owners, people approved by a bot owner, and people approved by this group's
-  admins. Group admins can use hidden `/approveall` for members seen in their group. Membership is checked.
+  admins. Only the group owner can use hidden `/approveall` for members seen in their group. Membership is checked.
 - **Approve and done:** each reader's language is picked automatically (the language they write in the group,
   else their Telegram app language); anyone can choose one of 79 languages with `/language`. Nobody has to
   message the bot first.
@@ -189,10 +189,19 @@ published image on GHCR, health checks with self-healing restarts, online backup
    in-group messages; no rights are needed or used).
 2. Whoever adds/promotes the bot gets setup steps privately. New groups are enabled by default
    (`ENABLE_NEW_GROUPS=owner_added` restores owner-only setup).
-3. Group admins can reply `/approve` to members or use `/approveall` for people seen in that group.
+3. Group admins can reply `/approve` to members. Only the Telegram group owner can use `/approveall` for people seen in that group.
    A bot owner's approval applies across groups; a group admin's approval applies only there.
 4. Readers receive translations in their automatically detected language or Telegram app language.
    They can choose another language with `/language` in private; `/start` is optional.
+
+### Personal controls and help
+
+Open `/start` or `/help` privately for buttons to change your reading language, pause/resume your own
+translations, or mute individual groups. Help has separate guides for reading, writing with `/tr`, group
+setup, and missing translations, with a return button on every guide. Changing language preserves your
+pause setting. Pausing stops automatic group translations for your account; manual `/tr` requests still work.
+Group-approved readers (including seen members under `/approveall`) can manage these controls even when
+private translation access is restricted. This does not grant global approval or private translation privileges.
 
 ## 💬 Commands
 
@@ -211,7 +220,8 @@ published image on GHCR, health checks with self-healing restarts, online backup
 | | `/chats` | Per-group toggles: text, captions, images, stickers, animated, GIFs, videos, voice, context, sender name |
 | | `/status` | Health, delivery counters, provider quota, latency |
 | Owners (hidden, in group) | `/approve` · `/revoke` · `/approvefree` · `/revokefree` (as replies) · `/check` · `/glossary term = rendering` | Invisible to members |
-| Group admins (hidden, in their group) | `/approve` · `/revoke` · `/approveall` · `/revokeall` · `/glossary` | Manage this group's readers and glossary |
+| Group admins (hidden, in their group) | `/approve` · `/revoke` · `/revokeall` · `/glossary` | Manage this group's readers and glossary |
+| Group owner only (hidden) | `/approveall` | Enable translations for members seen in this group |
 
 Group translations need bot-owner approval, group-admin approval, or that group's `/approveall` (with
 `PRIVATE_ACCESS=approved` the whole private chat is limited to approved users).

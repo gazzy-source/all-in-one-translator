@@ -346,10 +346,11 @@ async def test_help_is_short_and_role_aware(h: Harness) -> None:
     outsider, owner = h.tg.dms_to(OUTSIDER)[0].params["text"], h.tg.dms_to(OWNER)[0].params["text"]
     assert "<b>Here</b>" in outsider and "group admin" in outsider and "/pause" not in outsider
     assert "only to you" in owner and "/pause" in owner and "@babel_test_bot" in owner and "/status" in owner
-    assert "<blockquote expandable>" in owner and "Not getting a translation?" in owner and len(owner) < 1200
+    assert "Choose a guide" in owner and len(owner) < 1200
     assert owner.startswith("🇬🇧 <b>English</b>") and "(default)" in owner
     kb = h.tg.dms_to(OWNER)[0].params["reply_markup"]["inline_keyboard"]
-    assert {b["callback_data"] for row in kb for b in row} == {"lang:menu", "me:show", "me:mygroups", "me:privacy"}
+    assert {b["callback_data"] for row in kb for b in row} == {"lang:menu", "me:show", "me:mygroups", "me:privacy", "me:stop",
+                                                                      "help:read", "help:write", "help:setup", "help:missing"}
     okb = h.tg.dms_to(OUTSIDER)[0].params["reply_markup"]["inline_keyboard"]
     assert "me:mygroups" not in {b["callback_data"] for row in okb for b in row}  # not approved: no groups
 
@@ -732,3 +733,127 @@ async def test_caption_and_media_reading_preferences_are_independent(
         assert ("¿Alguien sabe" in texts[0]) == has_caption
         assert ("The meeting has been moved" in texts[0]) == has_media
     assert h.tg.public_group_output() == []
+
+
+async def test_help_navigation_personal_controls_and_language(h: Harness) -> None:
+    from tests.test_billing import press
+
+    async def tap(data: str) -> None:
+        await h.dp.feed_update(h.app.bot, Update.model_validate({"update_id": 998, **press(HINDI, data)}))
+
+    for topic in ("read", "write", "setup", "missing"):
+        await tap("help:" + topic)
+        edit = [c for c in h.tg.calls if c.method == "EditMessageText"][-1]
+        assert "help:home" in str(edit.params["reply_markup"])
+        await tap("help:home")
+    await tap("me:stop")
+    await tap("me:stop")  # an old keyboard must not accidentally resume
+    await tap("lang:set:my")
+    user = await h.app.storage.get_user(HINDI)
+    assert user and user.paused and user.lang == "my"
+    await h.send(group_message("¿Alguien sabe si mañana estará abierto? 😂", sender=SPANISH_SPEAKER))
+    await h.idle()
+    assert not h.tg.ephemeral_to(HINDI) and h.tg.ephemeral_to(OWNER)
+    await tap("me:resume")
+    await tap("me:resume")
+    user = await h.app.storage.get_user(HINDI)
+    assert user and not user.paused and user.lang == "my"
+    await tap("lang:set:hi")
+    await h.send(group_message("Que locura jajaja 😂", sender=SPANISH_SPEAKER))
+    await h.idle()
+    assert h.tg.ephemeral_to(HINDI)
+    assert not h.tg.public_group_output()
+
+
+@pytest.mark.parametrize("everyone", [False, True])
+async def test_group_approved_reader_can_use_private_controls(h: Harness, everyone: bool) -> None:
+    from tests.test_billing import press
+
+    h.app.s.private_access = "approved"
+    if everyone:
+        await h.app.storage.upsert_chat(GROUP_ID, settings={"everyone": True})
+        await h.app.storage.mark_participant(OUTSIDER, GROUP_ID)
+    else:
+        await h.app.storage.set_chat_approved(OUTSIDER, GROUP_ID, True, OWNER)
+    await h.send(dm(OUTSIDER, "/help"))
+    assert "me:stop" in str(h.tg.dms_to(OUTSIDER)[-1].params["reply_markup"])
+    for data in ("me:stop", "lang:set:my", "help:home"):
+        await h.dp.feed_update(h.app.bot, Update.model_validate({"update_id": 999, **press(OUTSIDER, data)}))
+    user = await h.app.storage.get_user(OUTSIDER)
+    assert user and user.paused and user.lang == "my"
+    assert not h.tg.public_group_output()
+
+    assert not await h.app.resolver.is_approved(OUTSIDER)
+    await h.send(dm(OUTSIDER, "/language", mid=553))
+    await h.send(dm(OUTSIDER, "Burmese", mid=554))
+    assert "lang:set:my" in str(h.tg.dms_to(OUTSIDER)[-1].params["reply_markup"])
+    await h.send(dm(OUTSIDER, "/language", mid=556))
+    await h.send(dm(OUTSIDER, "Please translate this private message", mid=555))
+    assert "Ask a group admin" in h.tg.dms_to(OUTSIDER)[-1].params["text"]
+
+
+@pytest.mark.parametrize(("actor", "role", "allowed"), [
+    (OUTSIDER, "creator", True), (OWNER, "creator", True),
+    (OUTSIDER, "administrator", False), (OWNER, "administrator", False),
+    (OUTSIDER, "member", False), (OWNER, "member", False), (OWNER, "error", False),
+])
+async def test_approveall_requires_current_group_owner(
+        h: Harness, monkeypatch: pytest.MonkeyPatch, actor: int, role: str, allowed: bool) -> None:
+    from types import SimpleNamespace
+
+    from aiogram.exceptions import TelegramBadRequest
+    from aiogram.methods import GetChatMember
+
+    original = h.app.bot.get_chat_member
+
+    async def member(chat_id: int, user_id: int, **kwargs: Any) -> Any:
+        if user_id == actor:
+            if role == "error":
+                raise TelegramBadRequest(method=GetChatMember(chat_id=chat_id, user_id=user_id), message="unavailable")
+            return SimpleNamespace(status=role)
+        return await original(chat_id, user_id, **kwargs)
+
+    monkeypatch.setattr(h.app.bot, "get_chat_member", member)
+    await h.send(_cmd("/approveall", actor))
+    chat = await h.app.storage.get_chat(GROUP_ID)
+    assert chat and bool(chat.settings.get("everyone")) is allowed
+    if allowed:
+        await h.app.storage.upsert_chat(GROUP_ID, settings={"everyone": False})
+        role = "administrator"  # ownership transferred: never reuse a cached positive result
+        await h.send(_cmd("/approveall", actor))
+        chat = await h.app.storage.get_chat(GROUP_ID)
+        assert chat and not chat.settings.get("everyone")
+    assert not h.tg.public_group_output()
+
+
+async def test_approving_old_message_does_not_restore_departed_membership(h: Harness) -> None:
+    h.tg.members[GROUP_ID].remove(OUTSIDER)
+    h.app.membership.set(GROUP_ID, OUTSIDER, False)
+    await h.send(_cmd("/approve", OWNER, reply_to=group_message("old message", sender=OUTSIDER)))
+    assert await h.app.resolver.is_approved(OUTSIDER)
+    recipients = await h.app.resolver.resolve(GROUP_ID, SPANISH_SPEAKER)
+    assert OUTSIDER not in {r.user_id for r in recipients}
+    assert not h.tg.public_group_output()
+
+
+async def test_admin_menus_are_per_person_and_approveall_only_for_creator(
+        h: Harness, monkeypatch: pytest.MonkeyPatch) -> None:
+    from types import SimpleNamespace
+
+    from translator_bot.handlers import register_owner_group_commands
+
+    async def admins(chat_id: int) -> Any:
+        return [SimpleNamespace(status=role, user=SimpleNamespace(id=uid, is_bot=False))
+                for uid, role in ((OWNER, "creator"), (HINDI, "administrator"))]
+
+    monkeypatch.setattr(h.app.bot, "get_chat_administrators", admins)
+    h.tg.calls.clear()
+    await register_owner_group_commands(h.app, GROUP_ID)
+    menus = [c.params for c in h.tg.calls if c.method == "SetMyCommands"]
+    assert len(menus) == 2
+    for menu in menus:
+        assert menu["scope"]["type"] == "chat_member"
+        commands = {c["command"] for c in menu["commands"]}
+        assert ("approveall" in commands) is (menu["scope"]["user_id"] == OWNER)
+        assert all(c["is_ephemeral"] for c in menu["commands"])
+    assert not h.tg.public_group_output()

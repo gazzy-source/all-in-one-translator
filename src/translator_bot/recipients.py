@@ -101,10 +101,17 @@ class RecipientResolver:
     async def has_group_access(self, user_id: int) -> bool:
         """Reader somewhere: globally approved, or approved by the admins of at least one group (for the
         group-related private commands only: /groups, /pause, help display)."""
-        return await self.is_approved(user_id) or await self.storage.is_chat_approved(user_id)
+        if await self.is_approved(user_id) or await self.storage.is_chat_approved(user_id):
+            return True
+        for chat in await self.storage.active_chats():
+            if chat.enabled and chat.settings.get("everyone"):
+                seen = any(u.user_id == user_id for u in await self.storage.participants(chat.chat_id))
+                if seen and await self.membership.is_member(chat.chat_id, user_id):
+                    return True
+        return False
 
     async def everyone_mode(self, chat_id: int) -> bool:
-        """The group's admins approved everyone here (/approveall)."""
+        """The group's owner approved everyone here (/approveall)."""
         chat = await self.storage.get_chat(chat_id)
         return bool(chat and chat.settings.get("everyone"))
 

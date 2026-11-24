@@ -12,7 +12,7 @@ code/configuration wins and the docs should be corrected as part of the work.
   `PublicOutputGuard` (`src/translator_bot/guard.py`) must keep rejecting every group-visible method. Never add a
   group-scope command menu, reactions, pins, edits or deletes of members' messages.
 - **Recipients are (bot owners ∪ users approved by a bot owner ∪ users approved by this group's owner/admins
-  ∪, when the group's admins chose `/approveall`, the people seen in that group) ∩ current members**, re-checked
+  ∪, when the group's owner chose `/approveall`, the people seen in that group) ∩ current members**, re-checked
   per message, fail-closed. Group-admin approval is valid only in that group.
 - **Message text is never written to disk or logged.** Only IDs/hashes, and OCR text of shared stickers/GIFs.
 - **Provider output is untrusted.** Plain-text sources are HTML-escaped; HTML sources keep only links present in

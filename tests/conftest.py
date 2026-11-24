@@ -72,6 +72,8 @@ class FakeTelegram:
         if name == "GetMe":
             return {"id": BOT_ID, "is_bot": True, "first_name": "Babel", "username": "babel_test_bot",
                     "can_join_groups": True, "can_read_all_group_messages": False, "supports_inline_queries": True}
+        if name == "GetChatAdministrators":
+            return []
         if name == "GetChatMember":
             chat_id, uid = params["chat_id"], params["user_id"]
             user = {"id": uid, "is_bot": uid == BOT_ID, "first_name": f"u{uid}"}

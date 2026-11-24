@@ -147,6 +147,37 @@ snapshot retained under `/home/ubuntu/translator-deployments/20261123-170456-62c
 CI for `62cac9a` passed on Python 3.12 and 3.13, including Docker/native-media smoke and vulnerability checks:
 https://github.com/gazzy-source/all-in-one-translator/actions/runs/45223611798.
 
+### Personal controls and navigable help — 2026-11-24 (local)
+
+Welcome/help now expose reading language, personal pause/resume and per-group mute controls, with separate
+reading, writing, setup and troubleshooting guides and return navigation. Explicit pause/resume callbacks
+are idempotent; choosing a language preserves pause. Group-local approval and current approve-all participants
+can access personal controls under restricted private access without receiving global/private translation
+privileges. Typed language selection also works for those readers; other text still obeys private access.
+No model, routing, schema, provider, or public-output changes. Slash-command auto-translation remains skipped.
+Full regression suite: **486 passed, 8 skipped** (196.35 s). After final navigation/typed-language edits,
+focused tests: **64 passed** (`test_e2e_group.py`, `test_reading_preferences.py`); ruff, strict mypy,
+bandit and diff whitespace checks passed. Telegram/provider calls were mocked; no deployment or live client
+verification was performed for this change.
+
+### Owner-only approve-all and bot review — 2026-11-24 (local)
+
+`/approveall` now requires a fresh Telegram `creator` check, with no bot-owner override. Group admins
+retain individual approval and `/revokeall`. Help, setup guidance and command menus reflect this policy.
+Review found two additional defects: approving a historical message could overwrite a departed member's
+cached status with true, and group-wide command registration bypassed the output guard. Approval now
+invalidates membership; command registration is per person and ephemeral only, with broad scopes removed
+at registration and rejected by the guard. No message content is stored, no provider/model/routing change.
+
+Read-only production inspection: image `1.4.0-62cac9a`, healthy, zero restarts, all four text workers and one
+media worker alive, empty queues, both circuits closed, zero blocked public-output attempts. Last-24-hour
+logs contained six membership-check warnings, six provider warnings (transient/blocked/timeout), one vision
+fallback, and one video-frame extraction timeout. These warnings do not establish which individual
+messages were ultimately missed. No ERROR/CRITICAL records were returned in that window.
+Validation: full suite **494 passed, 8 skipped** (263.50 s); after the final command-menu hardening,
+**79 focused integration/guard tests passed**. Ruff, strict mypy, bandit and diff whitespace checks passed.
+Changes remain local; no deployment or real-user message was sent during this review.
+
 ## Measured so far (offline)
 
 * Language gate, 103-case corpus authored for this project (not held-out): false-translate 0%, missed 0%,

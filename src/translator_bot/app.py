@@ -253,6 +253,14 @@ class App:
                 await self.bot.send_message(oid, text)  # private chat only (positive id)
 
     # -- membership & setup ----------------------------------------------------------------------
+    async def is_chat_owner(self, chat_id: int, user_id: int) -> bool:
+        """Fresh Telegram ownership check; bot ownership never grants group ownership."""
+        try:
+            member = await self.bot.get_chat_member(chat_id, user_id)
+        except TelegramAPIError:
+            return False
+        return member.status == "creator"
+
     async def is_chat_admin(self, chat_id: int, user_id: int) -> bool:
         """The group's owner or an administrator (live getChatMember, cached 60 s; any error -> False)."""
         key = (chat_id, user_id)
