@@ -11,7 +11,9 @@ import logging
 import re
 import time
 from collections import Counter
+from collections.abc import Awaitable, Callable
 from typing import Any
+from weakref import WeakValueDictionary
 
 from aiogram import Bot, F, Router
 from aiogram.exceptions import TelegramAPIError, TelegramBadRequest, TelegramRetryAfter
@@ -37,6 +39,7 @@ from aiogram.types import (
     Message,
     PreCheckoutQuery,
     ReplyParameters,
+    TelegramObject,
 )
 
 from translator_bot import billing, ui
@@ -45,7 +48,7 @@ from translator_bot.delivery import message_link
 from translator_bot.detect import Verdict
 from translator_bot.eligibility import Eligible, Skip, classify
 from translator_bot.languages import LANGUAGES, lang_name, resolve_language, suggest_languages
-from translator_bot.pipeline import PrivateResult, _media_file, html_escape_truncate
+from translator_bot.pipeline import PrivateResult, _media_file, html_escape_truncate, topic_of
 from translator_bot.providers.base import TranslationJob
 from translator_bot.textutil import ContentKind, html_to_plain, normalize_for_key, profile_text, truncate, utf16_prefix
 
@@ -173,6 +176,21 @@ async def ephemeral_reply(bot: Bot, msg: Message, text: str) -> None:
 
 def _group_router(app: App) -> Router:
     r = Router(name="group")
+    intake: WeakValueDictionary[tuple[int, int | None], asyncio.Lock] = WeakValueDictionary()
+
+    async def ordered(handler: Callable[[TelegramObject, dict[str, Any]], Awaitable[Any]],
+                      event: TelegramObject, data: dict[str, Any]) -> Any:
+        # aiogram filters can yield before the pipeline sees a message. Order admission before those
+        # filters and SQLite, then release as soon as translation has been queued.
+        if isinstance(event, Message) and event.chat.type in ("group", "supergroup"):
+            text = event.text or ""
+            if not text.startswith("/") or re.match(r"/play(?:@|\s|$)", text, re.IGNORECASE):
+                async with intake.setdefault((event.chat.id, topic_of(event)), asyncio.Lock()):
+                    return await handler(event, data)
+        return await handler(event, data)
+
+    r.message.outer_middleware(ordered)
+    r.edited_message.outer_middleware(ordered)
 
     @r.my_chat_member(GROUP)
     async def bot_membership(ev: ChatMemberUpdated) -> None:

@@ -198,6 +198,21 @@ worker alive, queues empty. A direct Gemini probe returned HTTP 503. Synthetic p
 endpoint translated a meeting-time question Burmese → English in 16.6 s and English → Burmese in 8.0 s.
 These probes exercised the provider without sending messages to Telegram users.
 
+## November 25 — concurrent group messages and pending edits
+
+Two dispatcher regressions reproduced on the prior release: a delayed SQLite claim reversed a
+two-line burst, and reverting an edit before the burst flushed left its intermediate text in the translation.
+A 40-message, four-topic simulation also reproduced reordering in asynchronous router filters before the
+pipeline. Group messages and edits now enter those filters in arrival order within each topic. Provider
+and delivery jobs still run concurrently. Pending edits update the stored content hash before returning.
+The regression scenarios use simulated Telegram accounts and providers, including a one-off translation
+of an older reply when Telegram omits its nested parent.
+
+The read-only production audit found 2,238 recorded successful ephemeral deliveries and 24 source rows
+marked processing over the preceding 24 hours, with empty queues at inspection. A confirmed path now
+records no_recipients when a text or media job has no eligible readers. Historical rows do not establish
+the cause of each individual case.
+
 ## Known gaps / next steps
 
 * Videos and voice messages longer than `MAX_MEDIA_SECONDS` (default 1 min) are skipped.

@@ -62,7 +62,7 @@ class Harness:
         await asyncio.sleep(0.01)
         while time.monotonic() < deadline:
             if p.text_lane.size == 0 and p.text_lane.inflight == 0 and p.media_lane.size == 0 \
-                    and p.media_lane.inflight == 0 and not p.bursts._pending:
+                    and p.media_lane.inflight == 0 and not p.bursts._pending and not p.bursts._flushing:
                 return
             await asyncio.sleep(0.01)
         raise AssertionError("pipeline did not become idle")
@@ -440,6 +440,8 @@ async def test_context_is_what_was_said_before_the_message(tmp_path: Path, detec
         # The pending burst still needs its original context after the live buffer turns over.
         for i in range(12):
             app.context.add(GROUP_ID, None, OUTSIDER, f"Later unrelated line {i}")
+        assert app.pipeline
+        await app.pipeline.bursts.flush_all()
         await hh.idle()
         [(job, _q)] = [j for j in gemini.jobs if "ni modo" in j[0].text]
         assert [c.text for c in job.context] == ["Are you coming tonight?"]
@@ -941,3 +943,96 @@ async def test_recent_exact_reply_skips_queue_and_rejects_changed_text(h: Harnes
     assert fresh[0].params["reply_parameters"]["message_id"] == mid
     await h.send(dm(OWNER, "/forgetme"))
     assert not cache.rows(OWNER, "en")
+
+
+async def test_slow_claim_preserves_consecutive_message_order(h: Harness, monkeypatch: pytest.MonkeyPatch) -> None:
+    pipeline = h.app.pipeline
+    assert pipeline
+    pipeline.bursts.window = 10
+    entered, release = asyncio.Event(), asyncio.Event()
+    claim = h.app.storage.claim_message
+
+    async def delayed(chat: int, mid: int, *args: Any) -> bool:
+        if mid == 1800:
+            entered.set()
+            await release.wait()
+        return await claim(chat, mid, *args)
+
+    monkeypatch.setattr(h.app.storage, "claim_message", delayed)
+    first = asyncio.create_task(h.send(group_message("Que locura jajaja 😂", message_id=1800)))
+    await asyncio.wait_for(entered.wait(), 2)
+    second = asyncio.create_task(h.send(group_message("¿Alguien sabe si mañana estará abierto? 😂", message_id=1801)))
+    try:
+        await asyncio.wait({second}, timeout=0.15)
+    finally:
+        release.set()
+        await asyncio.gather(first, second)
+    await pipeline.bursts.flush_all()
+    await h.idle()
+    sent = h.tg.ephemeral_to(OWNER)
+    assert len(sent) == 1 and sent[0].params["reply_parameters"]["message_id"] == 1801
+
+
+async def test_reverting_pending_edit_translates_final_text(h: Harness) -> None:
+    pipeline = h.app.pipeline
+    assert pipeline
+    pipeline.bursts.window = 10
+    msg = group_message("Que locura jajaja 😂")
+    await h.send(msg)
+    await h.send({**msg, "text": "¿Alguien sabe si mañana estará abierto? 😂"}, edited=True)
+    await h.send(msg, edited=True)
+    await pipeline.bursts.flush_all()
+    await h.idle()
+    assert "crazy hahaha" in h.tg.ephemeral_to(OWNER)[0].params["text"]
+
+
+async def test_one_off_recovers_quoted_parent_when_telegram_omits_nested_reply(h: Harness) -> None:
+    parent = group_message("Que locura jajaja 😂", sender=SPANISH_SPEAKER)
+    reply = group_message("¿Alguien sabe si mañana estará abierto? 😂", reply_to=parent)
+    await h.send(reply)
+    await h.idle()
+    h.app.deliverer.recent.forget(OWNER)  # force the on-demand path
+    shallow = dict(reply)
+    shallow.pop("reply_to_message")
+    await h.send(group_message("/tr", sender=OWNER, reply_to=shallow))
+    await h.idle()
+    body = h.tg.ephemeral_edits_to(OWNER)[-1].params["text"]
+    assert "crazy hahaha" in body.split("</blockquote>")[0]
+    assert "Does anyone know" in body.split("</blockquote>")[1]
+    assert not h.tg.public_group_output()
+
+
+async def test_simultaneous_bursts_keep_topic_order_and_all_message_ids(h: Harness) -> None:
+    pipeline = h.app.pipeline
+    assert pipeline
+    pipeline.bursts.window = 10
+    messages = [group_message(f"Que locura jajaja 😂 {i}", message_id=2000 + i, sender=SPANISH_SPEAKER,
+                              extra={"is_topic_message": True, "message_thread_id": 100 + i % 4})
+                for i in range(40)]
+    await asyncio.gather(*(h.send(msg) for msg in messages))
+    await pipeline.bursts.flush_all()
+    await h.idle(timeout=15)
+    for index in range(40):
+        mid = 2000 + index
+        rec = pipeline._units[GROUP_ID, mid]
+        first = 2000 + index % 4 + 20 * (index // 20)
+        assert rec.meta.thread_id == 100 + index % 4
+        assert [item.message_id for item in rec.items] == list(range(first, first + 20, 4))
+        deliveries = await h.app.storage.deliveries_for(GROUP_ID, mid)
+        assert any(row["recipient_id"] == OWNER and row["status"] == "sent" for row in deliveries)
+    assert not h.tg.public_group_output()
+
+
+async def test_jobs_without_readers_leave_processing_state(h: Harness) -> None:
+    for reader in (OWNER, HINDI):
+        await h.app.storage.upsert_user(reader, paused=True)
+    text = group_message("Que locura jajaja 😂")
+    caption = group_message(caption="Que locura jajaja 😂", extra={"photo": [
+        {"file_id": "p", "file_unique_id": "p1", "width": 10, "height": 10}]})
+    for msg in (text, caption):
+        await h.send(msg)
+    await h.idle()
+    for msg in (text, caption):
+        row = await h.app.storage.get_message(GROUP_ID, msg["message_id"])
+        assert row and row["status"] == "no_recipients"
+    assert not h.tg.ephemeral_to(OWNER) and not h.tg.ephemeral_to(HINDI)

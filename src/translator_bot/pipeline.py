@@ -233,14 +233,14 @@ class Pipeline:
         if row is not None and row["content_hash"] == new_hash:
             self.metrics.inc("edit.unchanged")  # e.g. link preview loaded / reactions: nothing to redo
             return
-        if self.bursts.update_pending((msg.chat.id, thread, sid or 0), msg.message_id, res.text_html, res.plain):
-            self.metrics.inc("edit.in_pending_burst")
-            return
         if row is None:
             if not await self.storage.claim_message(msg.chat.id, msg.message_id, thread, sid, new_hash):
                 return
         else:
             await self.storage.update_message(msg.chat.id, msg.message_id, content_hash=new_hash)
+        if self.bursts.update_pending((msg.chat.id, thread, sid or 0), msg.message_id, res.text_html, res.plain):
+            self.metrics.inc("edit.in_pending_burst")
+            return
         if res.has_media:
             # caption edit (or replaced file) on media: re-render caption *and* media text together - a caption-only
             # re-translation used to overwrite the combined ephemeral and drop the image/GIF text
@@ -591,6 +591,8 @@ class Pipeline:
         self._remember(meta, items)
         if not by_lang:
             self.metrics.inc("skip.no_recipients")
+            for item in items:
+                await self.storage.update_message(meta.chat_id, item.message_id, status="no_recipients")
             return
         text_html = "\n".join(i.text_html for i in items)
         plain = "\n".join(i.plain for i in items)
@@ -645,6 +647,7 @@ class Pipeline:
         by_lang = await self._recipients_by_lang(meta)
         if not by_lang:
             self.metrics.inc("skip.no_recipients")
+            await self.storage.update_message(meta.chat_id, msg.message_id, status="no_recipients")
             return
         file_id, unique_id, size, duration = _media_file(msg)
         mkind = MEDIA_KIND.get(el.kind)
