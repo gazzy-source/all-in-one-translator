@@ -50,6 +50,17 @@ def check_method(method: TelegramMethod[Any]) -> None:
     name = type(method).__name__
     if name in READ_ONLY or name in EPHEMERAL_EDITS:
         return
+    if name == "SetMyCommands":
+        scope = getattr(method, "scope", None)
+        kind = getattr(scope, "type", "default")
+        if kind == "all_private_chats":
+            return
+        if kind == "chat" and not _targets_group(getattr(scope, "chat_id", None)):
+            return
+        if (kind == "chat_member" and getattr(scope, "user_id", 0) > 0
+                and all(getattr(c, "is_ephemeral", False) for c in getattr(method, "commands", []))):
+            return
+        raise PublicOutputBlocked("SetMyCommands would expose a group command menu")
     targets = [getattr(method, f, None) for f in CHAT_FIELDS]
     if not any(_targets_group(t) for t in targets):
         return  # private chats (positive ids), inline answers, callback answers, setMyCommands, ...

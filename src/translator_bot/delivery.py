@@ -11,10 +11,11 @@ import html
 import logging
 import random
 import time
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from collections.abc import Awaitable, Callable, Coroutine, Iterable
 from dataclasses import dataclass, field, replace
 from typing import Any, Protocol
+from weakref import WeakValueDictionary
 
 from aiogram import Bot
 from aiogram.exceptions import (
@@ -26,10 +27,11 @@ from aiogram.exceptions import (
 from aiogram.types import EphemeralMessageParameters, LinkPreviewOptions, ReplyParameters
 
 from translator_bot.metrics import Metrics
+from translator_bot.recent import Recent
 from translator_bot.recipients import Recipient
 from translator_bot.resilience import KeyedLimiter, SlidingWindowLimiter
 from translator_bot.storage import Storage
-from translator_bot.textutil import html_to_plain, sanitize_html, truncate
+from translator_bot.textutil import html_to_plain, sanitize_html, truncate, utf16_prefix
 
 log = logging.getLogger(__name__)
 
@@ -147,9 +149,29 @@ class Delivery:
     target_lang: str
     translation_html: str
     kind: str = "text"  # text | caption | sticker | gif | image | album
-    original_plain: str | None = None  # only used when the chat enables show_original
+    original_plain: str | None = None  # shown when the chat or reader enables show_original
     edited: bool = False
     show_sender: bool = False
+    sender_id: int | None = None
+    append_after: int | None = None  # exact preceding original in this sender's run
+    parent_excerpt: str | None = None
+
+
+@dataclass(slots=True)
+class _Bubble:
+    """The last translation a reader got in a chat/topic: consecutive messages of the same sender are appended
+    to it (edited in place) instead of piling up new bubbles."""
+    sender_id: int | None
+    ephemeral_id: int
+    text: str
+    ts: float
+    last_message_id: int
+    target_lang: str
+    show_original: bool
+    show_sender: bool
+
+
+BUBBLE_WINDOW_S = 20.0
 
 
 def format_delivery(d: Delivery, *, notice: str | None = None) -> str:
@@ -158,15 +180,22 @@ def format_delivery(d: Delivery, *, notice: str | None = None) -> str:
     who = f"<b>{html.escape(d.sender_name or 'Someone')}:</b> " if d.show_sender else ""
     head = who + ("✏️ " if d.edited else "")
     parts = []
+    if d.parent_excerpt:
+        parts.append("<blockquote>" + html.escape(truncate(d.parent_excerpt, 240)) + "</blockquote>")
     if d.original_plain:
         parts.append(f"<blockquote>{html.escape(truncate(d.original_plain, 300))}</blockquote>")
     parts.append(head + sanitize_html(d.translation_html))
     if notice:
         parts.append(f"<i>{html.escape(notice)}</i>")
     text = "\n".join(parts)
-    if len(text) > MAX_TEXT:  # keep valid HTML: truncate the plain body instead of slicing tags
-        body = truncate(html_to_plain(d.translation_html), MAX_TEXT - len(head) - 200)
-        text = "\n".join([head + html.escape(body)] + ([f"<i>{html.escape(notice)}</i>"] if notice else []))
+    if len(html_to_plain(text).encode("utf-16-le")) // 2 > MAX_TEXT - 100:
+        body_index = -2 if notice else -1
+        parts[body_index] = head
+        reserved = len(html_to_plain("\n".join(parts)).encode("utf-16-le")) // 2
+        budget = max(0, MAX_TEXT - 101 - reserved)
+        body = utf16_prefix(html_to_plain(d.translation_html), budget)
+        parts[body_index] = head + html.escape(body) + "\u2026"
+        text = "\n".join(parts)
     return text
 
 
@@ -185,7 +214,7 @@ def message_link(chat_id: int, message_id: int, thread_id: int | None) -> str | 
     return f"https://t.me/c/{internal}/{thread_id}/{message_id}" if thread_id else f"https://t.me/c/{internal}/{message_id}"
 
 
-DEFAULT_NOTICE = "Only you see this. To change the language, message me and send /language."
+DEFAULT_NOTICE = "Change your reading language in private with /language."
 
 
 # --- deliverer -----------------------------------------------------------------------------------
@@ -237,32 +266,100 @@ class Deliverer:
                  member_check: Callable[[int, int], Awaitable[bool]] | None = None) -> None:
         self.transport = transport
         self.storage = storage
+        self.recent = Recent()
         self.metrics = metrics
         self.member_check = member_check
         self.digest = FailureDigest()
+        self._bubbles: OrderedDict[tuple[int, int | None, int], _Bubble] = OrderedDict()
+        self._locks: WeakValueDictionary[tuple[int, int | None, int], asyncio.Lock] = WeakValueDictionary()
+
+    def _lock(self, d: Delivery, r: Recipient) -> asyncio.Lock:
+        key = (d.chat_id, d.thread_id, r.user_id)
+        lock = self._locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._locks[key] = lock
+        return lock
 
     async def deliver(self, d: Delivery, recipients: list[Recipient], *, show_original: bool = False) -> None:
         """Deliver to every recipient concurrently; one recipient's failure never affects another."""
         await _finish(self._deliver_one(d, r, show_original) for r in recipients)
 
+    async def _append_to_bubble(self, d: Delivery, r: Recipient, view: Delivery) -> bool:
+        """Same sender continues: extend the reader's previous translation in place (no new bubble)."""
+        key = (d.chat_id, d.thread_id, r.user_id)
+        b = self._bubbles.get(key)
+        if (d.append_after is None or d.sender_id is None or d.kind != "text" or d.edited or b is None
+                or b.sender_id != d.sender_id or b.last_message_id != d.append_after
+                or min(d.message_ids) <= b.last_message_id or b.target_lang != d.target_lang
+                or b.show_original != bool(view.original_plain) or b.show_sender != view.show_sender
+                or time.monotonic() - b.ts > BUBBLE_WINDOW_S):
+            return False
+        text = b.text + "\n" + format_delivery(view)
+        if len(html_to_plain(text).encode("utf-16-le")) // 2 > MAX_TEXT - 100:
+            return False
+        try:
+            await self.transport.edit_ephemeral(d.chat_id, r.user_id, b.ephemeral_id, text)
+        except DeliveryError as err:
+            self._bubbles.pop(key, None)
+            if err.reason == "ephemeral_not_allowed" or err.reason.startswith("bad_request:"):
+                return False  # expired/unknown: send a fresh bubble instead
+            raise  # membership failures must never trigger another send or a DM fallback
+        b.text, b.ts = text, time.monotonic()
+        b.last_message_id = max(d.message_ids)
+        if key in self._bubbles:  # other readers may evict this entry while the network call awaits
+            self._bubbles.move_to_end(key)
+        for mid in d.message_ids:
+            await self.storage.record_delivery(d.chat_id, mid, r.user_id, channel="ephemeral", status="sent",
+                                               lang=d.target_lang, ephemeral_id=b.ephemeral_id)
+        self.metrics.inc("delivered.appended")
+        return True
+
+    def _remember_bubble(self, d: Delivery, r: Recipient, eph_id: int, text: str) -> None:
+        key = (d.chat_id, d.thread_id, r.user_id)
+        if d.kind == "text" and not d.edited and eph_id:
+            self._bubbles[key] = _Bubble(d.sender_id, eph_id, text, time.monotonic(), max(d.message_ids),
+                                         d.target_lang, bool(d.original_plain), d.show_sender)
+            self._bubbles.move_to_end(key)
+        else:
+            self._bubbles.pop(key, None)  # media/edit in between: the next text starts a new bubble
+        while self._bubbles and (len(self._bubbles) > 2000
+                                or time.monotonic() - next(iter(self._bubbles.values())).ts > BUBBLE_WINDOW_S):
+            self._bubbles.popitem(last=False)
+
+    def _remember_delivery(self, d: Delivery, r: Recipient) -> None:
+        self.recent.put(r.user_id, d.chat_id, d.thread_id, d.message_ids[-1], d.target_lang,
+                        d.chat_title or "Group", format_delivery(replace(d, original_plain=None, show_sender=True)),
+                        d.original_plain if d.kind == "text" and len(d.message_ids) == 1 else None)
+
     async def _deliver_one(self, d: Delivery, r: Recipient, show_original: bool) -> None:
+        async with self._lock(d, r):
+            await self._deliver_one_locked(d, r, show_original)
+
+    async def _deliver_one_locked(self, d: Delivery, r: Recipient, show_original: bool) -> None:
         anchor = d.message_ids[-1]
         notice = DEFAULT_NOTICE if r.notice_pending else None
-        view = d if show_original else replace(d, original_plain=None)
+        view = d if (show_original or r.show_original) else replace(d, original_plain=None)
         text = format_delivery(view, notice=notice)
         t0 = time.perf_counter()
         try:
+            if notice is None and await self._append_to_bubble(d, r, view):
+                self._remember_delivery(d, r)
+                return
             eph_id = await self._send_with_retries(d.chat_id, r.user_id, text, anchor, d.thread_id, view, notice)
         except DeliveryError as err:
+            self._bubbles.pop((d.chat_id, d.thread_id, r.user_id), None)
             self.metrics.inc(f"delivery_fail.ephemeral.{err.reason.split(':')[0]}")
             self.digest.add(d.chat_id, d.chat_title, f"ephemeral {err.reason.split(':')[0]}")
             for mid in d.message_ids:
                 await self.storage.record_delivery(d.chat_id, mid, r.user_id, channel="ephemeral", status="failed",
                                                    lang=d.target_lang, error=err.reason[:80])
-            await self._fallback(d, r, err)
+            await self._fallback(view, r, err)
             return
+        self._remember_delivery(d, r)
         self.metrics.inc("delivered.ephemeral")
         self.metrics.observe("delivery_ms", (time.perf_counter() - t0) * 1000)
+        self._remember_bubble(view, r, eph_id, text)
         for mid in d.message_ids:
             await self.storage.record_delivery(d.chat_id, mid, r.user_id, channel="ephemeral", status="sent",
                                                lang=d.target_lang, ephemeral_id=eph_id)
@@ -318,6 +415,7 @@ class Deliverer:
             if err2.reason == "forbidden":  # user blocked the bot: stop trying DM until they /start again
                 await self.storage.upsert_user(r.user_id, started=False)
             return
+        self._remember_delivery(d, r)
         self.metrics.inc("delivered.dm_fallback")
         for m in d.message_ids:
             await self.storage.record_delivery(d.chat_id, m, r.user_id, channel="dm", status="sent",
@@ -337,11 +435,17 @@ class Deliverer:
         await _finish(tasks)
 
     async def _edit_one(self, d: Delivery, r: Recipient, eph_id: int, show_original: bool) -> None:
-        view = d if show_original else replace(d, original_plain=None)
+        async with self._lock(d, r):
+            self._bubbles.pop((d.chat_id, d.thread_id, r.user_id), None)
+            await self._edit_one_locked(d, r, eph_id, show_original)
+
+    async def _edit_one_locked(self, d: Delivery, r: Recipient, eph_id: int, show_original: bool) -> None:
+        view = d if (show_original or r.show_original) else replace(d, original_plain=None)
         text = format_delivery(view)
         for attempt in range(3):
             try:
                 await self.transport.edit_ephemeral(d.chat_id, r.user_id, eph_id, text)
+                self._remember_delivery(d, r)
                 self.metrics.inc("delivery_edit.ok")
                 return
             except DeliveryError as err:
@@ -357,7 +461,7 @@ class Deliverer:
                 self.metrics.inc(f"delivery_edit.fail.{err.reason.split(':')[0]}")
                 if err.permanent and err.reason not in ("not_member", "forbidden", "parse_error"):
                     # the ephemeral is gone (expired / not found): deliver a fresh one marked edited
-                    await self._deliver_one(d, r, show_original)
+                    await self._deliver_one_locked(d, r, show_original)
                 # transient failures (rate limits, network) keep the old translation rather than duplicating it
                 return
 

@@ -212,7 +212,7 @@ def extract_video_frames(data: bytes, *, ffmpeg: str, suffix: str, max_seconds: 
         if suffix == ".webm":
             cmd += ["-c:v", "libvpx-vp9"]  # decoder with alpha support for video stickers
         cmd += ["-i", str(src), "-an", "-sn",
-                "-vf", f"fps={fps},scale='min({width},iw)':-2:flags=lanczos,format=rgba",
+                "-vf", f"fps={fps}:eof_action=pass,scale='min({width},iw)':-2:flags=lanczos,format=rgba",
                 "-frames:v", str(max_frames), out_pattern]
         try:
             proc = subprocess.run(cmd, capture_output=True, timeout=timeout, check=False,  # noqa: S603  # nosec B603
@@ -245,7 +245,7 @@ def _native_webm(data: bytes, ffmpeg: str, max_seconds: float, max_frames: int, 
         src.write_bytes(data)
         cmd = [ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error", "-threads", "1", *_input_args(".webm"),
                "-t", f"{max_seconds:.2f}", "-i", str(src), "-an", "-vf",
-               f"fps={fps},scale='min({width},iw)':-2", "-frames:v", str(max_frames), str(Path(tmp) / "f_%03d.png")]
+               f"fps={fps}:eof_action=pass,scale='min({width},iw)':-2", "-frames:v", str(max_frames), str(Path(tmp) / "f_%03d.png")]
         try:
             subprocess.run(cmd, capture_output=True, timeout=timeout, check=False,  # noqa: S603  # nosec B603
                            env={"PATH": os.environ.get("PATH", "")})
@@ -295,8 +295,10 @@ def select_distinct(frames: list[bytes], *, changed_frac: float = 0.004, pixel_d
     (64x64 thumbnails averaged a thin caption away: a fade-in sticker looked like one blank frame. A global
     dHash misses text changes on a static background.)
     """
-    if not frames:
+    if not frames or limit <= 0:
         return []
+    if limit == 1:
+        return [0]
     keep = [0]
     last = _thumb(frames[0])
     for i in range(1, len(frames)):

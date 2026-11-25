@@ -23,11 +23,11 @@ async def st(tmp_path: Path) -> Storage:
 async def test_migrations_idempotent(tmp_path: Path) -> None:
     s = Storage(tmp_path / "x.sqlite3")
     await s.open()
-    assert await s.migrate() == 3
+    assert await s.migrate() == 5
     await s.close()
     s2 = Storage(tmp_path / "x.sqlite3")
     await s2.open()
-    assert await s2.migrate() == 3
+    assert await s2.migrate() == 5
     await s2.close()
 
 
@@ -191,5 +191,41 @@ async def test_online_backup_while_open(tmp_path: Path) -> None:
         for _ in range(3):
             backup(tmp_path / "live.sqlite3", tmp_path / "backups", keep=2)
         assert len(list((tmp_path / "backups").glob("translator-*.sqlite3"))) <= 2
+    finally:
+        await st.close()
+
+
+async def test_expired_timer_cannot_flush_next_burst() -> None:
+    batches = []
+
+    async def record(key, items, meta):
+        batches.append([item.message_id for item in items])
+
+    b = BurstCoalescer(record, window=60)
+    key = (1, None, 1)
+    await b.add(key, BurstItem(1, "a", "a"), None)
+    b._pending[key][2].cancel()
+    b._spawn_flush(key)
+    await b.add(key, BurstItem(2, "b", "b"), None)
+    await asyncio.sleep(0)
+    assert batches == [[1]]
+    await b.flush_all()
+    assert batches == [[1], [2]]
+
+
+async def test_media_cache_ignores_legacy_entries_and_refreshes_expiry(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    st = Storage(tmp_path / "media.sqlite3")
+    await st.open()
+    try:
+        await st.db.execute("INSERT INTO media_cache VALUES (?,?,?,?,?,?,?)",
+                            ("old", 1, "old", "en", 1.0, "{}", 100))
+        await st.db.commit()
+        monkeypatch.setattr("translator_bot.storage._now", lambda: 110)
+        assert await st.get_media("old", 30) is None
+        await st.put_media("old", has_text=True, text="fresh", source_lang="en", confidence=1.0, translations={})
+        monkeypatch.setattr("translator_bot.storage._now", lambda: 190)
+        await st.put_media("old", has_text=True, text="refreshed", source_lang="en", confidence=1.0, translations={})
+        row = await st.get_media("old", 30)
+        assert row and row["file_unique_id"] == "old" and row["text"] == "refreshed"
     finally:
         await st.close()

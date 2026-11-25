@@ -171,6 +171,7 @@ class ProtectedEntities:
 
 TIME_RE = re.compile(r"(\d{1,2})[:.h](\d{2})")
 CJK_TIME_RE = re.compile(r"(\d{1,2})\s*[時时点點시]\s*(?:(\d{1,2})\s*[分분])?")
+MYANMAR_TIME_RE = re.compile(r"(\d{1,2})\s*နာရီ(?:\s*(\d{1,2})\s*မိနစ်)?")
 _THAI_RE = re.compile(r"\p{Thai}")
 AMPM_RE = re.compile(r"(?i)\b(\d{1,2})\s*(?:a\.?m\.?|p\.?m\.?)")
 
@@ -216,6 +217,9 @@ def missing_entities(source: str, translation: str) -> list[str]:
     out_times |= {(int(h) % 12, "00") for h in AMPM_RE.findall(out_plain)}
     # CJK/Korean clock formats: 8時30分 / 8点30分 / 8시 30분 / 午後5時
     out_times |= {(int(h) % 12, (mm or "00").zfill(2)) for h, mm in CJK_TIME_RE.findall(out_plain)}
+    # Burmese providers render 10:00 as ၁၀ နာရီ; normalize native minute digits too.
+    out_times |= {(int(h) % 12, _digits(mm or "00").zfill(2))
+                  for h, mm in MYANMAR_TIME_RE.findall(out_plain)}
     thai = bool(_THAI_RE.search(source))
     for n in src.numbers:
         d = _digits(n)
@@ -449,4 +453,22 @@ def normalize_for_key(text: str) -> str:
 
 
 def truncate(text: str, limit: int) -> str:
-    return text if len(text) <= limit else text[: max(0, limit - 1)].rstrip() + "…"
+    if len(text) <= limit:
+        return text
+    end = 0
+    for match in re.finditer(r"\X", text):
+        if match.end() >= limit:
+            break
+        end = match.end()
+    return text[:end].rstrip() + "\u2026"
+
+
+def utf16_prefix(text: str, budget: int) -> str:
+    """Take whole graphemes without exceeding a Telegram UTF-16 budget."""
+    end = 0
+    for match in re.finditer(r"\X", text):
+        budget -= len(match.group().encode("utf-16-le")) // 2
+        if budget < 0:
+            break
+        end = match.end()
+    return text[:end]

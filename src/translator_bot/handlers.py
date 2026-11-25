@@ -11,7 +11,9 @@ import logging
 import re
 import time
 from collections import Counter
+from collections.abc import Awaitable, Callable
 from typing import Any
+from weakref import WeakValueDictionary
 
 from aiogram import Bot, F, Router
 from aiogram.exceptions import TelegramAPIError, TelegramBadRequest, TelegramRetryAfter
@@ -20,6 +22,7 @@ from aiogram.types import (
     BotCommand,
     BotCommandScopeAllGroupChats,
     BotCommandScopeAllPrivateChats,
+    BotCommandScopeChatAdministrators,
     BotCommandScopeChatMember,
     CallbackQuery,
     ChatMemberUpdated,
@@ -36,16 +39,18 @@ from aiogram.types import (
     Message,
     PreCheckoutQuery,
     ReplyParameters,
+    TelegramObject,
 )
 
 from translator_bot import billing, ui
 from translator_bot.app import App
+from translator_bot.delivery import message_link
 from translator_bot.detect import Verdict
 from translator_bot.eligibility import Eligible, Skip, classify
-from translator_bot.languages import lang_name, resolve_language, suggest_languages
-from translator_bot.pipeline import PrivateResult, _media_file, html_escape_truncate
+from translator_bot.languages import LANGUAGES, lang_name, resolve_language, suggest_languages
+from translator_bot.pipeline import PrivateResult, _media_file, html_escape_truncate, topic_of
 from translator_bot.providers.base import TranslationJob
-from translator_bot.textutil import ContentKind, html_to_plain, normalize_for_key, profile_text, truncate
+from translator_bot.textutil import ContentKind, html_to_plain, normalize_for_key, profile_text, truncate, utf16_prefix
 
 log = logging.getLogger(__name__)
 _INT_RE = re.compile(r"-?\d{1,20}")  # callback/command ids: "--5" or "x" must not reach int()
@@ -54,7 +59,8 @@ GROUP = F.chat.type.in_({"group", "supergroup"})
 PRIVATE = F.chat.type == "private"
 
 PRIVATE_COMMANDS = [
-    BotCommand(command="start", description="Onboarding and current status"),
+    BotCommand(command="start", description="Open your translator"),
+    BotCommand(command="recent", description="Browse recent group translations"),
     BotCommand(command="language", description="Change your translation language"),
     BotCommand(command="settings", description="Personal preferences"),
     BotCommand(command="groups", description="Groups where you receive translations"),
@@ -84,6 +90,24 @@ MEMBER_GROUP_COMMANDS = [
     BotCommand(command="unmute", description="Resume my translations here", is_ephemeral=True),
 ]
 OWNER_GROUP_COMMANDS.insert(0, MEMBER_GROUP_COMMANDS[0])
+# The group's owner/admins: approve members for this group (hidden), plus the member commands.
+ADMIN_GROUP_COMMANDS = [
+    BotCommand(command="approve", description="Reply to a member: translations for them in this group",
+               is_ephemeral=True),
+    BotCommand(command="revoke", description="Reply to a member: stop their translations here", is_ephemeral=True),
+    BotCommand(command="approveall", description="Group owner: translations for everyone", is_ephemeral=True),
+    BotCommand(command="revokeall", description="Back to approving members one by one", is_ephemeral=True),
+    BotCommand(command="glossary", description="term = rendering (names, in-jokes) | -term", is_ephemeral=True),
+    *MEMBER_GROUP_COMMANDS,
+]
+SETUP_GUIDE = (
+    "👋 <b>Thanks for adding me!</b> Two steps, then everyone reads everyone:\n"
+    "1. Make me an <b>admin</b> (all rights can stay off) — that's how translations show up only for each reader.\n"
+    "2. Reply <code>/approve</code> to a member's message — the group owner can send <code>/approveall</code> for everyone here.\n\n"
+    "Then messages, stickers, GIFs and voice notes are translated into each reader's language, visible only to "
+    "them. Members can reply <code>/tr</code> to any message, or write <code>/tr text</code> to answer in the "
+    "group's languages."
+)
 
 
 def build_routers(app: App) -> list[Router]:
@@ -93,14 +117,46 @@ def build_routers(app: App) -> list[Router]:
 async def register_commands(app: App) -> None:
     await app.bot.set_my_commands(PRIVATE_COMMANDS, scope=BotCommandScopeAllPrivateChats())
     with contextlib.suppress(TelegramAPIError):
-        await app.bot.set_my_commands(MEMBER_GROUP_COMMANDS, scope=BotCommandScopeAllGroupChats())
+        await app.bot.delete_my_commands(scope=BotCommandScopeAllGroupChats())
+    # existing groups: hidden /approve for their owner/admins (new groups get it when the bot is added)
+    for chat in (await app.storage.active_chats())[:200]:
+        await register_owner_group_commands(app, chat.chat_id)
 
 
 async def register_owner_group_commands(app: App, chat_id: int) -> None:
+    configured: set[int] = set()
+    with contextlib.suppress(TelegramAPIError):
+        await app.bot.delete_my_commands(scope=BotCommandScopeChatAdministrators(chat_id=chat_id))
+        for member in await app.bot.get_chat_administrators(chat_id):
+            if member.user.is_bot:
+                continue
+            commands = [c for c in ADMIN_GROUP_COMMANDS if c.command != "approveall" or member.status == "creator"]
+            if member.user.id in app.s.owner_ids:
+                commands = [*commands, *(c for c in OWNER_GROUP_COMMANDS
+                                        if c.command not in {a.command for a in commands})]
+            await app.bot.set_my_commands(commands, scope=BotCommandScopeChatMember(
+                chat_id=chat_id, user_id=member.user.id))
+            configured.add(member.user.id)
     for oid in app.s.owner_ids:
+        if oid in configured:
+            continue
         with contextlib.suppress(TelegramAPIError):
             await app.bot.set_my_commands(OWNER_GROUP_COMMANDS,
                                           scope=BotCommandScopeChatMember(chat_id=chat_id, user_id=oid))
+
+
+async def _guide_adder(app: App, chat_id: int, user_id: int, *, ready: bool) -> None:
+    """Whoever added/promoted the bot gets the setup steps - privately, in the group (DM fallback)."""
+    text = ("✅ <b>I'm ready.</b> Reply <code>/approve</code> to a member's message, or "
+            "ask the group owner to use <code>/approveall</code> for everyone here." if ready else SETUP_GUIDE)
+    try:
+        await app.bot.send_message(chat_id=chat_id, text=text,
+                                   ephemeral_message_parameters=EphemeralMessageParameters(receiver_user_id=user_id))
+        return
+    except TelegramAPIError:
+        pass  # not an admin yet: ephemeral messages need it
+    with contextlib.suppress(TelegramAPIError):
+        await app.bot.send_message(user_id, text)  # works if they've opened the bot before
 
 
 async def ephemeral_reply(bot: Bot, msg: Message, text: str) -> None:
@@ -120,6 +176,21 @@ async def ephemeral_reply(bot: Bot, msg: Message, text: str) -> None:
 
 def _group_router(app: App) -> Router:
     r = Router(name="group")
+    intake: WeakValueDictionary[tuple[int, int | None], asyncio.Lock] = WeakValueDictionary()
+
+    async def ordered(handler: Callable[[TelegramObject, dict[str, Any]], Awaitable[Any]],
+                      event: TelegramObject, data: dict[str, Any]) -> Any:
+        # aiogram filters can yield before the pipeline sees a message. Order admission before those
+        # filters and SQLite, then release as soon as translation has been queued.
+        if isinstance(event, Message) and event.chat.type in ("group", "supergroup"):
+            text = event.text or ""
+            if not text.startswith("/") or re.match(r"/play(?:@|\s|$)", text, re.IGNORECASE):
+                async with intake.setdefault((event.chat.id, topic_of(event)), asyncio.Lock()):
+                    return await handler(event, data)
+        return await handler(event, data)
+
+    r.message.outer_middleware(ordered)
+    r.edited_message.outer_middleware(ordered)
 
     @r.my_chat_member(GROUP)
     async def bot_membership(ev: ChatMemberUpdated) -> None:
@@ -150,6 +221,8 @@ def _group_router(app: App) -> Router:
         state = "enabled" if chat and chat.enabled else "added by a non-owner — DISABLED until you enable it in /chats"
         who = html.escape(ev.from_user.full_name) if ev.from_user else "someone"
         await app.notify_owners(f"{report.render()}\n\nAdded/updated by {who}. Translation: {state}.")
+        if ev.from_user is not None and not ev.from_user.is_bot and chat is not None and chat.enabled:
+            await _guide_adder(app, chat_id, ev.from_user.id, ready=status == "administrator")
 
     @r.chat_member(GROUP)
     async def member_changed(ev: ChatMemberUpdated) -> None:
@@ -157,6 +230,8 @@ def _group_router(app: App) -> Router:
         is_member = st in ("creator", "administrator", "member") or (
             st == "restricted" and bool(getattr(ev.new_chat_member, "is_member", False)))
         app.membership.set(ev.chat.id, ev.new_chat_member.user.id, is_member)
+        if is_member and not ev.new_chat_member.user.is_bot:
+            await app.storage.mark_participant(ev.new_chat_member.user.id, ev.chat.id)  # joiners read from day one
 
     @r.message(GROUP, F.migrate_to_chat_id)
     async def migrated(msg: Message) -> None:
@@ -168,13 +243,37 @@ def _group_router(app: App) -> Router:
         """Hidden owner/recipient commands. Never answered publicly; unauthorized users are ignored."""
         if msg.from_user is None or not msg.text:
             return
-        head, _, arg = msg.text.partition(" ")
+        fields = msg.text.split(maxsplit=1)
+        head, arg = fields[0], fields[1] if len(fields) > 1 else ""
         cmd, _, target = head[1:].partition("@")
+        if cmd.lower() == "play" and arg and app.pipeline:
+            await app.pipeline.on_message(msg)
+            return
         if target and target.lower() != app.bot_username.lower():
             return
         uid = msg.from_user.id
         is_owner = app.resolver.is_owner(uid)
-        if cmd in ("approve", "revoke", "approvefree", "revokefree", "check", "glossary") and not is_owner:
+        group_admin = (cmd in ("approve", "revoke", "revokeall", "glossary") and not is_owner
+                       and await app.is_chat_admin(msg.chat.id, uid))
+        if cmd in ("approveall", "revokeall"):
+            if cmd == "approveall":
+                if msg.sender_chat is not None or not await app.is_chat_owner(msg.chat.id, uid):
+                    return
+            elif not (is_owner or group_admin):
+                return
+            chat = await app.storage.get_chat(msg.chat.id)
+            settings = dict(chat.settings) if chat else {}
+            settings["everyone"] = cmd == "approveall"
+            await app.storage.upsert_chat(msg.chat.id, settings=settings)
+            if app.pipeline:
+                app.pipeline.invalidate_chat(msg.chat.id)
+            app.reply_targets.clear()
+            await ephemeral_reply(bot, msg, "✅ Everyone here now gets translations (people are picked up as they "
+                                            "write, join or use /tr)." if cmd == "approveall"
+                                  else "Back to approving members one by one (/approve as a reply).")
+            return
+        if cmd in ("approve", "revoke", "approvefree", "revokefree", "check", "glossary") and not (is_owner or
+                                                                                                group_admin):
             return
         if cmd in ("approvefree", "revokefree"):
             r_msg = msg.reply_to_message
@@ -200,9 +299,16 @@ def _group_router(app: App) -> Router:
                 return
             member = r_msg.from_user
             await app.storage.upsert_user(member.id, first_name=member.first_name)
-            await app.storage.set_approved(member.id, cmd == "approve", by=uid)
-            app.membership.set(msg.chat.id, member.id, True)
-            verb = "approved ✅ — they now receive private translations" if cmd == "approve" else "revoked ❌"
+            if is_owner:  # bot owner: every group
+                await app.storage.set_approved(member.id, cmd == "approve", by=uid)
+            await app.storage.set_chat_approved(member.id, msg.chat.id, cmd == "approve", by=uid)  # this group
+            app.membership.invalidate(msg.chat.id, member.id)
+            app.reply_targets.clear()
+            if cmd == "approve":
+                verb = ("approved ✅ — they now get translations, only they see them" if is_owner
+                        else "approved ✅ for this group — they now get translations, only they see them")
+            else:
+                verb = "revoked ❌" if is_owner else "revoked ❌ for this group"
             await ephemeral_reply(bot, msg, f"{html.escape(member.full_name)} ({member.id}) {verb}.")
         elif cmd == "check":
             report = await app.verify_setup(msg.chat.id)
@@ -210,14 +316,14 @@ def _group_router(app: App) -> Router:
         elif cmd == "glossary":
             await ephemeral_reply(bot, msg, await _glossary_cmd(app, msg.chat.id, arg))
         elif cmd in ("mute", "unmute"):
-            if not await app.resolver.is_approved(uid):
+            if not await app.resolver.is_approved_in(msg.chat.id, uid):
                 return
             await app.storage.set_muted(uid, msg.chat.id, cmd == "mute")
             await ephemeral_reply(bot, msg, "🔕 Translations muted in this group." if cmd == "mute"
                                   else "🔔 Translations resumed in this group.")
         elif cmd == "tr":
             await _tr_command(app, bot, msg, arg)
-        elif cmd in ("start", "language", "settings", "help") and await app.resolver.is_approved(uid):
+        elif cmd in ("start", "language", "settings", "help") and await app.resolver.is_approved_in(msg.chat.id, uid):
             await ephemeral_reply(bot, msg, f'Settings live in our private chat: <a href="https://t.me/'
                                             f'{app.bot_username}?start=settings">open</a>.')
 
@@ -236,8 +342,9 @@ def _group_router(app: App) -> Router:
 
 async def _reply_targets(app: App, uid: int, chat_id: int | None = None) -> list[str]:
     """Languages to write *into* so the other people understand: the reader languages of the group (or of all
-    the user's groups, for inline mode, which doesn't say which chat it is), most common first, minus the user's
-    own language. An explicit inline target (/settings) comes first. Cached briefly per user/chat."""
+    the user's groups, for inline mode, which doesn't say which chat it is), most common first. The sender's own
+    language is not excluded (live: "/tr kya horha hai" from an English reader skipped the English reader); the
+    languages the text is already in are skipped by the caller. An explicit inline target comes first."""
     key = (uid, chat_id)
     hit = app.reply_targets.get(key)
     if hit is not None and time.monotonic() - hit[0] < 300:
@@ -257,9 +364,9 @@ async def _reply_targets(app: App, uid: int, chat_id: int | None = None) -> list
     out: list[str] = []
     if user is not None and user.inline_lang:
         out.append(user.inline_lang)
-    out += [lg for lg, _n in counts.most_common() if lg.split("-")[0] != own]
-    if not out and own != "en":
-        out.append("en")  # nobody else known yet: English is the safest bridge
+    out += [lg for lg, _n in counts.most_common()]
+    if not out:
+        out.append("en" if own != "en" else own)  # nobody else known yet: English is the safest bridge
     seen: list[str] = []
     for lg in out:
         if lg not in seen:
@@ -294,19 +401,40 @@ async def _translate_text(app: App, text: str, target: str, *, purpose: str = "i
 
 
 async def _send_ephemeral(app: App, msg: Message, text: str, *, reply_to: int | None = None,
-                          markup: InlineKeyboardMarkup | None = None, plain: bool = False) -> None:
-    """Only the command's sender sees this (never the group)."""
+                          markup: InlineKeyboardMarkup | None = None, plain: bool = False) -> int | None:
+    """Only the command's sender sees this (never the group). Returns its ephemeral id (for editing)."""
     if msg.from_user is None:
-        return
+        return None
     reply = (ReplyParameters(message_id=reply_to, allow_sending_without_reply=True) if reply_to
              else ReplyParameters(ephemeral_message_id=msg.ephemeral_message_id) if msg.ephemeral_message_id else None)
-    with contextlib.suppress(TelegramAPIError):
-        await app.bot.send_message(chat_id=msg.chat.id, text=text, reply_parameters=reply, reply_markup=markup,
-                                   parse_mode=None if plain else "HTML",
-                                   message_thread_id=msg.message_thread_id if msg.is_topic_message else None,
-                                   link_preview_options=LinkPreviewOptions(is_disabled=True),
-                                   ephemeral_message_parameters=EphemeralMessageParameters(
-                                       receiver_user_id=msg.from_user.id))
+    try:
+        sent = await app.bot.send_message(chat_id=msg.chat.id, text=text, reply_parameters=reply, reply_markup=markup,
+                                          parse_mode=None if plain else "HTML",
+                                          message_thread_id=msg.message_thread_id if msg.is_topic_message else None,
+                                          link_preview_options=LinkPreviewOptions(is_disabled=True),
+                                          ephemeral_message_parameters=EphemeralMessageParameters(
+                                              receiver_user_id=msg.from_user.id))
+    except TelegramAPIError:
+        return None
+    return sent.ephemeral_message_id or None
+
+
+async def _show(app: App, msg: Message, placeholder: int | None, text: str, *, reply_to: int | None = None,
+                markup: InlineKeyboardMarkup | None = None, plain: bool = False) -> None:
+    """Replace the "⏳ Translating…" placeholder with the result (fresh ephemeral if editing isn't possible)."""
+    if msg.from_user is None or not await _readable(app, msg.chat.id, msg.from_user.id,
+                                                    msg.message_thread_id if msg.is_topic_message else None):
+        return
+    if placeholder:
+        try:
+            await app.bot.edit_ephemeral_message_text(
+                chat_id=msg.chat.id, receiver_user_id=msg.from_user.id, ephemeral_message_id=placeholder, text=text,
+                parse_mode=None if plain else "HTML", reply_markup=markup,
+                link_preview_options=LinkPreviewOptions(is_disabled=True))
+            return
+        except TelegramAPIError:
+            pass
+    await _send_ephemeral(app, msg, text, reply_to=reply_to, markup=markup, plain=plain)
 
 
 async def _tr_command(app: App, bot: Bot, msg: Message, arg: str) -> None:
@@ -318,9 +446,11 @@ async def _tr_command(app: App, bot: Bot, msg: Message, arg: str) -> None:
     if msg.from_user is None or app.pipeline is None:
         return
     uid = msg.from_user.id
-    if not await app.resolver.is_approved(uid):
-        await _send_ephemeral(app, msg, "🔒 /tr is for members approved by the bot owner.")
+    if not await app.resolver.is_approved_in(msg.chat.id, uid):
+        await _send_ephemeral(app, msg, "🔒 Ask a group admin to approve you: they reply /approve to one of your "
+                                        "messages (only they see it).")
         return
+    await app.storage.mark_participant(uid, msg.chat.id)
     # same gates as every group message: chat enabled + active, bot is admin, topic enabled, chat toggles
     chat = await app.pipeline.chat(msg)
     thread = msg.message_thread_id if msg.is_topic_message else None
@@ -328,18 +458,32 @@ async def _tr_command(app: App, bot: Bot, msg: Message, arg: str) -> None:
             msg.chat.id, thread):
         await _send_ephemeral(app, msg, "⏸ Translation is switched off here.")
         return
-    if not app.private_limiter.try_acquire(uid):
+    if not app.tr_limiter.try_acquire(uid):  # generous: approved members shouldn't feel it
         await _send_ephemeral(app, msg, "⏳ That's a lot at once — give me a few seconds.")
         return
     reply = msg.reply_to_message
+    if not arg.strip() and (reply is None or (msg.is_topic_message and reply.message_id == msg.message_thread_id)):
+        await _send_ephemeral(app, msg, "Reply <code>/tr</code> to a message to translate it for you, or write "
+                                        "<code>/tr your text</code> to get it in the group's languages.")
+        return
+    if reply and not arg.strip() and (reply.text or reply.caption):
+        user = await app.storage.get_user(uid)
+        lang = (user.effective_lang if user else None) or app.s.default_target_lang
+        hit = app.deliverer.recent.exact(uid, msg.chat.id, reply.message_id, lang, reply.text or reply.caption or "")
+        if hit and hit.topic == (thread or 0):
+            await _show(app, msg, None, hit.html, reply_to=reply.message_id)
+            return
+    # instant feedback (only you see it); the result replaces it in place
+    placeholder = await _send_ephemeral(app, msg, "⏳ Translating…",
+                                        reply_to=None if arg.strip() or reply is None else reply.message_id)
     lane = app.pipeline.media_lane if (not arg.strip() and reply is not None and _media_file(reply)[0]) \
         else app.pipeline.text_lane
-    if not await lane.submit(msg.chat.id, lambda: _tr_work(app, msg, arg, chat.settings),
+    if not await lane.submit(msg.chat.id, lambda: _tr_work(app, msg, arg, chat.settings, placeholder),
                              key=f"tr:{msg.chat.id}:{msg.message_id}"):
-        await _send_ephemeral(app, msg, "⏳ I'm busy right now — please try again in a moment.")
+        await _show(app, msg, placeholder, "⏳ I'm busy right now — please try again in a moment.")
 
 
-async def _tr_work(app: App, msg: Message, arg: str, settings: dict[str, Any]) -> None:
+async def _tr_work(app: App, msg: Message, arg: str, settings: dict[str, Any], placeholder: int | None) -> None:
     assert msg.from_user is not None and app.pipeline is not None
     uid = msg.from_user.id
     user = await app.storage.get_user(uid)
@@ -347,40 +491,42 @@ async def _tr_work(app: App, msg: Message, arg: str, settings: dict[str, Any]) -
     text = arg.strip()
     if text:
         targets = await _reply_targets(app, uid, msg.chat.id) or ["en"]
-        target = targets[0]
-        out, why = await _translate_text(app, truncate(text, app.s.max_text_chars), target, purpose="group",
-                                         deadline_s=10.0)
-        if out is None:
-            await _send_ephemeral(app, msg, f"✅ That's already {html.escape(lang_name(target))}." if why == "same"
-                                  else "⚠️ Couldn't translate right now — try again in a moment.")
+        src = truncate(text, app.s.max_text_chars)
+        outs = await asyncio.gather(*(_translate_text(app, src, t, deadline_s=8.0) for t in targets))
+        lines: list[str] = []
+        copies: list[InlineKeyboardButton] = []
+        for t, (out, _why) in zip(targets, outs, strict=True):
+            if out:
+                lines.append(f"{ui.flag(t)} {truncate(out, 1200)}")
+                copies.append(InlineKeyboardButton(text=f"📋 {ui.flag(t)}" if len(targets) > 1 else "📋 Copy",
+                                                   copy_text=CopyTextButton(text=truncate(out, 256))))
+        if not lines:
+            names = ", ".join(lang_name(t) for t in targets)
+            await _show(app, msg, placeholder, f"✅ Already readable for everyone here ({names})."
+                        if all(why == "same" for _o, why in outs)
+                        else "⚠️ Couldn't translate right now — try again in a moment.", plain=True)
             return
-        out = truncate(out, 3900)
-        kb = InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="📋 Copy", copy_text=CopyTextButton(text=truncate(out, 256))),
-            InlineKeyboardButton(text="✍️ Send", switch_inline_query_current_chat=truncate(text, 200)),
-        ]])
-        await _send_ephemeral(app, msg, f"{ui.flag(target)} {out}", markup=kb, plain=True)
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            copies, [InlineKeyboardButton(text="✍️ Send", switch_inline_query_current_chat=truncate(text, 200))]])
+        await _show(app, msg, placeholder, "\n".join(lines), markup=kb, plain=True)
         return
     target_msg = msg.reply_to_message
-    if target_msg is None or (msg.is_topic_message and target_msg.message_id == msg.message_thread_id):
-        await _send_ephemeral(app, msg, "Reply <code>/tr</code> to a message to translate it for you, or write "
-                                        "<code>/tr your text</code> to get it in the group's language.")
-        return
+    assert target_msg is not None  # checked before queueing
     el = classify(target_msg, bot_id=app.bot_id, settings=settings, media_enabled=app.s.media_enabled)
     if isinstance(el, Skip):
-        await _send_ephemeral(app, msg, "🤷 Nothing to translate in that message.", reply_to=target_msg.message_id)
+        await _show(app, msg, placeholder, "🤷 Nothing to translate in that message.", reply_to=target_msg.message_id)
         return
     if len(el.plain) > app.s.max_text_chars:
         el = Eligible(el.kind, html_escape_truncate(el.plain, app.s.max_text_chars),
                       truncate(el.plain, app.s.max_text_chars), el.has_media)
     try:
-        res = await app.pipeline.translate_private(target_msg, el, mine)  # the lane bounds the time
+        res = await app.pipeline.recover_group(target_msg, el, mine, settings)  # the lane bounds the time
     except Exception:
         log.warning("/tr failed", exc_info=True)
         res = PrivateResult(None, None, "failed")
     body = res.text or _PRIVATE_REASONS.get(res.reason, _PRIVATE_REASONS["no_text"]).format(
         lang=html.escape(lang_name(mine)), secs=int(app.s.max_media_seconds))
-    await _send_ephemeral(app, msg, body, reply_to=target_msg.message_id)
+    await _show(app, msg, placeholder, body, reply_to=target_msg.message_id)
 
 
 async def _glossary_cmd(app: App, chat_id: int, arg: str) -> str:
@@ -412,24 +558,28 @@ def _private_router(app: App) -> Router:
     r.message.filter(PRIVATE)
     awaiting_lang: dict[int, float] = {}  # user id -> when the language prompt was shown (typed names resolve)
 
-    async def access(msg: Message) -> tuple[bool, bool]:
+    async def access(msg: Message, *, controls: bool = False) -> tuple[bool, bool]:
         """(may use the private chat, is approved for group translations). Replies when access is denied."""
         if msg.from_user is None:
             return False, False
         await app.storage.upsert_user(msg.from_user.id, first_name=msg.from_user.first_name, started=True)
         approved = await app.resolver.is_approved(msg.from_user.id)
+        if controls:
+            approved = approved or await app.resolver.has_group_access(msg.from_user.id)
         if approved or app.s.private_access == "everyone":
             return True, approved
         await msg.answer(ui.ACCESS_DENIED.format(uid=msg.from_user.id))
         return False, False
 
     async def gate(msg: Message) -> bool:
-        """Group-translation features (groups, pause): approved users only."""
-        ok, approved = await access(msg)
-        if ok and not approved:
-            assert msg.from_user is not None
+        """Group-translation features (groups, pause): readers of at least one group."""
+        ok, approved = await access(msg, controls=True)
+        if not ok or msg.from_user is None:
+            return False
+        reader = approved or await app.resolver.has_group_access(msg.from_user.id)
+        if not reader:
             await msg.answer(ui.ACCESS_DENIED.format(uid=msg.from_user.id))
-        return approved
+        return reader
 
     def prompt_language(uid: int) -> None:
         awaiting_lang[uid] = time.monotonic()
@@ -539,23 +689,28 @@ def _private_router(app: App) -> Router:
 
     @r.message(Command("start"))
     async def start(msg: Message) -> None:
-        ok, approved = await access(msg)
+        ok, approved = await access(msg, controls=True)
         if not ok:
             return
         assert msg.from_user is not None
         user = await app.storage.get_user(msg.from_user.id)
         assert user is not None
-        await msg.answer(ui.welcome(user, default_lang=app.s.default_target_lang,
-                                    is_owner=app.resolver.is_owner(user.user_id), bot_username=app.bot_username,
-                                    approved=approved, inline_ok=approved or app.s.inline_access == "everyone",
-                                    max_seconds=int(app.s.max_media_seconds)))
-        if not user.onboarded:
-            prompt_language(user.user_id)
-            await msg.answer(ui.LANGUAGE_PROMPT, reply_markup=ui.language_menu(user.effective_lang or app.s.default_target_lang))
+        if (msg.text or "").split()[1:] == ["settings"]:
+            await msg.answer(ui.settings_text(user, app.s.default_target_lang),
+                             reply_markup=ui.settings_kb(user, app.s.default_target_lang))
+            return
+        text, kb = ui.home(user, app.s.default_target_lang, approved=approved,
+                           private_ok=app.s.private_access == "everyone" or await app.resolver.is_approved(user.user_id))
+        await msg.answer(text, reply_markup=kb)
+
+    @r.message(Command("recent"))
+    async def recent(msg: Message) -> None:
+        if msg.from_user and (await access(msg, controls=True))[0]:
+            await _recent_page(app, msg, msg.from_user.id, "menu:0", edit=False)
 
     @r.message(Command("language"))
     async def language(msg: Message) -> None:
-        ok, _approved = await access(msg)
+        ok, _approved = await access(msg, controls=True)
         if not ok:
             return
         assert msg.from_user is not None
@@ -566,7 +721,7 @@ def _private_router(app: App) -> Router:
 
     @r.message(Command("settings"))
     async def settings(msg: Message) -> None:
-        ok, _approved = await access(msg)
+        ok, _approved = await access(msg, controls=True)
         if not ok:
             return
         assert msg.from_user is not None
@@ -588,29 +743,19 @@ def _private_router(app: App) -> Router:
             return
         assert msg.from_user is not None
         paused = command.command == "pause"
-        await app.storage.upsert_user(msg.from_user.id, paused=paused)
-        await msg.answer("⏸ Your translations are paused. /resume to restart." if paused
-                         else "▶️ Your translations are active again.")
+        user = await app.storage.upsert_user(msg.from_user.id, paused=paused)
+        await msg.answer("⏸ Your automatic group translations are paused. One-off /tr requests still work."
+                         if paused else "▶️ Your automatic group translations are active again.",
+                         reply_markup=ui.help_kb(user.effective_lang or app.s.default_target_lang,
+                                                 paused=paused))
 
     @r.message(Command("help"))
     async def help_(msg: Message) -> None:
-        ok, approved = await access(msg)
+        ok, _approved = await access(msg, controls=True)
         if not ok:
             return
         assert msg.from_user is not None
-        uid = msg.from_user.id
-        user = await app.storage.get_user(uid)
-        lang = (user.effective_lang if user else None) or app.s.default_target_lang
-        groups = await _group_count(app, uid) if approved else None
-        await msg.answer(ui.help_text(uid=uid, lang=lang, bot_username=app.bot_username,
-                                      approved=approved, private_ok=True,
-                                      inline_ok=approved or app.s.inline_access == "everyone",
-                                      max_seconds=int(app.s.max_media_seconds),
-                                      is_owner=app.resolver.is_owner(uid),
-                                      paused=bool(user and user.paused), user=user, groups=groups,
-                                      plan_line=None if app.resolver.is_owner(uid) or not app.plan.enabled
-                                      else billing.status_line(app.plan, user)),
-                         reply_markup=ui.help_kb(lang, approved=approved))
+        await _send_help(app, msg, msg.from_user.id)
 
     @r.message(Command("privacy"))
     async def privacy(msg: Message) -> None:
@@ -620,6 +765,7 @@ def _private_router(app: App) -> Router:
     async def forget(msg: Message) -> None:
         if msg.from_user is None:
             return
+        app.deliverer.recent.forget(msg.from_user.id)
         await app.storage.delete_user_data(msg.from_user.id)
         await msg.answer("🗑 Your preferences and delivery records were deleted.")
 
@@ -682,7 +828,9 @@ def _private_router(app: App) -> Router:
 
     @r.message(F.text)
     async def free_text(msg: Message) -> None:
-        ok, approved = await access(msg)
+        waiting_for_language = bool(msg.from_user and
+                                    time.monotonic() - awaiting_lang.get(msg.from_user.id, -1e9) < 600)
+        ok, approved = await access(msg, controls=waiting_for_language)
         if not ok or not msg.text:
             return
         assert msg.from_user is not None
@@ -705,6 +853,10 @@ def _private_router(app: App) -> Router:
             hits = suggest_languages(text)
             if hits:
                 await msg.answer("Did you mean:", reply_markup=ui.suggestions_kb(hits, current))
+                return
+        if waiting_for_language:
+            ok, approved = await access(msg)
+            if not ok:
                 return
         await _private_translate(app, msg, current, approved)
 
@@ -915,18 +1067,95 @@ async def _send_invoice(app: App, uid: int, product: str) -> str | None:
     return None
 
 
-async def _group_count(app: App, user_id: int) -> int | None:
-    """Enabled groups where this user is a member and hasn't muted the bot (None if it can't be checked)."""
+async def _readable(app: App, chat_id: int, uid: int, topic: int | None) -> bool:
+    chat = await app.storage.get_chat(chat_id)
+    if not (chat and chat.active and chat.enabled and chat.bot_is_admin
+            and await app.storage.topic_enabled(chat_id, topic) and await app.resolver.is_approved_in(chat_id, uid)):
+        return False
     try:
-        chats = [c for c in await app.storage.active_chats() if c.enabled][:50]
-        flags = await asyncio.gather(*(app.membership.is_member(c.chat_id, user_id) for c in chats))
-        n = 0
-        for c, is_member in zip(chats, flags, strict=True):
-            if is_member and user_id not in await app.storage.muted_users(c.chat_id):
-                n += 1
-        return n
-    except Exception:  # help must always render
-        return None
+        return await app._is_member(chat_id, uid)
+    except TelegramAPIError:
+        return False
+
+
+async def _recent_page(app: App, msg: Message, uid: int, request: str, *, edit: bool) -> None:
+    user = await app.storage.get_user(uid)
+    entries = app.deliverer.recent.rows(uid, (user.effective_lang if user else None) or app.s.default_target_lang)
+    rows: list[list[InlineKeyboardButton]] = []
+
+    def button(label: str, action: str) -> InlineKeyboardButton:
+        return InlineKeyboardButton(text=label, callback_data="recent:" + action)
+
+    text = "<b>Recent translations</b>\nDelivered in the past 15 minutes."
+    parts = request.split(":")
+    if len(parts) == 2 and parts[0] == "menu" and _INT_RE.fullmatch(parts[1]):
+        scopes = list(dict.fromkeys((e.chat, e.topic) for e in entries))
+        offset = max(0, min(int(parts[1]), len(scopes) - 1))
+        for chat, topic in scopes[offset:offset + 6]:
+            if await _readable(app, chat, uid, topic or None):
+                title = next(e.title for e in entries if (e.chat, e.topic) == (chat, topic))
+                rows.append([button(title[:40] + (f" · Topic {topic}" if topic else ""), f"p:{chat}:{topic}:0")])
+        if not rows:
+            text += "\nNo translations available here. Reply /tr to a group message to translate it again."
+        nav = []
+        if offset:
+            nav.append(button("Previous groups", f"menu:{max(0, offset - 6)}"))
+        if offset + 6 < len(scopes):
+            nav.append(button("More groups", f"menu:{offset + 6}"))
+        if nav:
+            rows.append(nav)
+    elif len(parts) == 4 and parts[0] == "p" and all(_INT_RE.fullmatch(n) for n in parts[1:]):
+        chat, topic, anchor = map(int, parts[1:])
+        group = sorted((e for e in entries if (e.chat, e.topic) == (chat, topic)), key=lambda e: -e.mid)
+        if group and await _readable(app, chat, uid, topic or None):
+            page = [e for e in group if not anchor or e.mid <= anchor][:5]
+            text = f"<b>{html.escape(group[0].title[:64])}</b>"
+            for e in reversed(page):
+                link = message_link(chat, e.mid, topic or None)
+                line = html.escape(utf16_prefix(truncate(html_to_plain(e.html), 500), 650))
+                text += "\n\n" + line + (f'  <a href="{link}">↗</a>' if link else "")
+            if page:
+                older = [e for e in group if e.mid < page[-1].mid]
+                newer = [e for e in group if e.mid > page[0].mid]
+                nav = []
+                if older:
+                    nav.append(button("‹ Older", f"p:{chat}:{topic}:{older[0].mid}"))
+                if newer:
+                    nav.append(button("Newer ›", f"p:{chat}:{topic}:{newer[max(0, len(newer)-5)].mid}"))
+                if nav:
+                    rows.append(nav)
+            else:
+                text += "\nThis page expired."
+        else:
+            text += "\nThis conversation is unavailable."
+        rows.append([button("‹ Groups", "menu:0")])
+    rows.append([InlineKeyboardButton(text="‹ Home", callback_data="home:open")])
+    method = msg.edit_text if edit else msg.answer
+    try:
+        await method(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+                     link_preview_options=LinkPreviewOptions(is_disabled=True))
+    except TelegramBadRequest as exc:
+        if "message is not modified" not in str(exc).lower():
+            raise
+
+
+async def _send_help(app: App, msg: Message, uid: int, *, edit: bool = False) -> None:
+    approved = await app.resolver.has_group_access(uid)
+    user = await app.storage.get_user(uid)
+    lang = (user.effective_lang if user else None) or app.s.default_target_lang
+    text = "<b>Help</b>\nChoose a guide below."
+    if not approved:
+        text += "\nFor group access, ask a group admin to reply /approve to your message."
+    if app.resolver.is_owner(uid):
+        text += "\n\nAdministration · /status · /recipients · /chats"
+    elif app.plan.enabled:
+        text += "\n\n" + billing.status_line(app.plan, user) + " · /buy"
+    kb = ui.help_kb(lang, approved=approved, paused=bool(user and user.paused))
+    if edit:
+        with contextlib.suppress(TelegramAPIError):
+            await msg.edit_text(text, reply_markup=kb)
+    else:
+        await msg.answer(text, reply_markup=kb)
 
 
 async def _send_groups(app: App, msg: Message, user_id: int, edit: bool = False) -> None:
@@ -954,7 +1183,7 @@ def _status_text(app: App) -> str:
     assert isinstance(c, dict)
     keys = ("updates.message", "cache_hit", "cache_miss", "delivered.ephemeral", "delivered.dm_fallback",
             "fallback", "validation_fail", "skip.already_target", "media.vision", "media.no_text",
-            "private.translated", "private.nothing")
+            "private.translated", "private.nothing", "queue.text.shed", "queue.media.shed")
     lines = ["<b>Status</b>", f"uptime {snap['uptime_s']}s · public output blocked: {app.guard.blocked}"]
     lines += [f"{k}: {c.get(k, 0)}" for k in keys]
     media = {k: v for k, v in c.items() if k.startswith(("media.too_long", "media.no_text.", "media.rejected",
@@ -968,7 +1197,7 @@ def _status_text(app: App) -> str:
         lines += [f"{html.escape(k)}: {v}" for k, v in sorted(fails.items())]
     lat = snap["latency_ms"]
     assert isinstance(lat, dict)
-    for k in ("latency.gemini", "latency.deepl", "delivery_ms", "pipeline_text_ms"):
+    for k in ("queue_wait_ms.text", "queue_wait_ms.media", "latency.gemini", "latency.deepl", "delivery_ms", "pipeline_text_ms"):
         if lat.get(k):
             lines.append(f"{k}: {lat[k]}")
     for k in sorted(k for k in lat if k.startswith(("pipeline_media_ms.", "private_ms."))):
@@ -999,13 +1228,38 @@ def _callback_router(app: App) -> Router:
         uid = cb.from_user.id
         data = cb.data or ""
         msg = cb.message
-        if not await app.resolver.is_approved(uid) and (app.s.private_access != "everyone"
+        personal = data.partition(":")[0] in ("lang", "ilang", "me", "also", "help", "home", "recent")
+        controls_ok = personal and await app.resolver.has_group_access(uid)
+        if not controls_ok and not await app.resolver.is_approved(uid) and (app.s.private_access != "everyone"
                                                          or data.partition(":")[0] not in ("lang", "ilang", "me",
-                                                                                            "pay")):
+                                                                                            "pay", "also", "help", "home", "recent")):
             await cb.answer("This translator is private.", show_alert=True)
             return
         user = await app.storage.get_user(uid) or await app.storage.upsert_user(uid)
         prefix, _, rest = data.partition(":")
+        if prefix == "recent":
+            await cb.answer()
+            await _recent_page(app, msg, uid, rest, edit=True)
+            return
+        if prefix == "home":
+            home_text, kb = ui.home(user, app.s.default_target_lang, approved=await app.resolver.has_group_access(uid),
+                               private_ok=app.s.private_access == "everyone" or await app.resolver.is_approved(uid))
+            with contextlib.suppress(TelegramAPIError):
+                await msg.edit_text(home_text, reply_markup=kb)
+            await cb.answer()
+            return
+        if prefix == "help":
+            if rest == "home":
+                await _send_help(app, msg, uid, edit=True)
+            else:
+                text = ui.help_topic(rest, int(app.s.max_media_seconds))
+                if text is None:
+                    await cb.answer("Open /help for the current menu.")
+                    return
+                with contextlib.suppress(TelegramAPIError):
+                    await msg.edit_text(text, reply_markup=ui.help_back_kb())
+            await cb.answer()
+            return
         if prefix in ("lang", "ilang"):
             current = (user.effective_lang if prefix == "lang" else user.inline_lang) or (
                 app.s.default_target_lang if prefix == "lang" else "en")
@@ -1022,7 +1276,8 @@ def _callback_router(app: App) -> Router:
                     await app.storage.upsert_user(uid, inline_lang=lang.code)
                     note = f"✅ Inline translations will go to <b>{html.escape(lang.label)}</b>."
                 with contextlib.suppress(TelegramAPIError):
-                    await msg.edit_text(note)
+                    await msg.edit_text(note + ("\nAutomatic group translations remain paused." if user.paused else ""),
+                                        reply_markup=ui.help_back_kb())
                 await cb.answer("Saved")
                 return
             if action == "page":
@@ -1030,15 +1285,19 @@ def _callback_router(app: App) -> Router:
             else:
                 kb = ui.language_menu(current, prefix)
             with contextlib.suppress(TelegramAPIError):
-                await msg.edit_reply_markup(reply_markup=kb)
+                await msg.edit_text("Choose a language below. Use /language to enter a language name.",
+                                    reply_markup=kb)
             await cb.answer()
             return
         if prefix == "me":
             action, _, val = rest.partition(":")
-            if action == "pause":
-                user = await app.storage.upsert_user(uid, paused=not user.paused)
+            if action in ("pause", "stop", "resume"):
+                user = await app.storage.upsert_user(
+                    uid, paused=not user.paused if action == "pause" else action == "stop")
             elif action == "dm":
-                user = await app.storage.upsert_user(uid, dm_fallback=not user.dm_fallback)
+                user = await app.storage.upsert_user(uid, dm_fallback=(val == "on" if val else not user.dm_fallback))
+            elif action == "orig":
+                user = await app.storage.upsert_user(uid, show_original=(val == "on" if val else not user.show_original))
             elif action == "groups":
                 await _send_groups(app, msg, uid, edit=True)
                 await cb.answer()
@@ -1054,15 +1313,15 @@ def _callback_router(app: App) -> Router:
                 await cb.answer("Muted" if not muted else "Unmuted")
                 return
             elif action == "privacy":
-                await msg.answer(ui.PRIVACY)
+                await msg.edit_text(ui.PRIVACY, reply_markup=ui.help_back_kb())
                 await cb.answer()
                 return
-            elif action == "mygroups":  # from /help: list below, keep the help message
-                await _send_groups(app, msg, uid)
+            elif action == "mygroups":
+                await _send_groups(app, msg, uid, edit=True)
                 await cb.answer()
                 return
-            elif action == "show":  # from /help: open settings below, keep the help message
-                await msg.answer(ui.settings_text(user, app.s.default_target_lang),
+            elif action == "show":
+                await msg.edit_text(ui.settings_text(user, app.s.default_target_lang),
                                  reply_markup=ui.settings_kb(user, app.s.default_target_lang))
                 await cb.answer()
                 return
@@ -1070,6 +1329,28 @@ def _callback_router(app: App) -> Router:
                 await msg.edit_text(ui.settings_text(user, app.s.default_target_lang),
                                     reply_markup=ui.settings_kb(user, app.s.default_target_lang))
             await cb.answer("Saved")
+            return
+        if prefix == "also":
+            action, _, val = rest.partition(":")
+            page = 0
+            if action == "tog":
+                val, _, raw_page = val.partition(":")
+                page = int(raw_page) if _INT_RE.fullmatch(raw_page) else 0
+            elif action == "page":
+                page = int(val) if _INT_RE.fullmatch(val) else 0
+            if action == "tog" and val in LANGUAGES:
+                picked = set(user.also_reads_set)
+                picked.symmetric_difference_update({val})
+                user = await app.storage.upsert_user(uid, also_reads=",".join(sorted(picked)))
+            with contextlib.suppress(TelegramAPIError):
+                if action == "menu":
+                    await msg.edit_text(ui.ALSO_PROMPT, reply_markup=ui.also_reads_kb(user, app.s.default_target_lang))
+                elif action == "done":
+                    await msg.edit_text(ui.settings_text(user, app.s.default_target_lang),
+                                        reply_markup=ui.settings_kb(user, app.s.default_target_lang))
+                else:
+                    await msg.edit_reply_markup(reply_markup=ui.also_reads_kb(user, app.s.default_target_lang, page))
+            await cb.answer()
             return
         if prefix == "pay":
             err = await _send_invoice(app, uid, rest)

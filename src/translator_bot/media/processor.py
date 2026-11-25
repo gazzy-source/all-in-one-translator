@@ -23,7 +23,6 @@ import multiprocessing
 import re
 import sys
 import time
-from collections import OrderedDict
 from collections.abc import Callable
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
@@ -65,6 +64,14 @@ def _mixed_scripts(text: str) -> bool:
     return sum(1 for n in counts.values() if n >= 3 and n / max(1, total) >= 0.15) >= 2
 
 
+class MediaReadError(Exception):
+    """The file could not be read. A later request may succeed."""
+
+    def __init__(self, reason: Literal["failed", "slow", "rejected"]) -> None:
+        self.reason = reason
+        super().__init__(reason)
+
+
 class _WorkerTimeout(TimeoutError):
     """A decode/render in the worker pool exceeded its time budget."""
 
@@ -94,17 +101,6 @@ class MediaProcessor:
         self._pool = self._new_pool()
         self._inflight: dict[str, asyncio.Future[MediaText | None]] = {}
         self.ocr_gate_frames = ocr_gate_frames
-        self._failures: OrderedDict[str, str] = OrderedDict()  # file_unique_id -> "timeout" | "rejected" (recent)
-
-    def _note_failure(self, file_unique_id: str, why: str) -> None:
-        self._failures[file_unique_id] = why
-        self._failures.move_to_end(file_unique_id)
-        while len(self._failures) > 1000:
-            self._failures.popitem(last=False)
-
-    def failure(self, file_unique_id: str) -> str | None:
-        """Why the last extraction of this file returned None without reading it ("timeout"/"rejected")."""
-        return self._failures.get(file_unique_id)
 
     def _new_pool(self) -> ProcessPoolExecutor:
         # forkserver (Linux) / spawn (Windows, macOS): fork() of the multi-threaded bot process (aiosqlite,
@@ -159,13 +155,23 @@ class MediaProcessor:
     async def extract(self, *, file_id: str, file_unique_id: str, size: int | None, kind: MediaKind,
                       targets: list[str], caption_hint: str | None = None,
                       duration: float | None = None) -> MediaText | None:
-        """Text/speech found in the media with translations into `targets` (when available), or None."""
+        """Group and benchmark callers silently skip unreadable media."""
+        try:
+            return await self.read(file_id=file_id, file_unique_id=file_unique_id, size=size, kind=kind,
+                                   targets=targets, caption_hint=caption_hint, duration=duration)
+        except MediaReadError:
+            return None
+
+    async def read(self, *, file_id: str, file_unique_id: str, size: int | None, kind: MediaKind,
+                   targets: list[str], caption_hint: str | None = None,
+                   duration: float | None = None) -> MediaText | None:
+        """Return this request's reading, or raise MediaReadError if extraction failed."""
         if kind in AUDIO_KINDS and duration is not None and duration > self.max_media_seconds:
             self.metrics.inc(f"media.too_long.{kind}")
             log.info("media skipped: too long", extra={"kind": kind, "seconds": duration,
                                                        "limit": self.max_media_seconds})
             return None
-        cached = await self.storage.get_media(file_unique_id, self.cache_ttl_s) if kind in PERSISTED else None
+        cached = await self.storage.get_media(file_unique_id, self.cache_ttl_s) if kind in PERSISTED and not caption_hint else None
         if cached is not None:
             self.metrics.inc("media.cache_hit")
             if not cached["has_text"]:
@@ -175,7 +181,7 @@ class MediaProcessor:
                              dict(cached["translations"]), "cache")
         # concurrent requests share one extraction only with the same caption hint (it steers the reading)
         hint = hashlib.sha256((caption_hint or "").encode()).hexdigest()[:16]
-        key = f"{file_unique_id}:{','.join(sorted(targets))}:{hint}"
+        key = f"{kind}:{duration}:{file_unique_id}:{','.join(sorted(targets))}:{hint}"
         while (fut := self._inflight.get(key)) is not None:
             try:
                 return await asyncio.shield(fut)
@@ -187,7 +193,7 @@ class MediaProcessor:
         fut = asyncio.get_running_loop().create_future()
         self._inflight[key] = fut
         try:
-            res = await self._extract_uncached(file_id, file_unique_id, size, kind, targets, caption_hint)
+            res = await self._extract_uncached(file_id, file_unique_id, size, kind, targets, caption_hint, duration)
             fut.set_result(res)
             return res
         except asyncio.CancelledError:
@@ -206,7 +212,7 @@ class MediaProcessor:
         return now
 
     async def _extract_uncached(self, file_id: str, file_unique_id: str, size: int | None, kind: MediaKind,
-                                targets: list[str], caption_hint: str | None) -> MediaText | None:
+                                targets: list[str], caption_hint: str | None, duration: float | None) -> MediaText | None:
         self.metrics.inc(f"media.process.{kind}")
         t_start = t = time.perf_counter()
         # A caption steers the vision prompt, and the cache is keyed by file id alone and shared by every chat:
@@ -242,6 +248,8 @@ class MediaProcessor:
                 if suffix not in (".webm", ".mp4", ".gif", ".avi"):
                     raise F.MediaRejected("not a video container")
                 fps = 1.0 if kind == "video" else 4.0
+                if duration is not None and duration > 0:
+                    fps = min(fps, self.max_frames / min(seconds, duration))
                 fs = await self._run(F.extract_video_frames, data, ffmpeg=self.ffmpeg_path, suffix=suffix,
                                      max_seconds=seconds, max_frames=self.max_frames, timeout=self.timeout_s - 2,
                                      fps=fps)
@@ -252,9 +260,7 @@ class MediaProcessor:
             del data
             t = self._stage("decode", t)
             if fs is not None:
-                distinct: list[int] = await self._run(F.select_distinct, fs.frames)
-                n = self.ocr_gate_frames  # each one is ~0.3 s on a desktop CPU, 2-5 s on a throttled 1/8-core VM
-                gate = distinct if len(distinct) <= n else [distinct[int(i * len(distinct) / n)] for i in range(n)]
+                gate: list[int] = await self._run(F.select_distinct, fs.frames, limit=self.ocr_gate_frames)
                 found: list[F.TextBoxes] = await self._run(F.detect_text, fs.frames, gate)
                 t = self._stage("ocr_gate", t)
                 text_idx = [b.index for b in found if b.boxes > 0 and b.text_area >= 0.004]
@@ -266,14 +272,13 @@ class MediaProcessor:
                 # a hung native render must not occupy a worker forever. Only worker timeouts: a slow *download*
                 # recycling the pool used to kill other jobs' healthy renders.
                 self._recycle_pool()
-            self._note_failure(file_unique_id, "timeout" if isinstance(exc, TimeoutError) else "rejected")
             self.metrics.inc(f"media.rejected.{type(exc).__name__}")
             log.info("media rejected", extra={"kind": kind, "reason": str(exc)[:60] or type(exc).__name__})
-            return None
-        except Exception:
+            raise MediaReadError("slow" if isinstance(exc, TimeoutError) else "rejected") from exc
+        except Exception as exc:
             self.metrics.inc("media.error")
             log.exception("media processing failed", extra={"kind": kind})
-            return None
+            raise MediaReadError("failed") from exc
 
         if not images and not audio:
             self.metrics.inc("media.no_text")
@@ -297,7 +302,7 @@ class MediaProcessor:
                     log.info("media: nothing to translate", extra={
                         "kind": kind, "has_text": vr.has_text, "confidence": round(vr.confidence, 2),
                         "chars": len(vr.text or ""), "min_confidence": self.ocr_min_confidence})
-                    if persist:
+                    if persist and not vr.has_text and vr.confidence >= self.ocr_min_confidence:
                         await self.storage.put_media(file_unique_id, has_text=False, text=None, source_lang=None,
                                                      confidence=vr.confidence, translations={})
                     return None
@@ -342,11 +347,13 @@ class MediaProcessor:
         # Local OCR fallback (no speech recognition; RapidOCR reads Latin/CJK only): trust confident reads.
         self.metrics.observe(f"media_ms.{kind}", (time.perf_counter() - t_start) * 1000)
         if fs is None or not text_idx:
-            return None
+            raise MediaReadError("failed")  # no speech recognizer available after the provider failed
         try:
             ocr = await self._run(F.ocr_frames, fs.frames, text_idx)
-        except Exception:
-            return None
+        except TimeoutError as exc:
+            raise MediaReadError("slow") from exc
+        except Exception as exc:
+            raise MediaReadError("failed") from exc
         texts: list[str] = []
         for o in ocr:  # drop repeats (text that stays on screen across frames)
             if o.text and o.text not in texts:

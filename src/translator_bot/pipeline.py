@@ -12,19 +12,18 @@ import logging
 import time
 from collections import Counter, OrderedDict, defaultdict, deque
 from collections.abc import AsyncIterator, Awaitable, Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from aiogram.types import Message
 
 from translator_bot.config import Settings
 from translator_bot.context import ContextStore
-from translator_bot.delivery import Deliverer, Delivery
+from translator_bot.delivery import BUBBLE_WINDOW_S, Deliverer, Delivery
 from translator_bot.detect import LanguageDetector, Verdict
 from translator_bot.eligibility import Eligible, Kind, Skip, classify, sender_id, sender_name
 from translator_bot.languages import LANGUAGES, same_language
-from translator_bot.media.processor import AUDIO_KINDS, MediaProcessor, MediaText
-from translator_bot.media.processor import PERSISTED as PERSISTED_KINDS
+from translator_bot.media.processor import AUDIO_KINDS, MediaProcessor, MediaReadError, MediaText
 from translator_bot.metrics import Metrics
 from translator_bot.orchestrator import Orchestrator
 from translator_bot.providers.base import ContextLine, TranslationJob
@@ -57,6 +56,9 @@ class UnitMeta:
     reply_ctx: ContextLine | None
     settings: dict[str, Any]
     ctx_before: int | None = None  # ContextStore.mark when the (first) message arrived
+    append_after: int | None = None  # exact preceding original; never merge out-of-order translations
+    arrival_context: tuple[ContextLine, ...] | None = None
+    parent_id: int | None = None
 
 
 @dataclass(slots=True)
@@ -88,12 +90,14 @@ class Pipeline:
         self.edit_memory_s = edit_memory_s
         self._units: OrderedDict[tuple[int, int], UnitRecord] = OrderedDict()  # (chat, msg) -> unit
         self._locks: dict[tuple[int, int], asyncio.Lock] = defaultdict(asyncio.Lock)
-        # last media reading per message (memory only, edit_memory_s): a caption edit reuses it instead of
-        # re-downloading and re-running vision/audio for photos, videos and voice (which aren't cached on disk)
-        self._media_memo: OrderedDict[tuple[int, int], tuple[float, str, MediaText | None]] = OrderedDict()
+        # Successful per-message readings can be reused while both the file and its caption hint match.
+        self._media_memo: OrderedDict[tuple[int, int], tuple[float, str, str, MediaText]] = OrderedDict()
         self._bg: set[asyncio.Task[None]] = set()
         self._chat_cache: dict[int, tuple[float, Chat]] = {}
         self._lang_votes: OrderedDict[int, deque[str]] = OrderedDict()  # approved sender -> recent languages
+        self._participants: set[tuple[int, int]] = set()  # (chat, user) already stored as participant
+        self._group_daily: dict[int, tuple[str, int]] = {}  # chat -> (UTC day, translated messages)
+        self._last_speaker: dict[tuple[int, int | None], tuple[int | None, float, int]] = {}
 
     def start(self) -> None:
         self.text_lane.start()
@@ -133,6 +137,19 @@ class Pipeline:
         sid = sender_id(msg)
         thread = topic_of(msg)  # one key for context, bursts, claims and delivery
         ctx_mark = self.context.mark  # context = what was said *before* this message
+        arrival_context = (self.context.get(msg.chat.id, thread, sid or 0, limit=self.s.context_messages)
+                           if chat.active and chat.enabled and chat.settings.get("context", True)
+                           and self.s.context_messages else ())
+        reply_ctx = self._reply_ctx(msg, sid)
+        prev = self._last_speaker.get((msg.chat.id, thread))
+        now = time.monotonic()
+        append_after = (prev[2] if prev is not None and sid is not None and prev[0] == sid
+                        and now - prev[1] <= BUBBLE_WINDOW_S and not msg.reply_to_message else None)
+        self._last_speaker[(msg.chat.id, thread)] = (sid, now, msg.message_id)
+        if prev is not None and (prev[0] != sid or not msg.text or msg.reply_to_message):
+            await self.bursts.flush((msg.chat.id, thread, prev[0] or 0))
+        if len(self._last_speaker) > 20_000:
+            self._last_speaker.clear()
         if msg.text and sid is not None and not msg.text.startswith("/"):
             self.context.add(msg.chat.id, thread, sid, msg.text)
         elif msg.caption and sid is not None:
@@ -150,29 +167,41 @@ class Pipeline:
             return
         if sid is not None and sid > 0 and msg.from_user is not None and not msg.from_user.is_bot:
             raw = msg.text or msg.caption or ""
+            if (msg.chat.id, sid) not in self._participants:
+                self._participants.add((msg.chat.id, sid))
+                if len(self._participants) > 100_000:
+                    self._participants.clear()
+                self._spawn(self.storage.mark_participant(sid, msg.chat.id))
             self._spawn(self._learn_language(sid, msg.from_user.language_code,
-                                             "" if raw.startswith("/") else raw[:500]))
+                                             "" if raw.startswith("/") else raw[:500], msg.chat.id))
         res = classify(msg, bot_id=self.bot_id, settings=chat.settings, media_enabled=self.s.media_enabled)
         if isinstance(res, Skip):
             self.metrics.inc(f"skip.{res.value}")
             return
         if len(res.plain) > self.s.max_text_chars:
             res = Eligible(res.kind, html_escape_truncate(res.plain, self.s.max_text_chars), truncate(res.plain, self.s.max_text_chars), res.has_media)
+        if not self._group_quota_ok(msg.chat.id):
+            self.metrics.inc("skip.group_daily_limit")
+            return
         if not await self.storage.claim_message(msg.chat.id, msg.message_id, thread, sid,
                                                 content_hash(res.plain + str(res.kind.value) + (_media_file(msg)[1] or ""))):
             self.metrics.inc("skip.duplicate")
             return
         self.metrics.inc(f"eligible.{res.kind.value}")
-        meta = UnitMeta(msg.chat.id, msg.chat.title, thread, sid, sender_name(msg), self._reply_ctx(msg, sid),
-                        chat.settings, ctx_mark)
+        meta = UnitMeta(msg.chat.id, msg.chat.title, thread, sid, sender_name(msg), reply_ctx,
+                        chat.settings, ctx_mark, append_after, arrival_context,
+                        msg.reply_to_message.message_id if reply_ctx and msg.reply_to_message else None)
         if res.kind is Kind.TEXT:
             await self.bursts.add((msg.chat.id, thread, sid or 0),
                                   BurstItem(msg.message_id, res.text_html, res.plain), meta)
+            if reply_ctx:
+                await self.bursts.flush((msg.chat.id, thread, sid or 0))
         else:
             key = (msg.chat.id, thread, sid or 0)
             await self.bursts.flush(key)  # keep ordering: pending text from this sender goes first
-            await self.media_lane.submit(msg.chat.id, lambda: self._process_media(msg, res, meta),
-                                         key=f"m:{msg.chat.id}:{msg.message_id}")
+            if not await self.media_lane.submit(msg.chat.id, lambda: self._process_media(msg, res, meta),
+                                                key=f"m:{msg.chat.id}:{msg.message_id}"):
+                await self.storage.update_message(msg.chat.id, msg.message_id, status="queue_rejected")
 
     async def on_edit(self, msg: Message) -> None:
         self.metrics.inc("updates.edit")
@@ -202,14 +231,14 @@ class Pipeline:
         if row is not None and row["content_hash"] == new_hash:
             self.metrics.inc("edit.unchanged")  # e.g. link preview loaded / reactions: nothing to redo
             return
-        if self.bursts.update_pending((msg.chat.id, thread, sid or 0), msg.message_id, res.text_html, res.plain):
-            self.metrics.inc("edit.in_pending_burst")
-            return
         if row is None:
             if not await self.storage.claim_message(msg.chat.id, msg.message_id, thread, sid, new_hash):
                 return
         else:
             await self.storage.update_message(msg.chat.id, msg.message_id, content_hash=new_hash)
+        if self.bursts.update_pending((msg.chat.id, thread, sid or 0), msg.message_id, res.text_html, res.plain):
+            self.metrics.inc("edit.in_pending_burst")
+            return
         if res.has_media:
             # caption edit (or replaced file) on media: re-render caption *and* media text together - a caption-only
             # re-translation used to overwrite the combined ephemeral and drop the image/GIF text
@@ -274,16 +303,35 @@ class Pipeline:
         self._bg.add(task)
         task.add_done_callback(self._bg.discard)
 
+    def _group_quota_ok(self, chat_id: int) -> bool:
+        """GROUP_DAILY_LIMIT translated messages per group per UTC day (in memory; a restart resets it)."""
+        limit = self.s.group_daily_limit
+        if limit <= 0:
+            return True
+        today = time.strftime("%Y-%m-%d", time.gmtime())
+        day, n = self._group_daily.get(chat_id, (today, 0))
+        if day != today:
+            n = 0
+        if n >= limit:
+            return False
+        self._group_daily[chat_id] = (today, n + 1)
+        if len(self._group_daily) > 50_000:
+            self._group_daily = {k: v for k, v in self._group_daily.items() if v[0] == today}
+        return True
+
     def _spawn(self, coro: Awaitable[None]) -> None:
         task = asyncio.ensure_future(coro)
         self._bg.add(task)
         task.add_done_callback(self._bg.discard)
 
-    async def _learn_language(self, uid: int, telegram_lang: str | None, plain: str) -> None:
+    async def _learn_language(self, uid: int, telegram_lang: str | None, plain: str,
+                              chat_id: int | None = None) -> None:
         """Automatic reader language for approved members who never chose one: the language they write in the
         group (majority of their last 5 messages), else their Telegram app language. Codes only, never text."""
         try:
-            if not await self.resolver.is_approved(uid):
+            approved = (await self.resolver.is_approved_in(chat_id, uid) if chat_id is not None
+                        else await self.resolver.is_approved(uid))
+            if not approved:
                 return
             user = await self.storage.get_user(uid)
             if user is not None and user.lang:
@@ -329,6 +377,8 @@ class Pipeline:
 
     def _reply_ctx(self, msg: Message, sid: int | None) -> ContextLine | None:
         r = msg.reply_to_message
+        if r is None or r.chat.id != msg.chat.id or r.ephemeral_message_id is not None or r.forum_topic_created:
+            return None
         quote = msg.quote.text if msg.quote is not None else None
         text = quote or (r.text or r.caption if r is not None else None)
         if not text:
@@ -337,12 +387,31 @@ class Pipeline:
         label = self.context.speaker_label(msg.chat.id, topic_of(msg), sid or 0, other or -1)
         return ContextLine(label, truncate(text, 300))
 
+    async def _translated_parent(self, meta: UnitMeta, lang: str,
+                                 glossary: tuple[tuple[str, str], ...]) -> str | None:
+        if not meta.reply_ctx or not meta.settings.get("context", True):
+            return None
+        source = meta.reply_ctx.text
+        # Translate the quoted speaker independently. Later conversation belongs to the reply.
+        parent = replace(meta, reply_ctx=None, settings={"context": False}, arrival_context=())
+        record = self._units.get((meta.chat_id, meta.parent_id)) if meta.parent_id is not None else None
+        if (record and record.meta.thread_id == meta.thread_id and record.meta.arrival_context is not None
+                and time.monotonic() - record.created <= min(self.edit_memory_s, self.context.ttl_s)
+                and len(record.items) == 1 and source in record.items[0].plain):
+            parent = record.meta
+        out, _, why = await self._translate_outcome(parent, source, source, lang, glossary=glossary)
+        if why == "same":
+            return source
+        return _html.unescape(out) if out else None
+
     async def _on_burst(self, key: tuple[int, int | None, int], items: list[BurstItem], meta: object) -> None:
         assert isinstance(meta, UnitMeta)
         if len(items) > 1:
             self.metrics.inc("burst.coalesced", len(items))
-        await self.text_lane.submit(meta.chat_id, lambda: self._process_text(meta, items),
-                                    key=f"u:{meta.chat_id}:{items[0].message_id}")
+        if not await self.text_lane.submit(meta.chat_id, lambda: self._process_text(meta, items),
+                                           key=f"u:{meta.chat_id}:{items[0].message_id}"):
+            for item in items:
+                await self.storage.update_message(meta.chat_id, item.message_id, status="queue_rejected")
 
     def _remember(self, meta: UnitMeta, items: list[BurstItem]) -> None:
         rec = UnitRecord(meta, items)
@@ -362,8 +431,8 @@ class Pipeline:
                                                           or verdict is Verdict.UNSURE)
         ctx: tuple[ContextLine, ...] = ()
         if use_ctx and self.s.context_messages:
-            ctx = self.context.get(meta.chat_id, meta.thread_id, meta.sender_id or 0, limit=self.s.context_messages,
-                                   before=meta.ctx_before)
+            ctx = meta.arrival_context if meta.arrival_context is not None else self.context.get(
+                meta.chat_id, meta.thread_id, meta.sender_id or 0, limit=self.s.context_messages, before=meta.ctx_before)
             # no arrival mark (edit after restart): the current message itself is the last entry - drop it
             if meta.ctx_before is None and ctx and ctx[-1].text.strip() == truncate(plain, 280).strip():
                 ctx = ctx[:-1]
@@ -407,6 +476,26 @@ class Pipeline:
         return out, src, ""
 
     # -- private chat (1:1 translator) -------------------------------------------------------------
+    async def recover_group(self, msg: Message, el: Eligible, lang: str, settings: dict[str, Any]) -> PrivateResult:
+        if el.has_media or not el.plain:
+            return await self.translate_private(msg, el, lang)
+        rec = self._units.get((msg.chat.id, msg.message_id))
+        meta = UnitMeta(msg.chat.id, msg.chat.title, topic_of(msg), sender_id(msg), sender_name(msg),
+                        self._reply_ctx(msg, sender_id(msg)), settings, arrival_context=(),
+                        parent_id=msg.reply_to_message.message_id if msg.reply_to_message else None)
+        if (rec and rec.meta.thread_id == meta.thread_id and settings.get("context", True)
+                and time.monotonic() - rec.created <= min(self.edit_memory_s, self.context.ttl_s)):
+            meta = replace(meta, arrival_context=rec.meta.arrival_context or (),
+                           reply_ctx=meta.reply_ctx or rec.meta.reply_ctx,
+                           parent_id=meta.parent_id or rec.meta.parent_id)
+        glossary = tuple(await self.storage.glossary(msg.chat.id))
+        (out, src, why), parent = await asyncio.gather(
+            self._translate_outcome(meta, el.text_html, el.plain, lang, glossary=glossary),
+            self._translated_parent(meta, lang, glossary))
+        if parent and (out or why == "same"):
+            out = f"<blockquote>{_html.escape(truncate(parent, 240))}</blockquote>\n" + (out or _html.escape(el.plain))
+        return PrivateResult(out, src, why)
+
     async def translate_private(self, msg: Message, el: Eligible, target: str) -> PrivateResult:
         """Translate one message sent to the bot in a private chat into `target`. Nothing is stored; the
         media cache (by Telegram file id) is shared with groups."""
@@ -428,13 +517,16 @@ class Pipeline:
             if mkind in AUDIO_KINDS and duration is not None and duration > self.s.max_media_seconds:
                 reasons.append("too_long")
             else:
-                mt = await self.media.extract(file_id=file_id, file_unique_id=unique_id, size=size,
-                                              kind=mkind, targets=[target],  # type: ignore[arg-type]
-                                              caption_hint=el.plain or None, duration=duration)
-                if mt is None and self.media.failure(unique_id) == "timeout":
-                    reasons.append("slow")  # never claim "no text" for a file we couldn't finish reading
-                elif mt is None or not mt.text or mt.text.strip() == el.plain.strip():
-                    reasons.append("no_text")
+                missing_reason = "no_text"
+                try:
+                    mt = await self.media.read(file_id=file_id, file_unique_id=unique_id, size=size,
+                                               kind=mkind, targets=[target],  # type: ignore[arg-type]
+                                               caption_hint=el.plain or None, duration=duration)
+                except MediaReadError as exc:
+                    missing_reason = "slow" if exc.reason == "slow" else "failed"
+                    mt = None
+                if mt is None or not mt.text or mt.text.strip() == el.plain.strip():
+                    reasons.append(missing_reason)
                 else:
                     cached = mt.translations.get(target)
                     tr: str | None
@@ -465,6 +557,25 @@ class Pipeline:
             by_lang[r.lang].append(r)
         return by_lang
 
+    async def _filter_readers(self, plain: str, target: str, rs: list[Recipient]) -> list[Recipient]:
+        # Only skip confidently single-language content. A provider's single source label cannot
+        # establish that every part of a code-switched message is understood by this reader.
+        if not plain or not any(r.also_reads for r in rs):
+            return rs
+        det = await asyncio.to_thread(self.detector.detect, plain, target)
+        if det.mixed or det.verdict is not Verdict.OTHER or not det.lang:
+            return rs
+        kept = [r for r in rs if not r.reads(det.lang)]
+        self.metrics.inc("skip.reader_reads_source", len(rs) - len(kept))
+        return kept
+
+    async def _current_readers(self, meta: UnitMeta, lang: str, rs: list[Recipient]) -> list[Recipient]:
+        # Provider calls may take seconds: revocation, pause, or a changed language during that wait
+        # must take effect before delivery. Never add readers who weren't in the original request.
+        ids = {r.user_id for r in rs}
+        return [r for r in await self.resolver.resolve(meta.chat_id, meta.sender_id)
+                if r.user_id in ids and r.lang == lang]
+
     async def _process_text(self, meta: UnitMeta, items: list[BurstItem], *, edited: bool = False) -> None:
         ids = [i.message_id for i in items]
         async with self._message_locks(meta.chat_id, ids):
@@ -481,19 +592,40 @@ class Pipeline:
         self._remember(meta, items)
         if not by_lang:
             self.metrics.inc("skip.no_recipients")
+            for item in items:
+                await self.storage.update_message(meta.chat_id, item.message_id, status="no_recipients")
             return
         text_html = "\n".join(i.text_html for i in items)
         plain = "\n".join(i.plain for i in items)
         glossary = tuple(await self.storage.glossary(meta.chat_id))
 
         async def one(lang: str, rs: list[Recipient]) -> None:
-            out = await self._translate_for(meta, text_html, plain, lang, glossary=glossary)
-            if out is None:
+            rs = await self._filter_readers(plain, lang, rs)
+            if not rs:
                 return
-            translation, src = out
+            parent = None
+            if meta.reply_ctx and meta.settings.get("context", True):
+                (translation, src, reason), parent = await asyncio.gather(
+                    self._translate_outcome(meta, text_html, plain, lang, glossary=glossary),
+                    self._translated_parent(meta, lang, glossary),
+                )
+                if translation is None:
+                    if reason != "same" or not parent or parent == meta.reply_ctx.text:
+                        return
+                    # The reply is readable, but its parent still needs translating.
+                    translation = _html.escape(plain)
+            else:
+                out = await self._translate_for(meta, text_html, plain, lang, glossary=glossary)
+                if out is None:
+                    return
+                translation, src = out
+            rs = await self._filter_readers(plain, lang, await self._current_readers(meta, lang, rs))
+            if not rs:
+                return
             d = Delivery(meta.chat_id, meta.chat_title, meta.thread_id, [i.message_id for i in items],
                          meta.sender_name, src, lang, translation, "text", plain, edited,
-                         show_sender=bool(meta.settings.get("show_sender")))
+                         show_sender=bool(meta.settings.get("show_sender")), sender_id=meta.sender_id,
+                         append_after=meta.append_after if not edited else None, parent_excerpt=parent)
             if edited and not fresh:
                 await self.deliverer.update(d, rs, show_original=bool(meta.settings.get("show_original")))
             else:  # new message, or an edit that must not overwrite a burst's shared ephemeral
@@ -516,6 +648,7 @@ class Pipeline:
         by_lang = await self._recipients_by_lang(meta)
         if not by_lang:
             self.metrics.inc("skip.no_recipients")
+            await self.storage.update_message(meta.chat_id, msg.message_id, status="no_recipients")
             return
         file_id, unique_id, size, duration = _media_file(msg)
         mkind = MEDIA_KIND.get(el.kind)
@@ -525,7 +658,8 @@ class Pipeline:
         extract_task: asyncio.Task[MediaText | None] | None = None
         memo_key = (meta.chat_id, msg.message_id)
         memo = self._media_memo.get(memo_key)
-        reuse = (edited and memo is not None and memo[1] == unique_id
+        hint_hash = content_hash(el.plain)
+        reuse = (edited and memo is not None and memo[1] == unique_id and memo[2] == hint_hash
                  and time.monotonic() - memo[0] <= self.edit_memory_s)
         if reuse:
             self.metrics.inc("edit.media_reused")
@@ -541,16 +675,17 @@ class Pipeline:
 
         try:
             captions = dict(zip(langs, await asyncio.gather(*(caption_for(lg) for lg in langs)), strict=True))
+            media_text: MediaText | None
             if reuse:
                 assert memo is not None
-                media_text = memo[2]
+                media_text = memo[3]
             else:
                 media_text = await extract_task if extract_task is not None else None
         finally:
             if extract_task is not None and not extract_task.done():
                 extract_task.cancel()  # caption failed / job cancelled: stop the download/ffmpeg/vision work
-        if unique_id:
-            self._media_memo[memo_key] = (time.monotonic(), unique_id, media_text)
+        if unique_id and media_text is not None:
+            self._media_memo[memo_key] = (time.monotonic(), unique_id, hint_hash, media_text)
             self._media_memo.move_to_end(memo_key)
             while self._media_memo and (len(self._media_memo) > 2000 or time.monotonic()
                                         - next(iter(self._media_memo.values()))[0] > self.edit_memory_s):
@@ -570,34 +705,47 @@ class Pipeline:
                 if cached_tr is not None:
                     tr = _html.escape(cached_tr, quote=False)  # vision output is plain text, never markup
                 else:  # not produced by the media call (cache from other languages / local OCR)
-                    out, s, why = await self._translate_outcome(meta, media_text.text, media_text.text, lang,
-                                                                style="ocr")
+                    out, s, _ = await self._translate_outcome(meta, media_text.text, media_text.text, lang,
+                                                              style="ocr", glossary=glossary)
                     tr = out or ""  # plain OCR job -> already escaped
                     src = src or s
-                    # remember only real outcomes: a failure (quota, outage) must not become "nothing to translate"
-                    if why != "failed":
-                        media_text.translations[lang] = _html.unescape(tr)
-                    # caption-steered readings stay out of the shared (file id) cache, like in the processor
-                    if why != "failed" and unique_id and mkind in PERSISTED_KINDS and not el.plain:
-                        await self.storage.put_media(unique_id, has_text=True, text=media_text.text,
-                                                     source_lang=media_text.source_lang or src,
-                                                     confidence=media_text.confidence,
-                                                     translations=media_text.translations)
+                    # This translation can depend on the group's conversation and glossary. Its scoped
+                    # orchestrator cache handles repeats; the shared file reading stays context-free.
                 if tr:
                     src = src or media_text.source_lang
                     parts.append((icon if el.plain else "") + tr)
             if not parts:
                 return
+            parent = await self._translated_parent(meta, lang, glossary)
+            rs = await self._current_readers(meta, lang, rs)
+            caption_readers = await self._filter_readers(el.plain, lang, rs)
+            media_readers = await self._filter_readers(media_text.text if media_text else "", lang, rs)
             kind = {Kind.STICKER: "sticker", Kind.ANIMATED_STICKER: "sticker", Kind.VIDEO_STICKER: "sticker",
                     Kind.GIF: "gif", Kind.IMAGE: "image", Kind.VIDEO: "video", Kind.VOICE: "voice"}.get(el.kind,
                                                                                                        "caption")
-            d = Delivery(meta.chat_id, meta.chat_title, meta.thread_id, [msg.message_id], meta.sender_name, src, lang,
-                         "\n".join(parts), kind, el.plain or (media_text.text if media_text else None), edited,
-                         show_sender=bool(meta.settings.get("show_sender")))
-            if edited:
-                await self.deliverer.update(d, rs, show_original=bool(meta.settings.get("show_original")))
-            else:
-                await self.deliverer.deliver(d, rs, show_original=bool(meta.settings.get("show_original")))
+            async def deliver_reader(r: Recipient) -> None:
+                selected = list(parts)
+                originals: list[str] = []
+                if cap and r in caption_readers:
+                    originals.append(el.plain)
+                if len(parts) > int(bool(cap)) and r in media_readers and media_text:
+                    originals.append(media_text.text)
+                if cap and r not in caption_readers:
+                    selected = selected[1:]
+                if len(parts) > int(bool(cap)) and r not in media_readers:
+                    selected = selected[:-1]
+                if not selected:
+                    return
+                d = Delivery(meta.chat_id, meta.chat_title, meta.thread_id, [msg.message_id], meta.sender_name,
+                             src, lang, "\n".join(selected), kind,
+                             "\n".join(originals) or None, edited,
+                             show_sender=bool(meta.settings.get("show_sender")), parent_excerpt=parent)
+                if edited:
+                    await self.deliverer.update(d, [r], show_original=bool(meta.settings.get("show_original")))
+                else:
+                    await self.deliverer.deliver(d, [r], show_original=bool(meta.settings.get("show_original")))
+
+            await asyncio.gather(*(deliver_reader(r) for r in rs))
 
         await asyncio.gather(*(one(lang, rs) for lang, rs in by_lang.items()))
         await self.storage.update_message(meta.chat_id, msg.message_id, status="done")

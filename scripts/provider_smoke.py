@@ -8,6 +8,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+from io import BytesIO
+
+from PIL import Image, ImageDraw, ImageFont
 
 from translator_bot.config import load_settings
 from translator_bot.providers.base import ContextLine, ProviderError, TranslationJob
@@ -43,15 +46,12 @@ async def main() -> None:
             except ProviderError as e:
                 report[f"gemini_{'quality' if quality else 'fast'}_error"] = {"err": str(e), "msg": e.extra.get("message")}
         try:
-            import sys
-            sys.path.insert(0, ".")
-            from tests.fixtures import text_image
-
-            from translator_bot.media.frames import load_image
-
-            img = load_image(text_image("NO WAY BRO", transparent=True, fmt="WEBP"), 25_000_000).frames[0]
-            v = await g.read_images([img], "es", animated=False, caption_hint=None, timeout=30)
-            report["gemini_vision"] = {"has_text": v.has_text, "text": v.text, "tr": v.translation,
+            img = Image.new("RGB", (640, 140), "white")
+            ImageDraw.Draw(img).text((30, 40), "NO WAY BRO", fill="black", font=ImageFont.load_default(size=48))
+            buf = BytesIO()
+            img.save(buf, format="PNG")
+            v = await g.read_images([buf.getvalue()], ["es"], animated=False, caption_hint=None, timeout=30)
+            report["gemini_vision"] = {"has_text": v.has_text, "text": v.text, "tr": v.translations,
                                        "conf": v.confidence, "ms": round(v.latency_ms), "tokens": [v.input_tokens,
                                                                                                     v.output_tokens]}
         except ProviderError as e:

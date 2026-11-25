@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import html
+import re
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any
@@ -74,8 +76,13 @@ def classify(msg: Message, *, bot_id: int, settings: dict[str, Any], media_enabl
     text = msg.text
     caption = msg.caption
     if text is not None:
+        text_html = msg.html_text
         if text.lstrip().startswith("/"):
-            return Skip.COMMAND
+            song = re.fullmatch(r"/play(?:@[A-Za-z0-9_]+)?\s+(.+)", text.strip(), re.IGNORECASE | re.DOTALL)
+            if private or not song:
+                return Skip.COMMAND
+            text = song[1].strip()
+            text_html = html.escape(text)
         prof = profile_text(text)
         if prof.kind not in (ContentKind.TEXT, ContentKind.CODE):
             return Skip.NON_LINGUISTIC
@@ -83,7 +90,7 @@ def classify(msg: Message, *, bot_id: int, settings: dict[str, Any], media_enabl
             return Skip.NON_LINGUISTIC  # code is not translated
         if not settings.get("text", True):
             return Skip.CHAT_DISABLED
-        return Eligible(Kind.TEXT, msg.html_text, text, False)
+        return Eligible(Kind.TEXT, text_html, text, False)
 
     cap_ok = caption is not None and settings.get("captions", True) and \
         profile_text(caption).kind is ContentKind.TEXT

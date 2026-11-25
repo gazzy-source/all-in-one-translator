@@ -120,6 +120,17 @@ MIGRATIONS: list[str] = [
         refunded INTEGER NOT NULL DEFAULT 0
     );
     """,
+    # 4: approval by a group's own owner/admins - valid in that group only
+    """
+    ALTER TABLE user_chat ADD COLUMN approved INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE user_chat ADD COLUMN approved_by INTEGER;
+    ALTER TABLE user_chat ADD COLUMN seen INTEGER NOT NULL DEFAULT 0;
+    """,
+    # 5: personal reading preferences (never amend an already released migration)
+    """
+    ALTER TABLE users ADD COLUMN also_reads TEXT NOT NULL DEFAULT '';
+    ALTER TABLE users ADD COLUMN show_original INTEGER NOT NULL DEFAULT 0;
+    """,
 ]
 
 DEFAULT_CHAT_SETTINGS: dict[str, Any] = {
@@ -156,6 +167,12 @@ class User:
     private_credit: int = 0  # purchased private-chat translations
     lifetime: bool = False  # bought unlimited
     free_pass: bool = False  # owner granted free lifetime use (/approvefree)
+    also_reads: str = ""  # comma-separated languages they read besides their own (never translated for them)
+    show_original: bool = False  # quote the original above each translation
+
+    @property
+    def also_reads_set(self) -> frozenset[str]:
+        return frozenset(c for c in self.also_reads.split(",") if c)
 
     @property
     def effective_lang(self) -> str | None:
@@ -229,6 +246,7 @@ class Storage:
             lang_guess=row["lang_guess"], tg_lang=row["tg_lang"],
             private_used=int(row["private_used"]), private_credit=int(row["private_credit"]),
             lifetime=bool(row["lifetime"]), free_pass=bool(row["free_pass"]),
+            also_reads=row["also_reads"] or "", show_original=bool(row["show_original"]),
         )
 
     async def get_user(self, user_id: int) -> User | None:
@@ -238,7 +256,7 @@ class Storage:
 
     async def upsert_user(self, user_id: int, **fields: Any) -> User:
         allowed = {"first_name", "lang", "onboarded", "approved", "approved_by", "approved_at", "paused", "started",
-                   "dm_fallback", "inline_lang", "default_notice_sent", "lang_guess", "tg_lang", "free_pass"}
+                   "dm_fallback", "inline_lang", "default_notice_sent", "lang_guess", "tg_lang", "free_pass", "also_reads", "show_original"}
         bad = set(fields) - allowed
         if bad:
             raise ValueError(f"unknown user fields: {bad}")
@@ -407,6 +425,41 @@ class Storage:
         cur = await self.db.execute("SELECT user_id FROM user_chat WHERE chat_id=? AND muted=1", (chat_id,))
         return {r["user_id"] for r in await cur.fetchall()}
 
+    async def set_chat_approved(self, user_id: int, chat_id: int, approved: bool, by: int) -> None:
+        """Approval by a group's owner/admin: translations (and /tr) in that group only."""
+        await self.db.execute("INSERT OR IGNORE INTO users(user_id, updated_at) VALUES (?, ?)", (user_id, _now()))
+        await self.db.execute(
+            "INSERT INTO user_chat(user_id, chat_id, approved, approved_by) VALUES (?,?,?,?) "
+            "ON CONFLICT(user_id, chat_id) DO UPDATE SET approved=excluded.approved, approved_by=excluded.approved_by",
+            (user_id, chat_id, int(approved), by if approved else None))
+        await self.db.commit()
+
+    async def mark_participant(self, user_id: int, chat_id: int) -> None:
+        """Seen in this group (wrote, joined, used /tr): a reader when the group's admins approved everyone."""
+        await self.db.execute("INSERT OR IGNORE INTO users(user_id, updated_at) VALUES (?, ?)", (user_id, _now()))
+        await self.db.execute("INSERT INTO user_chat(user_id, chat_id, seen) VALUES (?,?,1) "
+                              "ON CONFLICT(user_id, chat_id) DO UPDATE SET seen=1", (user_id, chat_id))
+        await self.db.commit()
+
+    async def participants(self, chat_id: int) -> list[User]:
+        cur = await self.db.execute("SELECT u.* FROM users u JOIN user_chat c ON u.user_id = c.user_id "
+                                    "WHERE c.chat_id=? AND c.seen=1", (chat_id,))
+        return [self._user(r) for r in await cur.fetchall()]
+
+    async def chat_approved_users(self, chat_id: int) -> list[User]:
+        cur = await self.db.execute("SELECT u.* FROM users u JOIN user_chat c ON u.user_id = c.user_id "
+                                    "WHERE c.chat_id=? AND c.approved=1", (chat_id,))
+        return [self._user(r) for r in await cur.fetchall()]
+
+    async def is_chat_approved(self, user_id: int, chat_id: int | None = None) -> bool:
+        """Approved by the admins of `chat_id` (or of any group, when chat_id is None)."""
+        if chat_id is None:
+            cur = await self.db.execute("SELECT 1 FROM user_chat WHERE user_id=? AND approved=1 LIMIT 1", (user_id,))
+        else:
+            cur = await self.db.execute("SELECT 1 FROM user_chat WHERE user_id=? AND chat_id=? AND approved=1",
+                                        (user_id, chat_id))
+        return await cur.fetchone() is not None
+
     async def set_muted(self, user_id: int, chat_id: int, muted: bool) -> None:
         await self.db.execute(
             "INSERT INTO user_chat(user_id, chat_id, muted) VALUES (?,?,?) "
@@ -474,11 +527,12 @@ class Storage:
     # -- media OCR cache -------------------------------------------------------------------------
     async def get_media(self, file_unique_id: str, ttl_s: int) -> dict[str, Any] | None:
         cur = await self.db.execute("SELECT * FROM media_cache WHERE file_unique_id=? AND created_at>=?",
-                                    (file_unique_id, _now() - ttl_s))
+                                    (f"ocr2:{file_unique_id}", _now() - ttl_s))
         row = await cur.fetchone()
         if not row:
             return None
         d = dict(row)
+        d["file_unique_id"] = file_unique_id
         d["translations"] = json.loads(d["translations"] or "{}")
         return d
 
@@ -488,8 +542,8 @@ class Storage:
             "INSERT INTO media_cache(file_unique_id, has_text, text, source_lang, confidence, translations, created_at)"
             " VALUES (?,?,?,?,?,?,?) ON CONFLICT(file_unique_id) DO UPDATE SET has_text=excluded.has_text,"
             " text=excluded.text, source_lang=excluded.source_lang, confidence=excluded.confidence,"
-            " translations=excluded.translations",
-            (file_unique_id, int(has_text), text, source_lang, confidence, json.dumps(translations, ensure_ascii=False),
+            " translations=excluded.translations, created_at=excluded.created_at",
+            (f"ocr2:{file_unique_id}", int(has_text), text, source_lang, confidence, json.dumps(translations, ensure_ascii=False),
              _now()))
         await self.db.commit()
 

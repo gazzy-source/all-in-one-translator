@@ -14,14 +14,14 @@ Telegram ──► aiogram Dispatcher ──► handlers (return immediately)
    group: Pipeline.on_message                          private: 1:1 translator (Pipeline.translate_private) + onboarding / settings
      1 chat config (cached 30s) · enabled? bot admin?   inline:  debounce → detect → translate
      2 eligibility (pure): bots, own inline results,
-       commands, emoji/URL/code-only, toggles
+       commands (except visible /play song arguments), emoji/URL/code-only, toggles
      3 claim (chat_id,message_id) UNIQUE  → idempotent
      4 context buffer (memory, pseudonymized, TTL)
      5 burst coalescer (same sender, 700 ms)
              │
              ▼
      text lane (4 workers)        media lane (2 workers + process pool)
-       recipients = (owners ∪ approved) ∩ members − sender − paused − muted
+       recipients = (owners ∪ globally approved ∪ group-approved ∪ approveall participants) ∩ members − sender − paused − muted
        group by recipient language → per language:
          LanguageDetector gate  (TARGET → skip | OTHER | UNSURE)
          Orchestrator: cache → route → provider → validate → (1 escalation) → (1 fallback hop)
@@ -40,7 +40,7 @@ Telegram ──► aiogram Dispatcher ──► handlers (return immediately)
 | Enforcement | `PublicOutputGuard` request middleware + per-test assertions | Non-interference is structural, not a convention: public sends, replies, reactions, chat actions, pins, edits, deletes and forwards to a group are rejected before any network I/O. |
 | Command menu | No group-scope commands; owner commands registered per owner per group with `is_ephemeral=True` | A group command menu would add a visible "/" button for every member. |
 | Language detection | Local multi-signal gate (script + `wordfreq` + `lingua` + lexicons) | `lingua` alone misread "no manches" as French and "yaar kya scene hai" as Tagalog; word-frequency evidence fixes short chat. Uncertain cases are decided by the LLM in the same call that translates — no extra detection call. |
-| Translation providers | Gemini (LLM, free tier) + DeepL API Free | User constraint: free providers only. DeepL is excellent and generous (500k chars/mo) for clean prose; Gemini handles slang, Hinglish/romanized text, code-switching, context and vision. |
+| Translation providers | Gemini (LLM, free tier) + DeepL API Free | User constraint: free providers only. DeepL's measured allowance is 1M chars/mo for clean prose; Gemini handles slang, Hinglish/romanized text, code-switching, context and vision. |
 | Routing | clean→DeepL; informal/romanized/mixed/short/laughter→Gemini fast; ambiguous-in-context/OCR/failed-validation→Gemini quality; one fallback hop with a guaranteed share of the deadline; Gemini 503 → failover lite model | Saves the small Gemini free quota for the cases only an LLM handles well. Romanized text is never sent to DeepL (it can't translate it). |
 | Models | Text: `gemini-3.1-flash-lite` for fast (MINIMAL thinking) and quality (LOW thinking), `gemini-3.5-flash-lite` failover. Vision/speech: `gemini-3.5-flash-lite`, failing over to the text model | Measured live on the free tier: 3.6/3.5-flash took 10–40 s, 3.7/3.8-flash returned 503, so only flash-lite is practical. In a 27-sample A/B of slang into ru/ar/hi, 3.5-flash-lite garbled 3–5 outputs (word salad, wrong script, cruder slang) at temperature 0 and 0.2; 3.1-flash-lite garbled none. 3.5-flash-lite stays on vision, where the media benchmark validated it. |
 | Validation | Local checks: empty, identical, missing URLs/mentions/numbers (time-format aware), preamble, length blow-up, **wrong script** for non-Latin targets | No second LLM call per message; one escalation to the quality model on failure. Wrong-script output is never delivered. |
@@ -50,6 +50,17 @@ Telegram ──► aiogram Dispatcher ──► handlers (return immediately)
 | Context | In-memory ring buffer per chat/topic (6 msgs, 15 min), pseudonymous speakers, sent only for short/ambiguous/reply messages | Accuracy where it matters, minimal data sent. |
 
 ## Modules
+
+Personal reading preferences use migration 5; migration 4 remains unchanged for existing installations.
+Additional languages suppress only confidently single-language group content, before text provider calls.
+Caption and media reading preferences are applied separately so an understood caption cannot hide an
+unfamiliar image's text. Recipients are resolved again after translation to honor revocation and settings changes.
+
+Consecutive text deliveries may append to the reader's last ephemeral within 20 seconds, only when its last
+original ID exactly matches the preceding message, sender, topic, target language and display preferences.
+Per-reader locks serialize sends/edits. Bubble text stays in a bounded in-memory cache (2,000 entries), with
+expired entries evicted on new sends. Edits invalidate the cached bubble; edits of shared translations use
+the existing fresh-correction path rather than overwriting other originals. No message text enters SQLite.
 
 | Module | Responsibility |
 |---|---|
@@ -83,7 +94,7 @@ All providers run on free tiers, so "cost" is **quota**:
   UTC day rolls over; per-minute 429s honour `retryDelay`.
 * **Per message**: one provider call per *distinct target language among recipients* (not per recipient).
   Bursts of rapid messages share one call. Identical text is served from an in-memory cache (6 h).
-  Stickers/GIFs are cached by `file_unique_id` (30 days). Textless media never reaches a provider.
+  Caption-free sticker/GIF readings are cached by `file_unique_id` (30 days). Captions can change the reading, so captioned requests bypass this shared cache. Group-specific fallback translations use the text translation cache. Textless media never reaches a provider.
 * **Quality levers you can turn**: switch `GEMINI_FAST_MODEL` to the quality model (better slang, ~half the
   free quota), set `BURST_WINDOW_MS=0` (no coalescing; more calls), or remove DeepL to send everything through
   Gemini (more natural for chat, far less quota).
@@ -102,3 +113,15 @@ confirmed live (see `PLAN.md` → live verification).
 * `getFile` downloads ≤ 20 MB (we cap at 8 MB). Inline queries ≤ 256 chars; results' message text ≤ 4096.
 * Adding the bot creates a public "X added the bot" service message and the bot appears in the member list —
   no bot can avoid this.
+
+Personal controls use explicit pause/resume callback actions, so repeated clicks on old keyboards do not
+reverse the intended setting. Private help and settings accept group-approved readers, including current
+seen members in approve-all groups, while private translation and inline authorization stay global.
+
+`/approveall` requires a fresh Telegram group-owner (`creator`) check without a bot-owner override.
+Other administrators can still approve individuals and disable approve-all with `/revokeall`.
+Group command menus are registered only per member, with ephemeral commands; broad group/admin scopes
+are removed during registration. The output guard rejects broad/default command registration and
+non-ephemeral per-member commands. Approval invalidates membership rather than trusting an old reply.
+
+Private recent pages read from a recipient- and language-scoped in-memory store of successful deliveries (15 minutes, 2,000 entries total). Each group or topic page rechecks approval and live Telegram membership. Page navigation uses source message IDs to keep older pages stable as new messages arrive.

@@ -100,13 +100,22 @@ journalctl -u translator -f
 
 ## 4. Group setup
 
+No bot-owner involvement is needed (`ENABLE_NEW_GROUPS=all`, the default): **any group admin** can set it up.
+
 1. Add the bot to the group and promote it to **admin with every right switched off** — admin status is what
-   lets it send private in-group messages; no rights are used.
-2. You receive a setup report by private message. Groups added by non-owners start disabled.
-3. Approve readers: reply `/approve` to one of their messages (only you see the command and the answer), or
-   `/approve <user id>` in a private chat with the bot.
-4. That's it: an approved member gets translations right away, in the language they write in (or their
-   Telegram app language). They can pick another one anytime: private chat → `/language`.
+   lets it send private in-group messages; no rights are used. Whoever adds/promotes it gets the steps privately.
+2. Choose readers (hidden commands — only the admin sees them and the answer):
+   * `/approveall` — everyone in the group reads everyone in their own language (people are picked up as they
+     write, join or use `/tr`); `/revokeall` goes back to one by one;
+   * or reply `/approve` / `/revoke` to a member's message.
+   Group-admin approval is valid in that group only; a bot owner's `/approve` covers every group.
+3. That's it: readers get translations right away, in the language they write in (or their Telegram app
+   language); they can pick another one anytime: private chat → `/language`.
+4. Writing back: reply `/tr` to any message for a private translation; `/tr your text` gives it in the group's
+   languages with Copy / Send. `@bot text` works too.
+
+The bot owner still gets a short notice for each new group (`/chats` can switch any group off), and
+`ENABLE_NEW_GROUPS=owner_added` restores "only groups the owner adds".
 
 **Private chat:** anyone can also send the bot text, stickers, GIFs, photos, videos or voice notes privately and get
 a translation back (`PRIVATE_ACCESS=everyone`, the default). Users who aren't approved are capped per day
