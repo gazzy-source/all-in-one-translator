@@ -211,3 +211,21 @@ async def test_expired_timer_cannot_flush_next_burst() -> None:
     assert batches == [[1]]
     await b.flush_all()
     assert batches == [[1], [2]]
+
+
+async def test_media_cache_ignores_legacy_entries_and_refreshes_expiry(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    st = Storage(tmp_path / "media.sqlite3")
+    await st.open()
+    try:
+        await st.db.execute("INSERT INTO media_cache VALUES (?,?,?,?,?,?,?)",
+                            ("old", 1, "old", "en", 1.0, "{}", 100))
+        await st.db.commit()
+        monkeypatch.setattr("translator_bot.storage._now", lambda: 110)
+        assert await st.get_media("old", 30) is None
+        await st.put_media("old", has_text=True, text="fresh", source_lang="en", confidence=1.0, translations={})
+        monkeypatch.setattr("translator_bot.storage._now", lambda: 190)
+        await st.put_media("old", has_text=True, text="refreshed", source_lang="en", confidence=1.0, translations={})
+        row = await st.get_media("old", 30)
+        assert row and row["file_unique_id"] == "old" and row["text"] == "refreshed"
+    finally:
+        await st.close()

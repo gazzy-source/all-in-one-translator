@@ -226,6 +226,16 @@ The OCR gate includes the first and last distinct frames when its budget permits
 emits a frame for a clip shorter than the sample interval. These changes keep the same frame and OCR caps.
 All eight formerly skipped tests passed with real FFmpeg. Final suite: 530 passed, zero skips (352.20 s).
 
+## November 25 — media cache isolation and retries
+
+Four synthetic regressions reproduced stale caption readings, a group-dependent OCR fallback stored in
+the shared file cache, and an uncertain vision response recorded as a lasting negative. Shared storage
+now accepts only caption-free extraction results. A changed caption triggers a fresh extraction, and
+group fallback translations stay in the text translator's contextual cache. Legacy shared rows are
+ineligible for lookups and expire under the existing retention policy. Refreshing a reading renews its TTL.
+Private media requests receive their own error result, including when they share an in-flight extraction.
+Verification: 536 tests passed with FFmpeg, zero skips. Production held 81 legacy cache rows before rollout.
+
 ## Known gaps / next steps
 
 * Videos and voice messages longer than `MAX_MEDIA_SECONDS` (default 1 min) are skipped.

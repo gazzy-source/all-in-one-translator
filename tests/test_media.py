@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import io
 import shutil
 from pathlib import Path
@@ -11,7 +12,7 @@ import pytest
 
 from tests.fixtures import blank_image, gzip_bomb, lottie_tgs, text_image, video_from_frames
 from translator_bot.media import frames as F
-from translator_bot.media.processor import MediaProcessor
+from translator_bot.media.processor import MediaProcessor, MediaReadError
 from translator_bot.metrics import Metrics
 from translator_bot.providers.base import ErrorKind, ProviderError, VisionResult
 from translator_bot.storage import Storage
@@ -422,3 +423,67 @@ def test_video_shorter_than_sampling_interval_still_yields_a_frame() -> None:
                                     timeout=20, fps=0.5)
     assert len(frames.frames) == 1
     assert F.select_distinct(frames.frames, limit=1) == [0]
+
+
+async def test_low_confidence_vision_can_retry(storage: Storage) -> None:
+    class UncertainFirst(FakeVision):
+        async def read_images(self, *args: Any, **kw: Any) -> VisionResult:
+            result = await super().read_images(*args, **kw)
+            if len(self.calls) == 1:
+                result.confidence = 0.1
+            return result
+
+    vision = UncertainFirst()
+    p = processor(FakeBot(text_image("NO WAY BRO")), storage, vision)
+    try:
+        args = dict(file_id="f", file_unique_id="uncertain", size=None, kind="sticker", targets=["es"])
+        assert await p.extract(**args) is None
+        assert await storage.get_media("uncertain", 86400) is None
+        assert await p.extract(**args) is not None and len(vision.calls) == 2
+    finally:
+        await p.close()
+
+
+@needs_ffmpeg
+async def test_changed_caption_bypasses_shared_reading(storage: Storage) -> None:
+    vision = FakeVision()
+    animation = video_from_frames([text_image("NO WAY BRO")] * 2)
+    p = processor(FakeBot(animation), storage, vision)
+    await storage.put_media("caption", has_text=True, text="old reading", confidence=1,
+                            source_lang="en", translations={})
+    try:
+        result = await p.extract(file_id="f", file_unique_id="caption", size=None, kind="gif", targets=["es"],
+                                 caption_hint="Read the sign")
+        assert result and result.text == "NO WAY BRO" and vision.calls == [1]
+        stored = await storage.get_media("caption", 86400)
+        assert stored and stored["text"] == "old reading"
+    finally:
+        await p.close()
+
+async def test_coalesced_timeout_reaches_the_request_that_waited(storage: Storage, monkeypatch: pytest.MonkeyPatch) -> None:
+    p = processor(FakeBot(b""), storage, FakeVision())
+    started, release = asyncio.Event(), asyncio.Event()
+    calls = 0
+
+    async def timeout(*args: Any) -> bytes:
+        nonlocal calls
+        calls += 1
+        started.set()
+        await release.wait()
+        raise TimeoutError
+
+    monkeypatch.setattr(p, "_download", timeout)
+    args = dict(file_id="f", file_unique_id="repeat", size=None, kind="voice", targets=["en"])
+    try:
+        group = asyncio.create_task(p.extract(**args))
+        await asyncio.wait_for(started.wait(), 2)
+        private = asyncio.create_task(p.read(**args))
+        await asyncio.sleep(0)
+        release.set()
+        assert await group is None
+        with pytest.raises(MediaReadError, match="slow"):
+            await private
+        assert calls == 1
+    finally:
+        release.set()
+        await p.close()

@@ -23,8 +23,7 @@ from translator_bot.delivery import BUBBLE_WINDOW_S, Deliverer, Delivery
 from translator_bot.detect import LanguageDetector, Verdict
 from translator_bot.eligibility import Eligible, Kind, Skip, classify, sender_id, sender_name
 from translator_bot.languages import LANGUAGES, same_language
-from translator_bot.media.processor import AUDIO_KINDS, MediaProcessor, MediaText
-from translator_bot.media.processor import PERSISTED as PERSISTED_KINDS
+from translator_bot.media.processor import AUDIO_KINDS, MediaProcessor, MediaReadError, MediaText
 from translator_bot.metrics import Metrics
 from translator_bot.orchestrator import Orchestrator
 from translator_bot.providers.base import ContextLine, TranslationJob
@@ -91,9 +90,8 @@ class Pipeline:
         self.edit_memory_s = edit_memory_s
         self._units: OrderedDict[tuple[int, int], UnitRecord] = OrderedDict()  # (chat, msg) -> unit
         self._locks: dict[tuple[int, int], asyncio.Lock] = defaultdict(asyncio.Lock)
-        # last media reading per message (memory only, edit_memory_s): a caption edit reuses it instead of
-        # re-downloading and re-running vision/audio for photos, videos and voice (which aren't cached on disk)
-        self._media_memo: OrderedDict[tuple[int, int], tuple[float, str, MediaText | None]] = OrderedDict()
+        # Successful per-message readings can be reused while both the file and its caption hint match.
+        self._media_memo: OrderedDict[tuple[int, int], tuple[float, str, str, MediaText]] = OrderedDict()
         self._bg: set[asyncio.Task[None]] = set()
         self._chat_cache: dict[int, tuple[float, Chat]] = {}
         self._lang_votes: OrderedDict[int, deque[str]] = OrderedDict()  # approved sender -> recent languages
@@ -519,13 +517,16 @@ class Pipeline:
             if mkind in AUDIO_KINDS and duration is not None and duration > self.s.max_media_seconds:
                 reasons.append("too_long")
             else:
-                mt = await self.media.extract(file_id=file_id, file_unique_id=unique_id, size=size,
-                                              kind=mkind, targets=[target],  # type: ignore[arg-type]
-                                              caption_hint=el.plain or None, duration=duration)
-                if mt is None and self.media.failure(unique_id) == "timeout":
-                    reasons.append("slow")  # never claim "no text" for a file we couldn't finish reading
-                elif mt is None or not mt.text or mt.text.strip() == el.plain.strip():
-                    reasons.append("no_text")
+                missing_reason = "no_text"
+                try:
+                    mt = await self.media.read(file_id=file_id, file_unique_id=unique_id, size=size,
+                                               kind=mkind, targets=[target],  # type: ignore[arg-type]
+                                               caption_hint=el.plain or None, duration=duration)
+                except MediaReadError as exc:
+                    missing_reason = "slow" if exc.reason == "slow" else "failed"
+                    mt = None
+                if mt is None or not mt.text or mt.text.strip() == el.plain.strip():
+                    reasons.append(missing_reason)
                 else:
                     cached = mt.translations.get(target)
                     tr: str | None
@@ -657,7 +658,8 @@ class Pipeline:
         extract_task: asyncio.Task[MediaText | None] | None = None
         memo_key = (meta.chat_id, msg.message_id)
         memo = self._media_memo.get(memo_key)
-        reuse = (edited and memo is not None and memo[1] == unique_id
+        hint_hash = content_hash(el.plain)
+        reuse = (edited and memo is not None and memo[1] == unique_id and memo[2] == hint_hash
                  and time.monotonic() - memo[0] <= self.edit_memory_s)
         if reuse:
             self.metrics.inc("edit.media_reused")
@@ -673,16 +675,17 @@ class Pipeline:
 
         try:
             captions = dict(zip(langs, await asyncio.gather(*(caption_for(lg) for lg in langs)), strict=True))
+            media_text: MediaText | None
             if reuse:
                 assert memo is not None
-                media_text = memo[2]
+                media_text = memo[3]
             else:
                 media_text = await extract_task if extract_task is not None else None
         finally:
             if extract_task is not None and not extract_task.done():
                 extract_task.cancel()  # caption failed / job cancelled: stop the download/ffmpeg/vision work
-        if unique_id:
-            self._media_memo[memo_key] = (time.monotonic(), unique_id, media_text)
+        if unique_id and media_text is not None:
+            self._media_memo[memo_key] = (time.monotonic(), unique_id, hint_hash, media_text)
             self._media_memo.move_to_end(memo_key)
             while self._media_memo and (len(self._media_memo) > 2000 or time.monotonic()
                                         - next(iter(self._media_memo.values()))[0] > self.edit_memory_s):
@@ -702,19 +705,12 @@ class Pipeline:
                 if cached_tr is not None:
                     tr = _html.escape(cached_tr, quote=False)  # vision output is plain text, never markup
                 else:  # not produced by the media call (cache from other languages / local OCR)
-                    out, s, why = await self._translate_outcome(meta, media_text.text, media_text.text, lang,
-                                                                style="ocr")
+                    out, s, _ = await self._translate_outcome(meta, media_text.text, media_text.text, lang,
+                                                              style="ocr", glossary=glossary)
                     tr = out or ""  # plain OCR job -> already escaped
                     src = src or s
-                    # remember only real outcomes: a failure (quota, outage) must not become "nothing to translate"
-                    if why != "failed":
-                        media_text.translations[lang] = _html.unescape(tr)
-                    # caption-steered readings stay out of the shared (file id) cache, like in the processor
-                    if why != "failed" and unique_id and mkind in PERSISTED_KINDS and not el.plain:
-                        await self.storage.put_media(unique_id, has_text=True, text=media_text.text,
-                                                     source_lang=media_text.source_lang or src,
-                                                     confidence=media_text.confidence,
-                                                     translations=media_text.translations)
+                    # This translation can depend on the group's conversation and glossary. Its scoped
+                    # orchestrator cache handles repeats; the shared file reading stays context-free.
                 if tr:
                     src = src or media_text.source_lang
                     parts.append((icon if el.plain else "") + tr)

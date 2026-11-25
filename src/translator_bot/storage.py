@@ -527,11 +527,12 @@ class Storage:
     # -- media OCR cache -------------------------------------------------------------------------
     async def get_media(self, file_unique_id: str, ttl_s: int) -> dict[str, Any] | None:
         cur = await self.db.execute("SELECT * FROM media_cache WHERE file_unique_id=? AND created_at>=?",
-                                    (file_unique_id, _now() - ttl_s))
+                                    (f"ocr2:{file_unique_id}", _now() - ttl_s))
         row = await cur.fetchone()
         if not row:
             return None
         d = dict(row)
+        d["file_unique_id"] = file_unique_id
         d["translations"] = json.loads(d["translations"] or "{}")
         return d
 
@@ -541,8 +542,8 @@ class Storage:
             "INSERT INTO media_cache(file_unique_id, has_text, text, source_lang, confidence, translations, created_at)"
             " VALUES (?,?,?,?,?,?,?) ON CONFLICT(file_unique_id) DO UPDATE SET has_text=excluded.has_text,"
             " text=excluded.text, source_lang=excluded.source_lang, confidence=excluded.confidence,"
-            " translations=excluded.translations",
-            (file_unique_id, int(has_text), text, source_lang, confidence, json.dumps(translations, ensure_ascii=False),
+            " translations=excluded.translations, created_at=excluded.created_at",
+            (f"ocr2:{file_unique_id}", int(has_text), text, source_lang, confidence, json.dumps(translations, ensure_ascii=False),
              _now()))
         await self.db.commit()
 

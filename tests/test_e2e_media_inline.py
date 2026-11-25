@@ -192,7 +192,7 @@ async def test_inline_provider_failure_no_stacktrace(mh: Harness) -> None:
 
 
 @pytest.mark.media
-async def test_caption_edit_keeps_image_text_and_reuses_the_reading(mh: Harness) -> None:
+async def test_caption_edit_refreshes_caption_guided_reading(mh: Harness) -> None:
     import time as _time
 
     photo = {"photo": [{"file_id": "p9", "file_unique_id": "pu9", "width": 512, "height": 512}]}
@@ -210,7 +210,7 @@ async def test_caption_edit_keeps_image_text_and_reuses_the_reading(mh: Harness)
     assert len(edits) == 1
     text = edits[0].params["text"]
     assert "funny sign" in text and "¡NI DE BROMA!" in text  # caption updated, image text kept
-    assert len(mh.vision.calls) == calls_before  # type: ignore[attr-defined]  # no second vision call
+    assert len(mh.vision.calls) == calls_before + 1  # type: ignore[attr-defined]  # changed vision hint
     assert len(mh.tg.ephemeral_to(OWNER)) == 1  # edited in place, not a new message
 
 
@@ -292,3 +292,46 @@ async def test_tr_respects_disabled_group(mh: Harness) -> None:
     await mh.idle()
     [eph] = mh.tg.ephemeral_to(OWNER)
     assert "switched off" in eph.params["text"] and mh.gemini.jobs == []
+
+
+async def test_group_ocr_fallback_stays_in_its_group(mh: Harness, monkeypatch: pytest.MonkeyPatch) -> None:
+    p = mh.app.pipeline
+    assert p
+    uid = "uniq-local"
+    await mh.app.storage.put_media(uid, has_text=True, text="shared sign", source_lang="en",
+                                   confidence=1.0, translations={})
+
+    async def contextual(*args: Any, **kwargs: Any) -> tuple[str, str, str]:
+        return "local wording", "en", ""
+
+    monkeypatch.setattr(p, "_translate_outcome", contextual)
+    await mh.send(group_message(sender=SPANISH_SPEAKER, extra=sticker("local")))
+    await mh.idle(timeout=60)
+    assert "local wording" in mh.tg.ephemeral_to(OWNER)[0].params["text"]
+    stored = await mh.app.storage.get_media(uid, 86400)
+    assert stored and stored["translations"] == {}
+
+async def test_media_retry_reports_current_outcome(mh: Harness, monkeypatch: pytest.MonkeyPatch) -> None:
+    from tests.test_e2e_group import dm
+    from translator_bot.media.processor import _WorkerTimeout
+
+    proc = mh.app.media
+    assert proc
+    original = proc._run
+    attempts = 0
+
+    async def timeout_once(fn: Any, *args: Any, **kwargs: Any) -> Any:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise _WorkerTimeout(fn.__name__)
+        return await original(fn, *args, **kwargs)
+
+    monkeypatch.setattr(proc, "_run", timeout_once)
+    mh.tg.files["retry"] = blank_image()
+    for mid in (500, 501):
+        await mh.send(dm(OUTSIDER, mid=mid, **sticker("retry")))
+        await mh.idle(timeout=60)
+    first, second = mh.tg.dms_to(OUTSIDER)
+    assert "took too long" in first.params["text"]
+    assert "couldn't find any text" in second.params["text"]

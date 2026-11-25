@@ -94,7 +94,7 @@ All providers run on free tiers, so "cost" is **quota**:
   UTC day rolls over; per-minute 429s honour `retryDelay`.
 * **Per message**: one provider call per *distinct target language among recipients* (not per recipient).
   Bursts of rapid messages share one call. Identical text is served from an in-memory cache (6 h).
-  Stickers/GIFs are cached by `file_unique_id` (30 days). Textless media never reaches a provider.
+  Caption-free sticker/GIF readings are cached by `file_unique_id` (30 days). Captions can change the reading, so captioned requests bypass this shared cache. Group-specific fallback translations use the text translation cache. Textless media never reaches a provider.
 * **Quality levers you can turn**: switch `GEMINI_FAST_MODEL` to the quality model (better slang, ~half the
   free quota), set `BURST_WINDOW_MS=0` (no coalescing; more calls), or remove DeepL to send everything through
   Gemini (more natural for chat, far less quota).
