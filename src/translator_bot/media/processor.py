@@ -187,7 +187,7 @@ class MediaProcessor:
         fut = asyncio.get_running_loop().create_future()
         self._inflight[key] = fut
         try:
-            res = await self._extract_uncached(file_id, file_unique_id, size, kind, targets, caption_hint)
+            res = await self._extract_uncached(file_id, file_unique_id, size, kind, targets, caption_hint, duration)
             fut.set_result(res)
             return res
         except asyncio.CancelledError:
@@ -206,7 +206,7 @@ class MediaProcessor:
         return now
 
     async def _extract_uncached(self, file_id: str, file_unique_id: str, size: int | None, kind: MediaKind,
-                                targets: list[str], caption_hint: str | None) -> MediaText | None:
+                                targets: list[str], caption_hint: str | None, duration: float | None) -> MediaText | None:
         self.metrics.inc(f"media.process.{kind}")
         t_start = t = time.perf_counter()
         # A caption steers the vision prompt, and the cache is keyed by file id alone and shared by every chat:
@@ -242,6 +242,8 @@ class MediaProcessor:
                 if suffix not in (".webm", ".mp4", ".gif", ".avi"):
                     raise F.MediaRejected("not a video container")
                 fps = 1.0 if kind == "video" else 4.0
+                if duration is not None and duration > 0:
+                    fps = min(fps, self.max_frames / min(seconds, duration))
                 fs = await self._run(F.extract_video_frames, data, ffmpeg=self.ffmpeg_path, suffix=suffix,
                                      max_seconds=seconds, max_frames=self.max_frames, timeout=self.timeout_s - 2,
                                      fps=fps)
@@ -252,9 +254,7 @@ class MediaProcessor:
             del data
             t = self._stage("decode", t)
             if fs is not None:
-                distinct: list[int] = await self._run(F.select_distinct, fs.frames)
-                n = self.ocr_gate_frames  # each one is ~0.3 s on a desktop CPU, 2-5 s on a throttled 1/8-core VM
-                gate = distinct if len(distinct) <= n else [distinct[int(i * len(distinct) / n)] for i in range(n)]
+                gate: list[int] = await self._run(F.select_distinct, fs.frames, limit=self.ocr_gate_frames)
                 found: list[F.TextBoxes] = await self._run(F.detect_text, fs.frames, gate)
                 t = self._stage("ocr_gate", t)
                 text_idx = [b.index for b in found if b.boxes > 0 and b.text_area >= 0.004]

@@ -389,3 +389,36 @@ async def test_screen_tag_becomes_icon(storage: Storage) -> None:
         assert all("[screen]" not in t.lower() and "📺" in t for t in r.translations.values())
     finally:
         await p.close()
+
+
+@needs_ffmpeg
+@pytest.mark.parametrize(("frame_budget", "ocr_budget"), [(4, 6), (12, 2)])
+async def test_video_final_caption_survives_sampling(storage: Storage, frame_budget: int, ocr_budget: int) -> None:
+    from PIL import Image
+
+    scenes = []
+    for level in range(0, 210, 35):
+        buf = io.BytesIO()
+        Image.new("RGB", (512, 512), (level, level, level)).save(buf, "PNG")
+        scenes.append(buf.getvalue())
+    scenes.extend([text_image("FINAL WORDS")] * 2)
+    video = video_from_frames(scenes, seconds_per_frame=1)
+    vision = FakeVision()
+    p = processor(FakeBot(video), storage, vision)
+    p.max_frames = frame_budget
+    p.ocr_gate_frames = ocr_budget
+    try:
+        result = await p.extract(file_id="last", file_unique_id="late", size=len(video), kind="video",
+                                 targets=["es"], duration=8)
+        assert result is not None and vision.calls == [1]
+    finally:
+        await p.close()
+
+
+@needs_ffmpeg
+def test_video_shorter_than_sampling_interval_still_yields_a_frame() -> None:
+    clip = video_from_frames([text_image("HI")], seconds_per_frame=0.2)
+    frames = F.extract_video_frames(clip, ffmpeg="ffmpeg", suffix=".mp4", max_seconds=60, max_frames=4,
+                                    timeout=20, fps=0.5)
+    assert len(frames.frames) == 1
+    assert F.select_distinct(frames.frames, limit=1) == [0]

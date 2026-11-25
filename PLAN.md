@@ -213,6 +213,19 @@ marked processing over the preceding 24 hours, with empty queues at inspection. 
 records no_recipients when a text or media job has no eligible readers. Historical rows do not establish
 the cause of each individual case.
 
+## November 25 — FFmpeg media verification
+
+The Windows test run skipped eight cases because FFmpeg was absent from PATH. The tests now run locally
+with FFmpeg 7.1 in the project virtual environment. Production uses its existing container FFmpeg.
+
+An eight-second synthetic video with text only in the last two seconds reproduced two missed captions:
+a four-frame decoding budget ran out before the text appeared, and a two-frame OCR budget skipped the
+last distinct scene. A 0.2-second clip also yielded zero frames at a sampling rate of 0.5 fps.
+For clips with a reported duration, the decoder now spaces samples across the allowed duration.
+The OCR gate includes the first and last distinct frames when its budget permits both. The decoder
+emits a frame for a clip shorter than the sample interval. These changes keep the same frame and OCR caps.
+All eight formerly skipped tests passed with real FFmpeg. Final suite: 530 passed, zero skips (352.20 s).
+
 ## Known gaps / next steps
 
 * Videos and voice messages longer than `MAX_MEDIA_SECONDS` (default 1 min) are skipped.
